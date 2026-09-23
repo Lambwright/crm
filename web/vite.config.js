@@ -26,3 +26,6 @@ export default defineConfig({
     },
   },
 });
+
+// Trivial change to force a fresh Actions build/deploy after fixing the
+// VITE_CRM_API repo-variable wiring — see the 2026-09-23 conversation.
