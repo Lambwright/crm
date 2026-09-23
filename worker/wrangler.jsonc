@@ -1,0 +1,58 @@
+/**
+ * crm-worker — company/contact database, bid pipeline + stage machine, tender
+ * email log, hot-lead weighting, stale-bid follow-up notifications.
+ *
+ * Wrangler config reference: https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "crm-worker",
+	"main": "src/index.js",
+	"compatibility_date": "2026-09-22",
+	"observability": {
+		"enabled": true
+	},
+	"upload_source_maps": true,
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"vars": {
+		"CURRENT_APP": "CRM",
+		// Comma list of Einbau ID usernames allowed to open this app at all,
+		// same gate shape as TALLY's ALLOWED_USERS. Confirm the real list with
+		// Ben before deploy — left broad (role-based) for now since the whole
+		// point of this app is wide internal use (estimating, BD/follow-up,
+		// leadership), unlike TALLY's small named list.
+		"ALLOWED_ROLES": "admin,user",
+		// TODO(ben): the exact NetSuite Customer custom-field script id that
+		// should receive the hot-lead flag/weight during the parallel-run
+		// period. Left unset means the NetSuite mirror push is skipped
+		// (logged, not blocking) until this is confirmed — see
+		// worker/README.md "Hot-lead weighting".
+		"NETSUITE_HOTLEAD_FIELD_ID": ""
+	},
+	// Daily: flag bids whose next_action_date has passed (or that are open with
+	// no owner/next action) into the notifications table. Playbook §5.3
+	// Workflow C. Real Teams/email delivery is stubbed — see schema.sql.
+	"triggers": {
+		"crons": ["0 13 * * *"]
+	},
+	// A Worker calling another Worker's *.workers.dev URL over plain fetch() gets
+	// blocked with Cloudflare error 1042 — service bindings are the supported
+	// path, same pattern every other suite Worker already uses.
+	"services": [
+		{ "binding": "AUTH_WORKER", "service": "auth" },
+		// TODO(ben): confirm the actual registered Worker name for
+		// netsuite.ben-a90.workers.dev in the Cloudflare dashboard — assumed
+		// "netsuite" by analogy with "auth" above, not yet verified. Until
+		// confirmed, the hot-lead NetSuite mirror push will fail closed
+		// (logged as netsuite_sync_status='failed', never blocks the save).
+		{ "binding": "NETSUITE_WORKER", "service": "netsuite" }
+	]
+	/**
+	 * Secrets (set with `wrangler secret put <NAME>`):
+	 *   DATABASE_URL          - Neon Postgres connection string (dedicated `crm` project — do NOT reuse another app's)
+	 *   CRM_SERVICE_KEY       - shared secret SCOUT sends as X-CRM-Service-Key when pushing a qualified RFQ
+	 *   NETSUITE_SERVICE_KEY  - shared secret this worker sends to netsuite-worker as X-NetSuite-Service-Key
+	 */
+}
