@@ -110,9 +110,16 @@ create index contacts_email_idx on contacts (lower(email));
 create table bids (
   id uuid primary key default gen_random_uuid(),
 
-  -- Playbook §4.2: same RFQ ID resubmitted updates this row, never creates a
-  -- second one. This is the idempotency key for the SCOUT intake endpoint.
-  procore_rfq_id text unique not null,
+  -- A human-readable ref minted by CRM itself at the moment an estimator
+  -- starts working an RFQ in SCOUT (see rfq_id_counters below) — not a
+  -- Procore-native identifier. SCOUT has no pre-existing RFQ ID of its own
+  -- (it creates the NetSuite Opportunity and Procore Bid fresh each
+  -- submission), so this is CRM's own idempotency key, minted early enough
+  -- to track an RFQ from intake, not just from submission. Format:
+  -- <2-letter initials><YY><MM><DD><2-digit per-estimator daily sequence>,
+  -- e.g. BW26092301. Sequence gaps are expected and harmless (an abandoned
+  -- browser tab's minted ref is never reused) — see kickoff prompt.
+  rfq_ref text unique not null,
   procore_bid_board_id text,
 
   company_id uuid references companies(id),
@@ -182,6 +189,19 @@ create index bids_company_idx on bids (company_id);
 create index bids_stage_idx on bids (stage);
 create index bids_owner_idx on bids (owner_username);
 create index bids_next_action_idx on bids (next_action_date) where stage not in ('closed_won', 'closed_lost', 'no_bid');
+
+-- ---------------------------------------------------------------------------
+-- rfq_id_counters — one row per (estimator, day), atomically incremented to
+-- mint rfq_ref values. `on conflict ... do update set seq = seq + 1` is the
+-- whole mechanism; Postgres's own row-level locking makes concurrent mints
+-- from the same estimator (e.g. two open tabs) safe without extra locking.
+-- ---------------------------------------------------------------------------
+create table rfq_id_counters (
+  estimator_initials text not null,
+  day date not null,
+  seq int not null default 1,
+  primary key (estimator_initials, day)
+);
 
 -- ---------------------------------------------------------------------------
 -- bid_stage_history — full audit trail of stage moves (Playbook §2.2 "audit

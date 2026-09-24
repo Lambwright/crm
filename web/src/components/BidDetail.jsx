@@ -73,7 +73,7 @@ export default function BidDetail({ id, user, onClose, onChanged }) {
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" style={{ width: 640 }} onClick={(e) => e.stopPropagation()}>
-        <div className="card-title">{bid.procore_rfq_id}</div>
+        <div className="card-title">{bid.rfq_ref}</div>
         <h2 style={{ marginBottom: 4 }}>{bid.project_name}</h2>
         <div className="row-secondary" style={{ marginBottom: 16 }}>{bid.company_name || "—"}</div>
 

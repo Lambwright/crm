@@ -10,6 +10,7 @@
 // the decisions made in planning).
 //
 // Routes:
+//   POST   /rfq-ids/mint                (Einbau ID) mints/reuses today's next per-estimator rfq_ref (see mintRfqRef below)
 //   POST   /intake/scout                (X-CRM-Service-Key) SCOUT pushes a scored RFQ; upserts company + bid
 //   GET    /companies/lookup?name=      (X-CRM-Service-Key or Einbau ID) SCOUT reads hot-lead weight before/while scoring
 //   GET    /companies?q=&segment=       (Einbau ID) list/search
@@ -232,16 +233,49 @@ async function findOrCreateCompany(sql, { name, procore_vendor_id }) {
 }
 
 // ---------------------------------------------------------------------------
+// /rfq-ids/mint — mints (or, within the same day, returns the next
+// sequential) rfq_ref for the logged-in estimator. SCOUT calls this once per
+// browser tab (caching the result in that tab's sessionStorage — see
+// scout-addin/app.html), not once per RFQ resubmission, so "mint" here always
+// means "give me a new one"; reuse-within-a-tab is entirely a SCOUT-side
+// concern. Format: <2-letter initials><YY><MM><DD><2-digit daily sequence>,
+// e.g. BW26092301. The per-estimator-per-day counter means concurrent tabs
+// from the SAME estimator never collide (Postgres's own row locking on the
+// upsert below makes that safe), and different estimators never collide
+// either (they each get their own initials prefix).
+function initialsFor(user) {
+  if (user.firstName && user.lastName) return (user.firstName[0] + user.lastName[0]).toUpperCase();
+  return String(user.username || "XX").slice(0, 2).toUpperCase();
+}
+
+async function handleMintRfqRef(sql, user) {
+  const initials = initialsFor(user);
+  const [{ seq }] = await sql`
+    insert into rfq_id_counters (estimator_initials, day, seq)
+    values (${initials}, current_date, 1)
+    on conflict (estimator_initials, day) do update set seq = rfq_id_counters.seq + 1
+    returning seq`;
+  const now = new Date();
+  const yy = String(now.getUTCFullYear()).slice(-2);
+  const mm = String(now.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(now.getUTCDate()).padStart(2, "0");
+  const rfq_ref = `${initials}${yy}${mm}${dd}${String(seq).padStart(2, "0")}`;
+  return json({ rfq_ref });
+}
+
+// ---------------------------------------------------------------------------
 // /intake/scout — SCOUT pushes a scored RFQ here (in parallel with its
 // existing NetSuite Opportunity write, per the parallel-run decision).
-// Upserts the company and the bid by procore_rfq_id (Playbook §4.2: same RFQ
-// ID resubmitted updates the row, never creates a second one).
+// Upserts the company and the bid by rfq_ref (Playbook §4.2: same RFQ
+// resubmitted updates the row, never creates a second one) — rfq_ref is
+// minted early by /rfq-ids/mint above, not derived from anything Procore- or
+// NetSuite-specific; see that route's comment and the kickoff prompt.
 // ---------------------------------------------------------------------------
 
 async function handleScoutIntake(request, sql) {
   const body = await parseBody(request);
-  const { procore_rfq_id, project_name, company_name, procore_vendor_id, contact, qualification_result, scout_score, scout_tier, hot_lead_applied, no_bid_reason, bid_due_date } = body;
-  if (!procore_rfq_id) return json({ error: "procore_rfq_id is required" }, 400);
+  const { rfq_ref, project_name, company_name, procore_vendor_id, contact, qualification_result, scout_score, scout_tier, hot_lead_applied, no_bid_reason, bid_due_date } = body;
+  if (!rfq_ref) return json({ error: "rfq_ref is required" }, 400);
   if (!project_name) return json({ error: "project_name is required" }, 400);
   if (!company_name) return json({ error: "company_name is required" }, 400);
 
@@ -259,7 +293,7 @@ async function handleScoutIntake(request, sql) {
 
   const initialStage = qualification_result === "no_bid" ? "no_bid" : "rfq_imported";
 
-  const existingBid = await sql`select * from bids where procore_rfq_id = ${procore_rfq_id} limit 1`;
+  const existingBid = await sql`select * from bids where rfq_ref = ${rfq_ref} limit 1`;
   let bid;
   if (existingBid.length) {
     [bid] = await sql`
@@ -279,10 +313,10 @@ async function handleScoutIntake(request, sql) {
   } else {
     [bid] = await sql`
       insert into bids (
-        procore_rfq_id, project_name, company_id, contact_id, qualification_result,
+        rfq_ref, project_name, company_id, contact_id, qualification_result,
         scout_score, scout_tier, hot_lead_applied, no_bid_reason, bid_due_date, stage
       ) values (
-        ${procore_rfq_id}, ${project_name}, ${company.id}, ${contactRow ? contactRow.id : null}, ${qualification_result || "pending_review"},
+        ${rfq_ref}, ${project_name}, ${company.id}, ${contactRow ? contactRow.id : null}, ${qualification_result || "pending_review"},
         ${scout_score ?? null}, ${scout_tier ?? null}, ${Boolean(hot_lead_applied)}, ${no_bid_reason ?? null}, ${bid_due_date ?? null}, ${initialStage}
       ) returning *`;
     await sql`insert into bid_stage_history (bid_id, from_stage, to_stage, changed_by, note)
@@ -331,7 +365,7 @@ async function handleCompanyDetail(id, sql) {
   const rows = await sql`select * from companies where id = ${id}`;
   if (!rows.length) return json({ error: "not_found" }, 404);
   const contacts = await sql`select * from contacts where company_id = ${id} order by created_at`;
-  const bids = await sql`select id, procore_rfq_id, project_name, stage, qualification_result, estimated_value, submitted_value, final_value, bid_due_date, created_at from bids where company_id = ${id} order by created_at desc`;
+  const bids = await sql`select id, rfq_ref, project_name, stage, qualification_result, estimated_value, submitted_value, final_value, bid_due_date, created_at from bids where company_id = ${id} order by created_at desc`;
   return json({ company: rows[0], contacts, bids });
 }
 
@@ -545,7 +579,7 @@ async function handleEmailCreate(bidId, request, sql, user) {
 async function handleNotificationsList(url, sql) {
   const status = url.searchParams.get("status") || "pending";
   const rows = await sql`
-    select n.*, b.project_name, b.procore_rfq_id, b.owner_username
+    select n.*, b.project_name, b.rfq_ref, b.owner_username
     from notifications n join bids b on b.id = n.bid_id
     where n.status = ${status}
     order by n.created_at desc limit 200`;
@@ -662,6 +696,8 @@ export default {
         for (const [k, v] of Object.entries(refresh)) res.headers.set(k, v);
         return res;
       };
+
+      if (url.pathname === "/rfq-ids/mint" && request.method === "POST") return withRefresh(await handleMintRfqRef(sql, auth.user));
 
       if (parts[0] === "companies") {
         if (parts.length === 1 && request.method === "GET") return withRefresh(await handleCompaniesList(url, sql));
