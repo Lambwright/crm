@@ -12,6 +12,7 @@ export default function CompanyList() {
   const [selectedId, setSelectedId] = useState(null);
   const [showCreate, setShowCreate] = useState(false);
   const [newName, setNewName] = useState("");
+  const [expiringHotLeads, setExpiringHotLeads] = useState([]);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -22,9 +23,16 @@ export default function CompanyList() {
     api.listCompanies(params).then((data) => setCompanies(data.companies || [])).catch((e) => setError(e.message)).finally(() => setLoading(false));
   }, [q, segment]);
 
+  const loadExpiring = useCallback(() => {
+    api.listNotifications("pending")
+      .then((data) => setExpiringHotLeads((data.notifications || []).filter((n) => n.type === "hot_lead_expiring")))
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
     load();
-  }, [load]);
+    loadExpiring();
+  }, [load, loadExpiring]);
 
   async function handleCreate() {
     if (!newName.trim()) return;
@@ -34,8 +42,31 @@ export default function CompanyList() {
     load();
   }
 
+  async function renewHotLead(n) {
+    await api.patchCompany(n.company_id, { hot_lead: true });
+    await api.ackNotification(n.id);
+    loadExpiring();
+    load();
+  }
+
+  async function letHotLeadExpire(n) {
+    await api.patchCompany(n.company_id, { hot_lead: false });
+    await api.ackNotification(n.id);
+    loadExpiring();
+    load();
+  }
+
   return (
     <>
+      {expiringHotLeads.map((n) => (
+        <div className="notification-banner" key={n.id}>
+          <span>🔥 {n.message}</span>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="btn btn-accent btn-sm" onClick={() => renewHotLead(n)}>Renew</button>
+            <button className="btn btn-ghost btn-sm" onClick={() => letHotLeadExpire(n)}>Let it expire</button>
+          </div>
+        </div>
+      ))}
       <div className="field-row" style={{ marginBottom: 12 }}>
         <div className="field" style={{ flex: 2 }}>
           <input placeholder="Search companies…" value={q} onChange={(e) => setQ(e.target.value)} />

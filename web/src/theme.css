@@ -116,7 +116,7 @@ input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.7); }
 .header-user { display: flex; align-items: center; gap: 12px; margin-top: 6px; }
 .header-username { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-secondary); }
 
-.container { max-width: 1200px; margin: 0 auto; padding: 24px 16px 48px; }
+.container { max-width: 1600px; margin: 0 auto; padding: 24px 16px 48px; }
 
 .card {
   background: var(--bg-card);
@@ -128,11 +128,11 @@ input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.7); }
 }
 .card-title {
   font-family: 'JetBrains Mono', monospace;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.1em;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   margin-bottom: 12px;
 }
 
@@ -254,11 +254,13 @@ input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.7); }
 
 .spinner-inline { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text-tertiary); }
 
-.kv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; margin-bottom: 4px; }
-.kv { display: flex; flex-direction: column; gap: 3px; }
-.kv-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-tertiary); }
-.kv-value { font-size: 14px; }
+.kv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; margin-bottom: 4px; }
+.kv-grid > .card { min-width: 0; }
+.kv { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.kv-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-secondary); }
+.kv-value { font-size: 14px; overflow-wrap: break-word; }
 .kv-value.mono { font-family: 'JetBrains Mono', monospace; }
+.kv-value.stat { font-size: clamp(16px, 2.2vw, 22px); line-height: 1.2; }
 
 /* --- Pipeline board (bid stage columns) --- */
 .pipeline-board { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 12px; }
@@ -278,6 +280,17 @@ input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.7); }
 .pipeline-card-meta { display: flex; justify-content: space-between; align-items: center; font-size: 10px; color: var(--text-tertiary); }
 
 .hot-lead-flame { color: var(--red); }
+
+/* --- Dashboard breakdown tables (by company / by region) --- */
+.data-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.data-table th {
+  text-align: left; font-family: 'JetBrains Mono', monospace; font-size: 10px;
+  text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-secondary);
+  padding: 8px 10px; border-bottom: 1px solid var(--border-color);
+}
+.data-table td { padding: 8px 10px; border-bottom: 1px solid var(--border-color); }
+.data-table tr:last-child td { border-bottom: none; }
+.data-table td.num, .data-table th.num { text-align: right; font-family: 'JetBrains Mono', monospace; }
 
 .notification-banner {
   display: flex; align-items: center; justify-content: space-between; gap: 10px;

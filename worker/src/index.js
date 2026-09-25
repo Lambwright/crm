@@ -579,8 +579,10 @@ async function handleEmailCreate(bidId, request, sql, user) {
 async function handleNotificationsList(url, sql) {
   const status = url.searchParams.get("status") || "pending";
   const rows = await sql`
-    select n.*, b.project_name, b.rfq_ref, b.owner_username
-    from notifications n join bids b on b.id = n.bid_id
+    select n.*, b.project_name, b.rfq_ref, b.owner_username, c.name as company_name
+    from notifications n
+    left join bids b on b.id = n.bid_id
+    left join companies c on c.id = coalesce(n.company_id, b.company_id)
     where n.status = ${status}
     order by n.created_at desc limit 200`;
   return json({ notifications: rows });
@@ -604,7 +606,9 @@ async function handleDashboardSummary(sql) {
   const winRateRows = await sql`
     select
       count(*) filter (where stage = 'closed_won')::int as won,
-      count(*) filter (where stage = 'closed_lost')::int as lost
+      count(*) filter (where stage = 'closed_lost')::int as lost,
+      coalesce(sum(estimated_value) filter (where stage = 'closed_won'),0)::float as won_value,
+      coalesce(sum(estimated_value) filter (where stage = 'closed_lost'),0)::float as lost_value
     from bids`;
   const aging = await sql`
     select count(*)::int as overdue_count
@@ -612,18 +616,51 @@ async function handleDashboardSummary(sql) {
     where stage not in ('closed_won', 'closed_lost', 'no_bid')
       and next_action_date is not null and next_action_date < current_date`;
   const hotLeads = await sql`select count(*)::int as hot_lead_count from companies where hot_lead = true`;
+  const totals = await sql`select count(*)::int as total_bids, coalesce(avg(estimated_value),0)::float as avg_bid_value from bids`;
+
+  // Top 10 companies by total bid value (any stage) — a quick "who matters most" view.
+  const byCompany = await sql`
+    select c.id, c.name,
+      count(b.id)::int as bid_count,
+      coalesce(sum(b.estimated_value),0)::float as total_value,
+      count(*) filter (where b.stage = 'closed_won')::int as won_count
+    from companies c join bids b on b.company_id = c.id
+    group by c.id, c.name
+    order by total_value desc
+    limit 10`;
+
+  // Region rollup — region lives on companies, not bids, hence the join.
+  const byRegion = await sql`
+    select coalesce(c.region, 'Unspecified') as region,
+      count(b.id)::int as bid_count,
+      coalesce(sum(b.estimated_value),0)::float as total_value,
+      count(*) filter (where b.stage = 'closed_won')::int as won_count,
+      count(*) filter (where b.stage = 'closed_lost')::int as lost_count
+    from bids b left join companies c on c.id = b.company_id
+    group by coalesce(c.region, 'Unspecified')
+    order by total_value desc`;
 
   const won = winRateRows[0]?.won || 0;
   const lost = winRateRows[0]?.lost || 0;
   const winRate = won + lost > 0 ? won / (won + lost) : null;
+  const wonValue = winRateRows[0]?.won_value || 0;
+  const lostValue = winRateRows[0]?.lost_value || 0;
+  const winRateByValue = wonValue + lostValue > 0 ? wonValue / (wonValue + lostValue) : null;
 
   return json({
     by_stage: byStage,
     win_rate: winRate,
+    win_rate_by_value: winRateByValue,
     won,
     lost,
+    won_value: wonValue,
+    lost_value: lostValue,
+    total_bids: totals[0]?.total_bids || 0,
+    avg_bid_value: totals[0]?.avg_bid_value || 0,
     overdue_followups: aging[0]?.overdue_count || 0,
     hot_leads: hotLeads[0]?.hot_lead_count || 0,
+    by_company: byCompany,
+    by_region: byRegion,
   });
 }
 
@@ -658,7 +695,25 @@ async function runStalenessSweep(env) {
       values (${bid.id}, 'no_owner', ${`"${bid.project_name}" is open with no assigned owner.`})`;
   }
 
-  return { flagged_overdue: overdue.length, flagged_no_owner: noOwner.length };
+  // Hot-lead expiry (Ben, 2026-09): a hot-lead flag prompts for renewal at 30
+  // days old, then auto-clears at 37 days if nobody renewed it — renewing
+  // (PATCH hot_lead:true again) bumps hot_lead_set_at and this cycle restarts.
+  // A week of grace between prompt and auto-clear, not configurable yet.
+  const expiringSoon = await sql`
+    select id, name from companies
+    where hot_lead = true and hot_lead_set_at < now() - interval '30 days'
+      and id not in (select company_id from notifications where type = 'hot_lead_expiring' and status = 'pending')`;
+  for (const company of expiringSoon) {
+    await sql`insert into notifications (company_id, type, message)
+      values (${company.id}, 'hot_lead_expiring', ${`"${company.name}"'s hot-lead flag is 30+ days old — renew it or let it expire.`})`;
+  }
+
+  const autoExpired = await sql`
+    update companies set hot_lead = false, hot_lead_reason = coalesce(hot_lead_reason, '') || ' (auto-expired after 37 days unrenewed)'
+    where hot_lead = true and hot_lead_set_at < now() - interval '37 days'
+    returning id`;
+
+  return { flagged_overdue: overdue.length, flagged_no_owner: noOwner.length, flagged_hot_lead_expiring: expiringSoon.length, auto_expired_hot_leads: autoExpired.length };
 }
 
 // ---------------------------------------------------------------------------

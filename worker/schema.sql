@@ -121,6 +121,11 @@ create table bids (
   -- browser tab's minted ref is never reused) — see kickoff prompt.
   rfq_ref text unique not null,
   procore_bid_board_id text,
+  -- The Procore Portfolio project this bid became, when Procore has linked
+  -- one (only ~19% of Awarded bid board records currently do — mostly recent
+  -- ones, since the auto-link is newer HANDOFF behavior). Not required for
+  -- "won" — that's stage = 'closed_won' regardless of this being set.
+  procore_project_id text,
 
   company_id uuid references companies(id),
   contact_id uuid references contacts(id),
@@ -259,8 +264,12 @@ create index bid_emails_company_idx on bid_emails (company_id);
 create table notifications (
   id uuid primary key default gen_random_uuid(),
   bid_id uuid references bids(id) on delete cascade,
+  -- Company-level notifications (e.g. hot-lead expiry prompts) have no bid;
+  -- bid-level ones (stale follow-up, etc.) have no company. Exactly one of
+  -- the two is populated in practice, not enforced at the DB level.
+  company_id uuid references companies(id) on delete cascade,
 
-  type    text not null check (type in ('stale_followup', 'no_owner', 'missing_next_action', 'past_decision_date')),
+  type    text not null check (type in ('stale_followup', 'no_owner', 'missing_next_action', 'past_decision_date', 'hot_lead_expiring')),
   message text not null,
   status  text not null default 'pending' check (status in ('pending', 'acknowledged', 'closed')),
 
@@ -270,4 +279,5 @@ create table notifications (
 );
 
 create index notifications_bid_idx on notifications (bid_id);
+create index notifications_company_idx on notifications (company_id);
 create index notifications_status_idx on notifications (status) where status = 'pending';

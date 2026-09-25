@@ -8,15 +8,15 @@ import CompanyList from "./components/CompanyList.jsx";
 import Dashboard from "./components/Dashboard.jsx";
 
 const TABS = [
+  { key: "dashboard", label: "Dashboard" },
   { key: "pipeline", label: "Pipeline" },
   { key: "companies", label: "Companies" },
-  { key: "dashboard", label: "Dashboard" },
 ];
 
 export default function App() {
   const [authState, setAuthState] = useState("checking"); // checking | out | in
   const [user, setUser] = useState(null);
-  const [tab, setTab] = useState("pipeline");
+  const [tab, setTab] = useState("dashboard");
   const [notificationCount, setNotificationCount] = useState(0);
 
   useEffect(() => {
