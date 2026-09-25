@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, buildMailto } from "../api.js";
-import { STAGE_LABELS, STAGE_ORDER, STAGE_REQUIREMENTS } from "../stages.js";
+import { HANDOFF_STATUS_LABELS, STAGE_LABELS, STAGE_ORDER, STAGE_REQUIREMENTS } from "../stages.js";
 
 export default function BidDetail({ id, user, onClose, onChanged }) {
   const [data, setData] = useState(null);
@@ -85,6 +85,24 @@ export default function BidDetail({ id, user, onClose, onChanged }) {
           <div className="kv"><span className="kv-label">Bid Due</span><span className="kv-value">{bid.bid_due_date || "—"}</span></div>
           <div className="kv"><span className="kv-label">Next Action</span><span className="kv-value">{bid.next_action ? `${bid.next_action} (${bid.next_action_date || "no date"})` : "—"}</span></div>
         </div>
+
+        {bid.stage === "complete" && (
+          <div className="card" style={{ background: "var(--bg-page)", marginBottom: 16 }}>
+            <div className="card-title">Handoff status</div>
+            <div className="field-help" style={{ marginBottom: 8 }}>
+              Not a pipeline stage — Procore's own Bid Board has no "handoff pending" concept, so
+              this tracks it separately on Awarded bids instead.
+            </div>
+            <select
+              value={bid.handoff_status || "pending"}
+              onChange={async (e) => { await api.patchBid(id, { handoff_status: e.target.value }); load(); onChanged?.(); }}
+            >
+              {Object.entries(HANDOFF_STATUS_LABELS).map(([k, label]) => (
+                <option key={k} value={k}>{label}</option>
+              ))}
+            </select>
+          </div>
+        )}
 
         <div className="card-title">Move stage</div>
         <div className="field-row" style={{ marginBottom: 8 }}>

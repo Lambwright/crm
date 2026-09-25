@@ -20,7 +20,7 @@ export default function BidBoard({ user, onNotificationsChanged }) {
     load();
   }, [load]);
 
-  const columns = showClosed ? [...BOARD_STAGES, "closed_won", "closed_lost", "no_bid"] : BOARD_STAGES;
+  const columns = showClosed ? [...BOARD_STAGES, "complete", "lost", "no_bid"] : BOARD_STAGES;
 
   function handleChanged() {
     load();

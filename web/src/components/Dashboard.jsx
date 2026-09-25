@@ -2,6 +2,13 @@ import { useEffect, useState } from "react";
 import { api } from "../api.js";
 import { STAGE_LABELS, STAGE_ORDER } from "../stages.js";
 
+const RANGES = [
+  { key: "all", label: "All Time" },
+  { key: "year", label: "This Year" },
+  { key: "quarter", label: "This Quarter" },
+  { key: "month", label: "This Month" },
+];
+
 function fmtMoney(n) {
   return `$${Math.round(n || 0).toLocaleString()}`;
 }
@@ -10,23 +17,33 @@ function fmtPct(n) {
 }
 
 export default function Dashboard() {
+  const [range, setRange] = useState("all");
   const [summary, setSummary] = useState(null);
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    api.getDashboardSummary().then(setSummary).catch((e) => setError(e.message));
-  }, []);
+    setSummary(null);
+    api.getDashboardSummary(range).then(setSummary).catch((e) => setError(e.message));
+  }, [range]);
 
   if (error) return <div className="card" style={{ color: "var(--red)" }}>{error}</div>;
   if (!summary) return <div className="spinner-inline">Loading…</div>;
 
   const byStage = Object.fromEntries((summary.by_stage || []).map((r) => [r.stage, r]));
   const totalPipeline = (summary.by_stage || [])
-    .filter((r) => !["closed_won", "closed_lost", "no_bid"].includes(r.stage))
+    .filter((r) => !["complete", "lost", "no_bid"].includes(r.stage))
     .reduce((sum, r) => sum + Number(r.pipeline_value || 0), 0);
 
   return (
     <>
+      <div className="tabs" style={{ marginBottom: 16 }}>
+        {RANGES.map((r) => (
+          <button key={r.key} className={`tab ${range === r.key ? "active" : ""}`} onClick={() => setRange(r.key)}>
+            {r.label}
+          </button>
+        ))}
+      </div>
+
       <div className="kv-grid" style={{ marginBottom: 20 }}>
         <div className="card"><div className="kv-label">Open pipeline value</div><div className="kv-value mono stat">{fmtMoney(totalPipeline)}</div></div>
         <div className="card"><div className="kv-label">Win rate (count)</div><div className="kv-value mono stat">{fmtPct(summary.win_rate)}</div></div>
@@ -54,7 +71,7 @@ export default function Dashboard() {
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(420px, 1fr))", gap: 16 }}>
         <div>
-          <div className="card-title">Top companies by bid value</div>
+          <div className="card-title">Top companies by bid value ({RANGES.find((r) => r.key === range)?.label})</div>
           <table className="data-table">
             <thead>
               <tr><th>Company</th><th className="num">Bids</th><th className="num">Won</th><th className="num">Total value</th></tr>
@@ -69,7 +86,7 @@ export default function Dashboard() {
                 </tr>
               ))}
               {(!summary.by_company || summary.by_company.length === 0) && (
-                <tr><td colSpan={4} className="empty-state">No bids yet.</td></tr>
+                <tr><td colSpan={4} className="empty-state">No bids in this range.</td></tr>
               )}
             </tbody>
           </table>

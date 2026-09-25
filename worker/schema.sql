@@ -143,17 +143,28 @@ create table bids (
   no_bid_reason text,
   override_reason text,         -- leadership override, if qualification_result = 'leadership_override'
 
-  -- Opportunity Stage — Phase 1 doc §4 / Playbook §3.3. The approved 10-stage
-  -- journey (plus On Hold). RFQ Imported is the entry point for every intake
-  -- regardless of qualification result; No Bid is a terminal stage reached
-  -- from Imported, not a starting one, so a disqualified/no-bid RFQ is still
-  -- visible in the pipeline rather than silently absent.
-  stage text not null default 'rfq_imported'
+  -- Opportunity Stage — Procore's own 9 Bid Board statuses (raw enum keys;
+  -- see worker/src/index.js's PROCORE_STAGE_LABELS for the exact display
+  -- labels Einbau's instance uses), plus `no_bid` as a 10th CRM-only stage
+  -- for SCOUT declines, which Procore's own vocabulary has no equivalent
+  -- for (2026-09 decision, migration 005 — supersedes the earlier
+  -- NetSuite-Playbook-derived 10-stage taxonomy this table used at first).
+  -- "Awarded - Handoff Pending" is not a stage here — it's `handoff_status`
+  -- below, an attribute of `complete` bids, not a stage a bid moves through.
+  stage text not null default 'invitation'
     check (stage in (
-      'rfq_imported', 'no_bid', 'qualified_estimating', 'bid_in_preparation',
-      'bid_submitted', 'client_evaluation', 'clarification_negotiation',
-      'awarded_handoff', 'closed_won', 'closed_lost', 'on_hold'
+      'invitation', 'accepted', 'estimating', 'bid_submitted', 'to_do',
+      'delayed', 'in_progress', 'lost', 'complete', 'no_bid'
     )),
+  -- Only meaningful when stage = 'complete' (Awarded). Not a pipeline stage
+  -- of its own — see comment above.
+  handoff_status text check (handoff_status in ('pending', 'complete')),
+  -- The original Procore Bid Board status label a backfilled/synced bid
+  -- carried (e.g. "Awarded", "Lost ENA / CNA") — now effectively redundant
+  -- with `stage` itself post-migration-005 (both speak Procore's language),
+  -- kept for cases where Einbau's custom label wording drifts from the raw
+  -- key CRM stores in `stage`.
+  source_status text,
 
   owner_username     text,   -- assignment-team / estimating lead who owns this bid
   estimator_username text,

@@ -135,43 +135,50 @@ async function requireLogin(request, env) {
 }
 
 // ---------------------------------------------------------------------------
-// Stage machine — Playbook §3.3 (approved stage list) + §5.2 (Workflow B
-// required validations per transition). Kept as data, not scattered if/else,
-// so the required-field list per transition is auditable in one place.
-// ---------------------------------------------------------------------------
-
+// Stage machine — Procore's own 9 Bid Board statuses (2026-09 decision,
+// migration 005), plus `no_bid` as a 10th CRM-only stage for SCOUT declines.
+// Kept as data, not scattered if/else, so the required-field list per
+// transition is auditable in one place. Most of Procore's own statuses
+// (Watch List, the two Active aging buckets, S/I Queue) turned out to be
+// attention/aging flags rather than real data-collection points once Ben
+// walked through what they actually mean day-to-day, so only the two
+// transitions with a real backing requirement (Lost, Awarded) are gated —
+// don't add requirements to the others without confirming they're real.
 const STAGES = [
-  "rfq_imported", "no_bid", "qualified_estimating", "bid_in_preparation",
-  "bid_submitted", "client_evaluation", "clarification_negotiation",
-  "awarded_handoff", "closed_won", "closed_lost", "on_hold",
+  "invitation", "accepted", "estimating", "bid_submitted", "to_do",
+  "delayed", "in_progress", "lost", "complete", "no_bid",
 ];
+
+// Procore's own display labels for each raw stage key (Einbau's instance,
+// confirmed live via /estimating/settings — see kickoff prompt). `no_bid`
+// has no Procore equivalent; label is CRM's own.
+const PROCORE_STAGE_LABELS = {
+  invitation: "Invitation",
+  accepted: "Active (30-60 days)",
+  estimating: "Estimating Queue",
+  bid_submitted: "Submitted (30 days)",
+  to_do: "S/I Queue",
+  delayed: "Watch List",
+  in_progress: "Active (60-90+ days)",
+  lost: "Lost ENA / CNA",
+  complete: "Awarded",
+  no_bid: "No Bid",
+};
 
 // field -> human label, used to build a clear "missing" error message.
 const STAGE_REQUIREMENTS = {
   no_bid: [["no_bid_reason", "No-Bid Reason"]],
-  qualified_estimating: [
-    ["owner_username", "Owner"],
-    ["estimator_username", "Estimator"],
-    ["bid_due_date", "Bid Due Date"],
-  ],
   bid_submitted: [
     ["submitted_date", "Submitted Date"],
     ["submitted_value", "Submitted Value"],
     ["expected_decision_date", "Expected Decision Date"],
     ["next_action_date", "Follow-Up Date"],
   ],
-  client_evaluation: [["next_action_date", "Next Action Date"]],
-  clarification_negotiation: [["next_action", "Next Action"]],
-  on_hold: [
-    ["hold_reason", "Hold Reason"],
-    ["hold_review_date", "Review Date"],
-  ],
-  awarded_handoff: [["estimated_value", "Expected/Final Value"]],
-  closed_won: [
+  complete: [
     ["final_value", "Final Value"],
     ["award_date", "Award Date"],
   ],
-  closed_lost: [["lost_reason", "Lost Reason"]],
+  lost: [["lost_reason", "Lost Reason"]],
 };
 
 // Validate against the merged view of {existing bid row, incoming payload} —
@@ -291,7 +298,7 @@ async function handleScoutIntake(request, sql) {
       returning *`)[0];
   }
 
-  const initialStage = qualification_result === "no_bid" ? "no_bid" : "rfq_imported";
+  const initialStage = qualification_result === "no_bid" ? "no_bid" : "invitation";
 
   const existingBid = await sql`select * from bids where rfq_ref = ${rfq_ref} limit 1`;
   let bid;
@@ -484,7 +491,7 @@ async function handleBidDetail(id, sql) {
 const BID_PATCHABLE = [
   "owner_username", "estimator_username", "bid_due_date", "submitted_date",
   "expected_decision_date", "award_date", "estimated_value", "submitted_value",
-  "final_value", "next_action", "next_action_date", "contact_id",
+  "final_value", "next_action", "next_action_date", "contact_id", "handoff_status",
 ];
 
 async function handleBidPatch(id, request, sql) {
@@ -502,6 +509,7 @@ async function handleBidPatch(id, request, sql) {
       estimated_value = ${merged.estimated_value}, submitted_value = ${merged.submitted_value},
       final_value = ${merged.final_value}, next_action = ${merged.next_action},
       next_action_date = ${merged.next_action_date}, contact_id = ${merged.contact_id},
+      handoff_status = ${merged.handoff_status},
       updated_at = now()
     where id = ${id}
     returning *`;
@@ -533,7 +541,8 @@ async function handleBidStageChange(id, request, sql, user) {
       final_value = ${merged.final_value}, next_action = ${merged.next_action}, next_action_date = ${merged.next_action_date},
       lost_reason = ${merged.lost_reason}, lost_competitor = ${merged.lost_competitor}, lost_feedback = ${merged.lost_feedback},
       hold_reason = ${merged.hold_reason}, hold_review_date = ${merged.hold_review_date},
-      handoff_triggered_at = ${to_stage === "awarded_handoff" ? new Date().toISOString() : bid.handoff_triggered_at},
+      handoff_triggered_at = ${to_stage === "complete" ? (bid.handoff_triggered_at || new Date().toISOString()) : bid.handoff_triggered_at},
+      handoff_status = ${to_stage === "complete" ? (bid.handoff_status || "pending") : bid.handoff_status},
       updated_at = now()
     where id = ${id}
     returning *`;
@@ -541,8 +550,8 @@ async function handleBidStageChange(id, request, sql, user) {
   await sql`insert into bid_stage_history (bid_id, from_stage, to_stage, changed_by, note)
     values (${id}, ${bid.stage}, ${to_stage}, ${user.username}, ${body.note || null})`;
 
-  // Closed Won/Lost close out any pending follow-up notifications (Playbook §5.2).
-  if (to_stage === "closed_won" || to_stage === "closed_lost") {
+  // Awarded/Lost close out any pending follow-up notifications (Playbook §5.2).
+  if (to_stage === "complete" || to_stage === "lost") {
     await sql`update notifications set status = 'closed' where bid_id = ${id} and status = 'pending'`;
   }
 
@@ -601,30 +610,46 @@ async function handleNotificationAck(id, sql, user) {
 // Dashboard
 // ---------------------------------------------------------------------------
 
-async function handleDashboardSummary(sql) {
-  const byStage = await sql`select stage, count(*)::int as count, coalesce(sum(estimated_value),0)::float as pipeline_value from bids group by stage`;
+// 'all' | 'year' | 'quarter' | 'month' -> a real cutoff Date, computed
+// server-side so the client just sends a keyword, not a date it has to get
+// right. Filters on `created_at`, which for backfilled bids is the bid's
+// real historical Procore creation date, not the date it was imported.
+function rangeCutoffDate(range) {
+  const now = new Date();
+  if (range === "month") return new Date(now.getFullYear(), now.getMonth(), 1);
+  if (range === "quarter") return new Date(now.getFullYear(), Math.floor(now.getMonth() / 3) * 3, 1);
+  if (range === "year") return new Date(now.getFullYear(), 0, 1);
+  return new Date(0); // 'all' or anything unrecognized
+}
+
+async function handleDashboardSummary(sql, range) {
+  const cutoffIso = rangeCutoffDate(range).toISOString();
+
+  const byStage = await sql`select stage, count(*)::int as count, coalesce(sum(estimated_value),0)::float as pipeline_value from bids where created_at >= ${cutoffIso} group by stage`;
+
   const winRateRows = await sql`
     select
-      count(*) filter (where stage = 'closed_won')::int as won,
-      count(*) filter (where stage = 'closed_lost')::int as lost,
-      coalesce(sum(estimated_value) filter (where stage = 'closed_won'),0)::float as won_value,
-      coalesce(sum(estimated_value) filter (where stage = 'closed_lost'),0)::float as lost_value
-    from bids`;
+      count(*) filter (where stage = 'complete')::int as won,
+      count(*) filter (where stage = 'lost')::int as lost,
+      coalesce(sum(estimated_value) filter (where stage = 'complete'),0)::float as won_value,
+      coalesce(sum(estimated_value) filter (where stage = 'lost'),0)::float as lost_value
+    from bids where created_at >= ${cutoffIso}`;
   const aging = await sql`
     select count(*)::int as overdue_count
     from bids
-    where stage not in ('closed_won', 'closed_lost', 'no_bid')
+    where stage not in ('complete', 'lost', 'no_bid') and created_at >= ${cutoffIso}
       and next_action_date is not null and next_action_date < current_date`;
   const hotLeads = await sql`select count(*)::int as hot_lead_count from companies where hot_lead = true`;
-  const totals = await sql`select count(*)::int as total_bids, coalesce(avg(estimated_value),0)::float as avg_bid_value from bids`;
+  const totals = await sql`select count(*)::int as total_bids, coalesce(avg(estimated_value),0)::float as avg_bid_value from bids where created_at >= ${cutoffIso}`;
 
-  // Top 10 companies by total bid value (any stage) — a quick "who matters most" view.
+  // Top 10 companies by total bid value in range — a quick "who matters most" view.
   const byCompany = await sql`
     select c.id, c.name,
       count(b.id)::int as bid_count,
       coalesce(sum(b.estimated_value),0)::float as total_value,
-      count(*) filter (where b.stage = 'closed_won')::int as won_count
+      count(*) filter (where b.stage = 'complete')::int as won_count
     from companies c join bids b on b.company_id = c.id
+    where b.created_at >= ${cutoffIso}
     group by c.id, c.name
     order by total_value desc
     limit 10`;
@@ -634,9 +659,10 @@ async function handleDashboardSummary(sql) {
     select coalesce(c.region, 'Unspecified') as region,
       count(b.id)::int as bid_count,
       coalesce(sum(b.estimated_value),0)::float as total_value,
-      count(*) filter (where b.stage = 'closed_won')::int as won_count,
-      count(*) filter (where b.stage = 'closed_lost')::int as lost_count
+      count(*) filter (where b.stage = 'complete')::int as won_count,
+      count(*) filter (where b.stage = 'lost')::int as lost_count
     from bids b left join companies c on c.id = b.company_id
+    where b.created_at >= ${cutoffIso}
     group by coalesce(c.region, 'Unspecified')
     order by total_value desc`;
 
@@ -678,7 +704,7 @@ async function runStalenessSweep(env) {
 
   const overdue = await sql`
     select id, project_name, next_action_date from bids
-    where stage not in ('closed_won', 'closed_lost', 'no_bid')
+    where stage not in ('complete', 'lost', 'no_bid')
       and next_action_date is not null and next_action_date < current_date
       and id not in (select bid_id from notifications where type = 'stale_followup' and status = 'pending')`;
   for (const bid of overdue) {
@@ -688,7 +714,7 @@ async function runStalenessSweep(env) {
 
   const noOwner = await sql`
     select id, project_name from bids
-    where stage not in ('closed_won', 'closed_lost', 'no_bid') and owner_username is null
+    where stage not in ('complete', 'lost', 'no_bid') and owner_username is null
       and id not in (select bid_id from notifications where type = 'no_owner' and status = 'pending')`;
   for (const bid of noOwner) {
     await sql`insert into notifications (bid_id, type, message)
@@ -780,7 +806,7 @@ export default {
         if (isUuid(parts[1]) && parts[2] === "ack" && request.method === "POST") return withRefresh(await handleNotificationAck(parts[1], sql, auth.user));
       }
 
-      if (url.pathname === "/dashboard/summary" && request.method === "GET") return withRefresh(await handleDashboardSummary(sql));
+      if (url.pathname === "/dashboard/summary" && request.method === "GET") return withRefresh(await handleDashboardSummary(sql, url.searchParams.get("range")));
 
       return withRefresh(json({ error: "not_found" }, 404));
     } catch (e) {

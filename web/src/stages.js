@@ -2,62 +2,61 @@
 // client-side hinting only — the worker is the source of truth and validates
 // every transition independently. Keep these two lists in sync by hand; there
 // are few enough stages that a shared-package split isn't worth it yet.
+//
+// These are Procore's own 9 real Bid Board statuses (raw keys; labels below
+// are Einbau's actual custom labels, confirmed live via Procore's
+// /estimating/settings — not guessed), plus `no_bid` as a 10th CRM-only
+// stage for SCOUT declines, which has no Procore equivalent. "Awarded -
+// Handoff Pending" is NOT a stage — see HANDOFF_STATUS_LABELS below; it's an
+// attribute of `complete` bids, not something a bid moves through.
 
 export const STAGE_ORDER = [
-  "rfq_imported", "qualified_estimating", "bid_in_preparation", "bid_submitted",
-  "client_evaluation", "clarification_negotiation", "awarded_handoff",
-  "on_hold", "closed_won", "closed_lost", "no_bid",
+  "invitation", "accepted", "estimating", "bid_submitted", "to_do",
+  "delayed", "in_progress", "lost", "complete", "no_bid",
 ];
 
 export const STAGE_LABELS = {
-  rfq_imported: "RFQ Imported",
+  invitation: "Invitation",
+  accepted: "Active (30-60 days)",
+  estimating: "Estimating Queue",
+  bid_submitted: "Submitted (30 days)",
+  to_do: "S/I Queue",
+  delayed: "Watch List",
+  in_progress: "Active (60-90+ days)",
+  lost: "Lost ENA / CNA",
+  complete: "Awarded",
   no_bid: "No Bid",
-  qualified_estimating: "Qualified – Estimating",
-  bid_in_preparation: "Bid in Preparation",
-  bid_submitted: "Bid Submitted",
-  client_evaluation: "Client Evaluation",
-  clarification_negotiation: "Clarification / Negotiation",
-  awarded_handoff: "Awarded – Handoff Pending",
-  closed_won: "Closed Won",
-  closed_lost: "Closed Lost",
-  on_hold: "On Hold",
+};
+
+export const HANDOFF_STATUS_LABELS = {
+  pending: "Handoff Pending",
+  complete: "Handoff Complete",
 };
 
 // Board columns — closed/no-bid stages are visible in the list view but
 // collapsed off the kanban board by default (BidBoard filters these out of
 // the column set, not out of the underlying data).
 export const BOARD_STAGES = [
-  "rfq_imported", "qualified_estimating", "bid_in_preparation", "bid_submitted",
-  "client_evaluation", "clarification_negotiation", "awarded_handoff", "on_hold",
+  "invitation", "accepted", "estimating", "bid_submitted", "to_do", "delayed", "in_progress",
 ];
 
 // field -> label, shown as inputs when a stage-move requires them. Must match
-// worker/src/index.js's STAGE_REQUIREMENTS exactly.
+// worker/src/index.js's STAGE_REQUIREMENTS exactly. Most of Procore's own
+// statuses turned out to be attention/aging flags rather than real
+// data-collection points (per Ben) — only Lost and Awarded are gated.
 export const STAGE_REQUIREMENTS = {
   no_bid: [["no_bid_reason", "No-Bid Reason", "text"]],
-  qualified_estimating: [
-    ["owner_username", "Owner", "text"],
-    ["estimator_username", "Estimator", "text"],
-    ["bid_due_date", "Bid Due Date", "date"],
-  ],
   bid_submitted: [
     ["submitted_date", "Submitted Date", "date"],
     ["submitted_value", "Submitted Value", "number"],
     ["expected_decision_date", "Expected Decision Date", "date"],
     ["next_action_date", "Follow-Up Date", "date"],
   ],
-  client_evaluation: [["next_action_date", "Next Action Date", "date"]],
-  clarification_negotiation: [["next_action", "Next Action", "text"]],
-  on_hold: [
-    ["hold_reason", "Hold Reason", "text"],
-    ["hold_review_date", "Review Date", "date"],
-  ],
-  awarded_handoff: [["estimated_value", "Expected/Final Value", "number"]],
-  closed_won: [
+  complete: [
     ["final_value", "Final Value", "number"],
     ["award_date", "Award Date", "date"],
   ],
-  closed_lost: [["lost_reason", "Lost Reason", "text"]],
+  lost: [["lost_reason", "Lost Reason", "text"]],
 };
 
 export const ACCOUNT_SEGMENTS = [

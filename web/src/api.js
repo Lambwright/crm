@@ -66,7 +66,7 @@ export const api = {
   ackNotification: (id) => request(`/notifications/${id}/ack`, { method: "POST", body: {} }),
 
   // Dashboard
-  getDashboardSummary: () => request("/dashboard/summary"),
+  getDashboardSummary: (range) => request(`/dashboard/summary${range ? `?range=${encodeURIComponent(range)}` : ""}`),
 };
 
 // Builds a prefilled mailto: link for the tender-email popout. Kept client-side
