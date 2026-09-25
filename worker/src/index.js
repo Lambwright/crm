@@ -144,15 +144,22 @@ async function requireLogin(request, env) {
 // walked through what they actually mean day-to-day, so only the two
 // transitions with a real backing requirement (Lost, Awarded) are gated —
 // don't add requirements to the others without confirming they're real.
+// Order matches Procore's own Bid Board column order (confirmed against a
+// live screenshot, 2026-09), with `rfq` prepended (SCOUT-side, pre-Procore)
+// and `no_bid` appended (CRM-only, no Procore equivalent). `to_do` (S/I
+// Queue) wasn't visible in that screenshot (scrolled off-screen, along with
+// `invitation`) — its position here, right before `complete`, is a guess,
+// not confirmed. Flag if it's actually somewhere else on the real board.
 const STAGES = [
-  "invitation", "accepted", "estimating", "bid_submitted", "to_do",
-  "delayed", "in_progress", "lost", "complete", "no_bid",
+  "rfq", "invitation", "estimating", "bid_submitted", "accepted",
+  "in_progress", "to_do", "complete", "delayed", "lost", "no_bid",
 ];
 
 // Procore's own display labels for each raw stage key (Einbau's instance,
-// confirmed live via /estimating/settings — see kickoff prompt). `no_bid`
-// has no Procore equivalent; label is CRM's own.
+// confirmed live via /estimating/settings — see kickoff prompt). `rfq` and
+// `no_bid` have no Procore equivalent; those two labels are CRM's own.
 const PROCORE_STAGE_LABELS = {
+  rfq: "RFQ",
   invitation: "Invitation",
   accepted: "Active (30-60 days)",
   estimating: "Estimating Queue",
@@ -298,7 +305,11 @@ async function handleScoutIntake(request, sql) {
       returning *`)[0];
   }
 
-  const initialStage = qualification_result === "no_bid" ? "no_bid" : "invitation";
+  // SCOUT hasn't necessarily created the Procore Bid Board entry yet at
+  // intake time (that only happens on submit, and only if push_to_bid was
+  // checked) — so a fresh intake starts at `rfq`, not `invitation`, which is
+  // specifically Procore's own native pre-bid status.
+  const initialStage = qualification_result === "no_bid" ? "no_bid" : "rfq";
 
   const existingBid = await sql`select * from bids where rfq_ref = ${rfq_ref} limit 1`;
   let bid;
@@ -348,13 +359,22 @@ async function handleCompanyLookup(url, sql) {
 async function handleCompaniesList(url, sql) {
   const q = (url.searchParams.get("q") || "").trim();
   const segment = url.searchParams.get("segment");
-  const rows = q
-    ? segment
-      ? await sql`select * from companies where lower(name) like ${"%" + q.toLowerCase() + "%"} and account_segment = ${segment} order by name limit 200`
-      : await sql`select * from companies where lower(name) like ${"%" + q.toLowerCase() + "%"} order by name limit 200`
-    : segment
-      ? await sql`select * from companies where account_segment = ${segment} order by name limit 200`
-      : await sql`select * from companies order by name limit 200`;
+  // Single query with (param is null or ...) conditions rather than 4
+  // hand-duplicated branches, now that it also needs the bids join/aggregate
+  // below — bound params throughout, no raw text splicing.
+  const rows = await sql`
+    select c.*,
+      count(b.id)::int as bid_count,
+      count(*) filter (where b.stage = 'complete')::int as won_count,
+      count(*) filter (where b.stage = 'lost')::int as lost_count,
+      coalesce(sum(b.estimated_value),0)::float as total_value
+    from companies c
+    left join bids b on b.company_id = c.id
+    where (${q || null}::text is null or lower(c.name) like ${q ? "%" + q.toLowerCase() + "%" : null})
+      and (${segment || null}::text is null or c.account_segment = ${segment || null})
+    group by c.id
+    order by c.name
+    limit 200`;
   return json({ companies: rows });
 }
 

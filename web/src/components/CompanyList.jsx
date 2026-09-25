@@ -3,6 +3,10 @@ import { api } from "../api.js";
 import { ACCOUNT_SEGMENT_LABELS, ACCOUNT_SEGMENTS } from "../stages.js";
 import CompanyDetail from "./CompanyDetail.jsx";
 
+function fmtMoney(n) {
+  return `$${Math.round(n || 0).toLocaleString()}`;
+}
+
 export default function CompanyList() {
   const [companies, setCompanies] = useState([]);
   const [q, setQ] = useState("");
@@ -10,8 +14,6 @@ export default function CompanyList() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
-  const [showCreate, setShowCreate] = useState(false);
-  const [newName, setNewName] = useState("");
   const [expiringHotLeads, setExpiringHotLeads] = useState([]);
 
   const load = useCallback(() => {
@@ -33,14 +35,6 @@ export default function CompanyList() {
     load();
     loadExpiring();
   }, [load, loadExpiring]);
-
-  async function handleCreate() {
-    if (!newName.trim()) return;
-    await api.createCompany({ name: newName.trim() });
-    setNewName("");
-    setShowCreate(false);
-    load();
-  }
 
   async function renewHotLead(n) {
     await api.patchCompany(n.company_id, { hot_lead: true });
@@ -77,20 +71,28 @@ export default function CompanyList() {
             {ACCOUNT_SEGMENTS.map((s) => <option key={s} value={s}>{ACCOUNT_SEGMENT_LABELS[s]}</option>)}
           </select>
         </div>
-        <button className="btn btn-accent btn-sm" onClick={() => setShowCreate(true)}>+ New Company</button>
       </div>
       {error && <div className="card" style={{ color: "var(--red)" }}>{error}</div>}
       <div className="row-list">
+        <div className="row-item" style={{ background: "transparent", border: "none", cursor: "default", padding: "0 16px" }}>
+          <div className="kv-label">Company</div>
+          <div className="kv-label">Segment</div>
+          <div className="kv-label" style={{ textAlign: "right" }}>Bids</div>
+          <div className="kv-label" style={{ textAlign: "right" }}>Won</div>
+          <div className="kv-label" style={{ textAlign: "right" }}>Lost</div>
+          <div className="kv-label" style={{ textAlign: "right" }}>Total value</div>
+        </div>
         {companies.map((c) => (
           <div className="row-item" key={c.id} onClick={() => setSelectedId(c.id)}>
             <div className="row-primary">
               {c.hot_lead && <span className="hot-lead-flame">🔥</span>}
               {c.name}
             </div>
-            <div className="row-secondary">{c.region || "—"}</div>
-            <div className="row-secondary">{c.vertical || "—"}</div>
             <div><span className="badge badge-segment">{ACCOUNT_SEGMENT_LABELS[c.account_segment]}</span></div>
-            <div className="row-secondary" style={{ textAlign: "right" }}>{c.tier || ""}</div>
+            <div className="row-amount">{c.bid_count}</div>
+            <div className="row-amount" style={{ color: c.won_count > 0 ? "var(--green)" : undefined }}>{c.won_count}</div>
+            <div className="row-amount" style={{ color: c.lost_count > 0 ? "var(--text-tertiary)" : undefined }}>{c.lost_count}</div>
+            <div className="row-amount">{fmtMoney(c.total_value)}</div>
           </div>
         ))}
         {!loading && companies.length === 0 && <div className="empty-state">No companies match.</div>}
@@ -98,22 +100,6 @@ export default function CompanyList() {
 
       {selectedId && (
         <CompanyDetail id={selectedId} onClose={() => setSelectedId(null)} onChanged={load} />
-      )}
-
-      {showCreate && (
-        <div className="modal-backdrop" onClick={() => setShowCreate(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="card-title">New Company</div>
-            <div className="field" style={{ marginBottom: 12 }}>
-              <label>Name</label>
-              <input autoFocus value={newName} onChange={(e) => setNewName(e.target.value)} />
-            </div>
-            <div className="modal-actions">
-              <button className="btn btn-ghost" onClick={() => setShowCreate(false)}>Cancel</button>
-              <button className="btn btn-accent" onClick={handleCreate}>Create</button>
-            </div>
-          </div>
-        </div>
       )}
     </>
   );

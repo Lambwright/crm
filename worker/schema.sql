@@ -151,9 +151,12 @@ create table bids (
   -- NetSuite-Playbook-derived 10-stage taxonomy this table used at first).
   -- "Awarded - Handoff Pending" is not a stage here — it's `handoff_status`
   -- below, an attribute of `complete` bids, not a stage a bid moves through.
-  stage text not null default 'invitation'
+  -- `rfq` (added migration 006) is a SCOUT-originated intake that hasn't
+  -- necessarily reached Procore's Bid Board yet — distinct from `invitation`,
+  -- which is specifically Procore's own native pre-bid status.
+  stage text not null default 'rfq'
     check (stage in (
-      'invitation', 'accepted', 'estimating', 'bid_submitted', 'to_do',
+      'rfq', 'invitation', 'accepted', 'estimating', 'bid_submitted', 'to_do',
       'delayed', 'in_progress', 'lost', 'complete', 'no_bid'
     )),
   -- Only meaningful when stage = 'complete' (Awarded). Not a pipeline stage

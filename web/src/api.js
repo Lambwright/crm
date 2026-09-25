@@ -46,7 +46,6 @@ export const api = {
   // Companies
   listCompanies: (params = {}) => request(`/companies?${new URLSearchParams(params)}`),
   getCompany: (id) => request(`/companies/${id}`), // { company, contacts, bids }
-  createCompany: (fields) => request("/companies", { method: "POST", body: fields }),
   patchCompany: (id, fields) => request(`/companies/${id}`, { method: "PATCH", body: fields }),
   addContact: (companyId, fields) => request(`/companies/${companyId}/contacts`, { method: "POST", body: fields }),
   patchContact: (id, fields) => request(`/contacts/${id}`, { method: "PATCH", body: fields }),

@@ -3,19 +3,23 @@
 // every transition independently. Keep these two lists in sync by hand; there
 // are few enough stages that a shared-package split isn't worth it yet.
 //
-// These are Procore's own 9 real Bid Board statuses (raw keys; labels below
-// are Einbau's actual custom labels, confirmed live via Procore's
-// /estimating/settings — not guessed), plus `no_bid` as a 10th CRM-only
-// stage for SCOUT declines, which has no Procore equivalent. "Awarded -
-// Handoff Pending" is NOT a stage — see HANDOFF_STATUS_LABELS below; it's an
-// attribute of `complete` bids, not something a bid moves through.
+// Order matches Procore's own Bid Board column order (confirmed against a
+// live screenshot, 2026-09), with `rfq` prepended (SCOUT-originated, hasn't
+// necessarily reached Procore's Bid Board yet) and `no_bid` appended
+// (CRM-only, SCOUT declines, no Procore equivalent). `to_do` (S/I Queue)
+// wasn't visible in that screenshot — its position here, right before
+// `complete`, is a guess, flag if it's actually elsewhere on the real board.
+// "Awarded - Handoff Pending" is NOT a stage — see HANDOFF_STATUS_LABELS
+// below; it's an attribute of `complete` bids, not something a bid moves
+// through the way Procore's own statuses are.
 
 export const STAGE_ORDER = [
-  "invitation", "accepted", "estimating", "bid_submitted", "to_do",
-  "delayed", "in_progress", "lost", "complete", "no_bid",
+  "rfq", "invitation", "estimating", "bid_submitted", "accepted",
+  "in_progress", "to_do", "complete", "delayed", "lost", "no_bid",
 ];
 
 export const STAGE_LABELS = {
+  rfq: "RFQ",
   invitation: "Invitation",
   accepted: "Active (30-60 days)",
   estimating: "Estimating Queue",
@@ -37,7 +41,7 @@ export const HANDOFF_STATUS_LABELS = {
 // collapsed off the kanban board by default (BidBoard filters these out of
 // the column set, not out of the underlying data).
 export const BOARD_STAGES = [
-  "invitation", "accepted", "estimating", "bid_submitted", "to_do", "delayed", "in_progress",
+  "rfq", "invitation", "estimating", "bid_submitted", "accepted", "in_progress", "to_do", "delayed",
 ];
 
 // field -> label, shown as inputs when a stage-move requires them. Must match
