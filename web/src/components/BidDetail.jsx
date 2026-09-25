@@ -51,16 +51,20 @@ export default function BidDetail({ id, user, onClose, onChanged }) {
     }
   }
 
-  function handleCompose() {
-    const mailto = buildMailto({ to: emailDraft.to_addresses, subject: emailDraft.subject, body: emailDraft.body });
-    window.location.href = mailto;
-  }
-
-  async function handleLogEmail() {
-    if (!emailDraft.subject && !emailDraft.body) return;
+  // One action, not two: opening the mail app now logs the email at the same
+  // time, rather than requiring a separate "Log this email" click afterward.
+  // Real tradeoff, not a hidden one: a mailto: link can't tell us whether the
+  // user actually hit send in their mail client, so this can produce a
+  // false-positive record if they cancel or change their mind after
+  // composing. Ben's call, given a two-step flow was judged unlikely to get
+  // followed through consistently — see the 2026-09 conversation.
+  async function handleComposeAndLog() {
+    if (!emailDraft.to_addresses && !emailDraft.subject && !emailDraft.body) return;
     setBusy(true);
     try {
       await api.logEmail(id, { ...emailDraft, from_address: emailDraft.direction === "outbound" ? user.username : undefined, sent_at: new Date().toISOString() });
+      const mailto = buildMailto({ to: emailDraft.to_addresses, subject: emailDraft.subject, body: emailDraft.body });
+      window.location.href = mailto;
       setEmailDraft({ direction: "outbound", subject: "", to_addresses: "", body: "" });
       load();
     } catch (e) {
@@ -169,8 +173,10 @@ export default function BidDetail({ id, user, onClose, onChanged }) {
           <textarea rows={3} value={emailDraft.body} onChange={(e) => setEmailDraft((d) => ({ ...d, body: e.target.value }))} />
         </div>
         <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
-          <button className="btn btn-ghost btn-sm" onClick={handleCompose}>✉ Open in mail app</button>
-          <button className="btn btn-accent btn-sm" onClick={handleLogEmail} disabled={busy}>Log this email</button>
+          <button className="btn btn-accent btn-sm" onClick={handleComposeAndLog} disabled={busy}>✉ Open in mail app &amp; log</button>
+        </div>
+        <div className="field-help" style={{ marginTop: -10, marginBottom: 16 }}>
+          Logs immediately, before you actually send — can't verify send from here (a mailto: link has no way to know).
         </div>
 
         <div className="card-title">Stage history</div>
