@@ -97,14 +97,28 @@ export default function BidDetail({ id, user, onClose, onChanged }) {
               Not a pipeline stage — Procore's own Bid Board has no "handoff pending" concept, so
               this tracks it separately on Awarded bids instead.
             </div>
-            <select
-              value={bid.handoff_status || "pending"}
-              onChange={async (e) => { await api.patchBid(id, { handoff_status: e.target.value }); load(); onChanged?.(); }}
-            >
-              {Object.entries(HANDOFF_STATUS_LABELS).map(([k, label]) => (
-                <option key={k} value={k}>{label}</option>
-              ))}
-            </select>
+            <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+              <select
+                value={bid.handoff_status || "pending"}
+                onChange={async (e) => { await api.patchBid(id, { handoff_status: e.target.value }); load(); onChanged?.(); }}
+              >
+                {Object.entries(HANDOFF_STATUS_LABELS).map(([k, label]) => (
+                  <option key={k} value={k}>{label}</option>
+                ))}
+              </select>
+              {bid.procore_bid_board_id ? (
+                <a
+                  className="btn btn-accent btn-sm"
+                  href={`https://lambwright.github.io/handoff/#/bids?open=${encodeURIComponent(bid.procore_bid_board_id)}`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Start Handoff →
+                </a>
+              ) : (
+                <span className="field-help">No Procore Bid Board ID on this bid — can't deep-link into HANDOFF.</span>
+              )}
+            </div>
           </div>
         )}
 
