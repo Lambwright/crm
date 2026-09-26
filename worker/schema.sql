@@ -168,6 +168,12 @@ create table bids (
   -- kept for cases where Einbau's custom label wording drifts from the raw
   -- key CRM stores in `stage`.
   source_status text,
+  -- Procore's own `archived` flag on the bid board record (migration 007) —
+  -- true once Estimating drains it into their annual archive folder. Doesn't
+  -- change `stage`; just keeps the sync (worker/src/index.js
+  -- handleProcoreSync) from using an archived record as a name-match target
+  -- when attaching a not-yet-linked bid.
+  source_archived boolean not null default false,
 
   owner_username     text,   -- assignment-team / estimating lead who owns this bid
   estimator_username text,
@@ -259,8 +265,10 @@ create table bid_emails (
   body      text,
 
   -- 'manual' = logged by hand after using the mailto popout; 'inbound_forward'
-  -- = arrived via a future forwarding rule; reserved for when that's built.
-  source text not null default 'manual' check (source in ('manual', 'inbound_forward')),
+  -- = arrived via a forwarding rule (reserved, not built); 'auto' = captured
+  -- by email-worker off the per-bid BCC/reply address (migration 007) —
+  -- see kickoff prompt "out-of-the-box outgoing email capture".
+  source text not null default 'manual' check (source in ('manual', 'inbound_forward', 'auto')),
 
   sent_at    timestamptz not null default now(),
   logged_by  text,
@@ -283,7 +291,12 @@ create table notifications (
   -- the two is populated in practice, not enforced at the DB level.
   company_id uuid references companies(id) on delete cascade,
 
-  type    text not null check (type in ('stale_followup', 'no_owner', 'missing_next_action', 'past_decision_date', 'hot_lead_expiring')),
+  -- 'sync_needs_detail' (migration 007): the Procore sync moved a bid to
+  -- Awarded/Lost on its own (see handleProcoreSync) and a required field
+  -- (final_value/award_date or lost_reason) is still missing — a manual
+  -- stage move is blocked until it's filled in (validateStageTransition),
+  -- but the sync can't be blocked the same way, so it flags instead.
+  type    text not null check (type in ('stale_followup', 'no_owner', 'missing_next_action', 'past_decision_date', 'hot_lead_expiring', 'sync_needs_detail')),
   message text not null,
   status  text not null default 'pending' check (status in ('pending', 'acknowledged', 'closed')),
 

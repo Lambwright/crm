@@ -64,6 +64,9 @@ export const api = {
   listNotifications: (status) => request(`/notifications${status ? `?status=${encodeURIComponent(status)}` : ""}`),
   ackNotification: (id) => request(`/notifications/${id}/ack`, { method: "POST", body: {} }),
 
+  // Follow-ups — open bids due (or overdue) for a human touch
+  listFollowups: (mine) => request(`/followups${mine ? "?mine=1" : ""}`),
+
   // Dashboard
   getDashboardSummary: (range) => request(`/dashboard/summary${range ? `?range=${encodeURIComponent(range)}` : ""}`),
 };

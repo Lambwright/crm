@@ -27,10 +27,13 @@
 //   POST   /bids/:id/emails             (Einbau ID) log a sent/received tender email
 //   GET    /notifications?status=       (Einbau ID) the follow-up/staleness ledger
 //   POST   /notifications/:id/ack       (Einbau ID) acknowledge a notification
+//   GET    /followups?mine=1            (Einbau ID) open bids due (or overdue) for a follow-up touch
 //   GET    /dashboard/summary           (Einbau ID) pipeline-by-stage, aging, win-rate aggregates
+//   POST   /internal/procore-sync       (X-Crm-Sync-Key) handoff-worker pushes Bid Board status batches here
+//   POST   /internal/admin/migrate      (X-Crm-Admin-Key) one-off manual migration runner — see bottom of file
 //   scheduled (cron 0 13 * * *)         flag stale/ownerless/actionless open bids into notifications
 //
-// Secrets: DATABASE_URL, CRM_SERVICE_KEY, NETSUITE_SERVICE_KEY
+// Secrets: DATABASE_URL, CRM_SERVICE_KEY, NETSUITE_SERVICE_KEY, CRM_SYNC_KEY, CRM_ADMIN_KEY
 //
 // Design notes:
 //  - Qualification Result, Opportunity Stage, and Account Segment are kept as
@@ -200,6 +203,42 @@ function validateStageTransition(bid, toStage, payload) {
 }
 
 // ---------------------------------------------------------------------------
+// Follow-up cadence (2026-09, Ben) — how often an open bid needs a human
+// touch before it's considered overdue. Pure defaults, easy to retune: only
+// used to compute `next_action_date` when nobody's set one explicitly (or
+// the one that's there has already passed), never overwrites a real future
+// date someone deliberately chose. No entry = closed stage, no cadence.
+// ---------------------------------------------------------------------------
+const FOLLOWUP_CADENCE_DAYS = {
+  rfq: 3,
+  invitation: 3,
+  estimating: 5,
+  bid_submitted: 7,
+  to_do: 7,
+  accepted: 14,
+  in_progress: 14,
+  delayed: 14,
+};
+
+function todayIso() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+// Only pushes the date forward when there isn't already a sensible future
+// one sitting there — so a manual pick always wins until it itself goes
+// stale. `force` (used right after logging an outbound follow-up) always
+// resets the clock, since contact just happened.
+function autoFollowUpDate(stage, existingDateStr, { force = false } = {}) {
+  const cadence = FOLLOWUP_CADENCE_DAYS[stage];
+  if (!cadence) return existingDateStr ?? null;
+  const today = todayIso();
+  if (!force && existingDateStr && existingDateStr >= today) return existingDateStr;
+  const next = new Date();
+  next.setUTCDate(next.getUTCDate() + cadence);
+  return next.toISOString().slice(0, 10);
+}
+
+// ---------------------------------------------------------------------------
 // NetSuite mirror — best-effort only. Parallel-run decision: hot-lead
 // flag/weight is recorded here AND pushed to NetSuite's Customer record so
 // either system reflects it during the transition period. Never blocks the
@@ -288,7 +327,7 @@ async function handleMintRfqRef(sql, user) {
 
 async function handleScoutIntake(request, sql) {
   const body = await parseBody(request);
-  const { rfq_ref, project_name, company_name, procore_vendor_id, contact, qualification_result, scout_score, scout_tier, hot_lead_applied, no_bid_reason, bid_due_date } = body;
+  const { rfq_ref, project_name, company_name, procore_vendor_id, contact, qualification_result, scout_score, scout_tier, hot_lead_applied, no_bid_reason, bid_due_date, procore_bid_board_id } = body;
   if (!rfq_ref) return json({ error: "rfq_ref is required" }, 400);
   if (!project_name) return json({ error: "project_name is required" }, 400);
   if (!company_name) return json({ error: "company_name is required" }, 400);
@@ -305,11 +344,11 @@ async function handleScoutIntake(request, sql) {
       returning *`)[0];
   }
 
-  // SCOUT hasn't necessarily created the Procore Bid Board entry yet at
-  // intake time (that only happens on submit, and only if push_to_bid was
-  // checked) — so a fresh intake starts at `rfq`, not `invitation`, which is
-  // specifically Procore's own native pre-bid status.
-  const initialStage = qualification_result === "no_bid" ? "no_bid" : "rfq";
+  // A fresh intake starts at `rfq`, unless SCOUT already pushed it to the
+  // Procore Bid Board in the same submit (push_to_bid checked, so it hands
+  // back a real procore_bid_board_id) — that's Procore's own native pre-bid
+  // status, `invitation`, not CRM's pre-Procore placeholder.
+  const initialStage = qualification_result === "no_bid" ? "no_bid" : (procore_bid_board_id ? "invitation" : "rfq");
 
   const existingBid = await sql`select * from bids where rfq_ref = ${rfq_ref} limit 1`;
   let bid;
@@ -325,6 +364,7 @@ async function handleScoutIntake(request, sql) {
         hot_lead_applied = ${Boolean(hot_lead_applied)},
         no_bid_reason = ${no_bid_reason ?? existingBid[0].no_bid_reason},
         bid_due_date = ${bid_due_date ?? existingBid[0].bid_due_date},
+        procore_bid_board_id = ${procore_bid_board_id ?? existingBid[0].procore_bid_board_id},
         updated_at = now()
       where id = ${existingBid[0].id}
       returning *`;
@@ -332,10 +372,12 @@ async function handleScoutIntake(request, sql) {
     [bid] = await sql`
       insert into bids (
         rfq_ref, project_name, company_id, contact_id, qualification_result,
-        scout_score, scout_tier, hot_lead_applied, no_bid_reason, bid_due_date, stage
+        scout_score, scout_tier, hot_lead_applied, no_bid_reason, bid_due_date, stage,
+        procore_bid_board_id, next_action_date
       ) values (
         ${rfq_ref}, ${project_name}, ${company.id}, ${contactRow ? contactRow.id : null}, ${qualification_result || "pending_review"},
-        ${scout_score ?? null}, ${scout_tier ?? null}, ${Boolean(hot_lead_applied)}, ${no_bid_reason ?? null}, ${bid_due_date ?? null}, ${initialStage}
+        ${scout_score ?? null}, ${scout_tier ?? null}, ${Boolean(hot_lead_applied)}, ${no_bid_reason ?? null}, ${bid_due_date ?? null}, ${initialStage},
+        ${procore_bid_board_id ?? null}, ${autoFollowUpDate(initialStage, null)}
       ) returning *`;
     await sql`insert into bid_stage_history (bid_id, from_stage, to_stage, changed_by, note)
       values (${bid.id}, null, ${initialStage}, 'system', 'Created from SCOUT intake')`;
@@ -501,7 +543,9 @@ async function handleBidsList(url, sql) {
 
 async function handleBidDetail(id, sql) {
   const rows = await sql`
-    select b.*, c.name as company_name from bids b left join companies c on c.id = b.company_id where b.id = ${id}`;
+    select b.*, c.name as company_name, ct.email as contact_email, ct.first_name as contact_first_name, ct.last_name as contact_last_name
+    from bids b left join companies c on c.id = b.company_id left join contacts ct on ct.id = b.contact_id
+    where b.id = ${id}`;
   if (!rows.length) return json({ error: "not_found" }, 404);
   const history = await sql`select * from bid_stage_history where bid_id = ${id} order by changed_at desc`;
   const emails = await sql`select * from bid_emails where bid_id = ${id} order by sent_at desc`;
@@ -549,7 +593,13 @@ async function handleBidStageChange(id, request, sql, user) {
   if (validation.badStage) return json({ error: "unknown_stage", detail: `"${to_stage}" isn't a recognized stage.` }, 400);
   if (!validation.ok) return json({ error: "missing_required_fields", missing: validation.missing }, 422);
 
+  // Only auto-refresh the cadence date when the caller didn't explicitly set
+  // one in this same call — a human picking a specific follow-up date always
+  // wins over the generic default.
   const merged = { ...bid, ...body, stage: to_stage };
+  if (body.next_action_date === undefined) {
+    merged.next_action_date = autoFollowUpDate(to_stage, bid.next_action_date);
+  }
   const [updated] = await sql`
     update bids set
       stage = ${to_stage},
@@ -589,15 +639,20 @@ async function handleEmailsList(bidId, sql) {
 
 async function handleEmailCreate(bidId, request, sql, user) {
   const body = await parseBody(request);
-  const bidRows = await sql`select company_id from bids where id = ${bidId}`;
+  const bidRows = await sql`select * from bids where id = ${bidId}`;
   if (!bidRows.length) return json({ error: "bid_not_found" }, 404);
   if (!body.direction || !["outbound", "inbound"].includes(body.direction)) {
     return json({ error: "direction must be 'outbound' or 'inbound'" }, 400);
   }
   const [email] = await sql`
-    insert into bid_emails (bid_id, company_id, direction, subject, from_address, to_addresses, cc_addresses, body, sent_at, logged_by)
-    values (${bidId}, ${bidRows[0].company_id}, ${body.direction}, ${body.subject || null}, ${body.from_address || null}, ${body.to_addresses || null}, ${body.cc_addresses || null}, ${body.body || null}, ${body.sent_at || new Date().toISOString()}, ${user.username})
+    insert into bid_emails (bid_id, company_id, direction, subject, from_address, to_addresses, cc_addresses, body, sent_at, logged_by, source)
+    values (${bidId}, ${bidRows[0].company_id}, ${body.direction}, ${body.subject || null}, ${body.from_address || null}, ${body.to_addresses || null}, ${body.cc_addresses || null}, ${body.body || null}, ${body.sent_at || new Date().toISOString()}, ${user.username}, ${body.source || "manual"})
     returning *`;
+
+  // A follow-up just happened — reset the cadence clock rather than waiting
+  // for it to lapse again on its own. Inbound (a client wrote back) counts too.
+  await sql`update bids set next_action_date = ${autoFollowUpDate(bidRows[0].stage, null, { force: true })}, updated_at = now() where id = ${bidId}`;
+
   return json({ email }, 201);
 }
 
@@ -624,6 +679,146 @@ async function handleNotificationAck(id, sql, user) {
     returning *`;
   if (!notification) return json({ error: "not_found" }, 404);
   return json({ notification });
+}
+
+// ---------------------------------------------------------------------------
+// Follow-ups — open bids due (or overdue) for a human touch, per
+// FOLLOWUP_CADENCE_DAYS above. Deliberately just a filtered/sorted view over
+// `bids`, not a separate table: `next_action_date` is already the single
+// source of truth the stale-followup notification also reads.
+// ---------------------------------------------------------------------------
+
+async function handleFollowupsList(url, sql, user) {
+  const mine = url.searchParams.get("mine") === "1";
+  const rows = await sql`
+    select b.*, c.name as company_name, c.hot_lead as company_hot_lead, ct.email as contact_email,
+      ct.first_name as contact_first_name, ct.last_name as contact_last_name
+    from bids b left join companies c on c.id = b.company_id left join contacts ct on ct.id = b.contact_id
+    where b.stage not in ('complete', 'lost', 'no_bid')
+      and (b.next_action_date is null or b.next_action_date <= current_date)
+      and (${mine} = false or b.owner_username = ${user.username} or b.estimator_username = ${user.username})
+    order by (b.next_action_date is null) desc, b.next_action_date asc
+    limit 500`;
+  return json({ bids: rows });
+}
+
+// ---------------------------------------------------------------------------
+// Procore sync — pushed FROM handoff-worker's own Bid Board scan (see its
+// bids.js), not polled by CRM itself. Keeping the whole suite's Procore
+// traffic behind that one already-proven crawler (its own client_credentials
+// app, its own rate-limit pacing) avoids standing up a second independent
+// scanner that could trip the same "too many concurrent Procore calls"
+// lockout from 2026-09 — see kickoff prompt "Procore rate limiting".
+// ---------------------------------------------------------------------------
+
+function isSyncCaller(request, env) {
+  const key = request.headers.get("X-Crm-Sync-Key");
+  return Boolean(key) && Boolean(env.CRM_SYNC_KEY) && key === env.CRM_SYNC_KEY;
+}
+
+async function handleProcoreSync(request, sql) {
+  const body = await parseBody(request);
+  const rows = Array.isArray(body.rows) ? body.rows : [];
+  if (!rows.length) return json({ received: 0, attached: 0, updated: 0 });
+
+  const known = await sql`select * from bids where procore_bid_board_id is not null`;
+  const byBoardId = new Map(known.map((b) => [b.procore_bid_board_id, b]));
+
+  // Fallback attach target for a bid that reached the Procore board without
+  // its id ever making it back to CRM (pre-fix SCOUT pushes, mainly) — exact
+  // case-insensitive company+project name match, same MVP rule as
+  // findOrCreateCompany. Archived records are excluded (a name collision with
+  // a long-dead archived bid is more likely to be wrong than useful).
+  const unattached = await sql`
+    select b.*, c.name as company_name from bids b left join companies c on c.id = b.company_id
+    where b.procore_bid_board_id is null and b.stage = 'rfq'`;
+
+  let attached = 0, updated = 0;
+  for (const row of rows) {
+    const boardId = String(row.id);
+    let bid = byBoardId.get(boardId);
+
+    if (!bid && !row.archived && row.name && row.customer_name) {
+      const idx = unattached.findIndex(
+        (u) =>
+          (u.project_name || "").trim().toLowerCase() === row.name.trim().toLowerCase() &&
+          (u.company_name || "").trim().toLowerCase() === row.customer_name.trim().toLowerCase()
+      );
+      if (idx !== -1) {
+        [bid] = await sql`update bids set procore_bid_board_id = ${boardId}, updated_at = now() where id = ${unattached[idx].id} returning *`;
+        unattached.splice(idx, 1);
+        attached++;
+      }
+    }
+    if (!bid) continue;
+
+    const newStage = String(row.status || "").toLowerCase();
+    const stageKnown = STAGES.includes(newStage);
+    const stageChanged = stageKnown && newStage !== bid.stage;
+    const archivedChanged = Boolean(row.archived) !== bid.source_archived;
+    if (!stageChanged && row.status === bid.source_status && !archivedChanged) continue;
+
+    const [after] = await sql`
+      update bids set
+        stage = ${stageKnown ? newStage : bid.stage},
+        source_status = ${row.status || null},
+        source_archived = ${Boolean(row.archived)},
+        next_action_date = ${stageChanged ? autoFollowUpDate(newStage, bid.next_action_date) : bid.next_action_date},
+        handoff_triggered_at = ${stageChanged && newStage === "complete" ? bid.handoff_triggered_at || new Date().toISOString() : bid.handoff_triggered_at},
+        handoff_status = ${stageChanged && newStage === "complete" ? bid.handoff_status || "pending" : bid.handoff_status},
+        updated_at = now()
+      where id = ${bid.id}
+      returning *`;
+    updated++;
+    if (!stageChanged) continue;
+
+    await sql`insert into bid_stage_history (bid_id, from_stage, to_stage, changed_by, note)
+      values (${bid.id}, ${bid.stage}, ${newStage}, 'procore_sync', 'Detected via Procore Bid Board sync')`;
+
+    if (newStage === "complete" || newStage === "lost") {
+      await sql`update notifications set status = 'closed' where bid_id = ${bid.id} and status = 'pending' and type != 'sync_needs_detail'`;
+      // A manual move through /bids/:id/stage would be BLOCKED without these
+      // fields (validateStageTransition); the sync can't block Procore's own
+      // board, so it flags the gap instead.
+      const validation = validateStageTransition(bid, newStage, {});
+      if (!validation.ok) {
+        await sql`insert into notifications (bid_id, type, message)
+          values (${bid.id}, 'sync_needs_detail', ${`Procore marked "${after.project_name}" as ${PROCORE_STAGE_LABELS[newStage] || newStage} — still need: ${validation.missing.join(", ")}.`})`;
+      }
+    }
+  }
+  return json({ received: rows.length, attached, updated });
+}
+
+// ---------------------------------------------------------------------------
+// Admin — a manual, one-off migration runner (same "temporary /admin/* probe
+// route" pattern HANDOFF used for its own Procore probe). Not wired into any
+// UI; Ben/Claude calls it directly with X-Crm-Admin-Key after adding a new
+// migrations/NNN_*.sql file, so a migration can land without ever needing the
+// raw Neon connection string outside this Worker's own secret.
+// ---------------------------------------------------------------------------
+
+function isAdminCaller(request, env) {
+  const key = request.headers.get("X-Crm-Admin-Key");
+  return Boolean(key) && Boolean(env.CRM_ADMIN_KEY) && key === env.CRM_ADMIN_KEY;
+}
+
+async function handleAdminMigrate(sql) {
+  const statements = [
+    `alter table bids add column if not exists source_archived boolean not null default false`,
+    `alter table notifications drop constraint if exists notifications_type_check`,
+    `alter table notifications add constraint notifications_type_check
+       check (type in ('stale_followup', 'no_owner', 'missing_next_action', 'past_decision_date', 'hot_lead_expiring', 'sync_needs_detail'))`,
+    `alter table bid_emails drop constraint if exists bid_emails_source_check`,
+    `alter table bid_emails add constraint bid_emails_source_check
+       check (source in ('manual', 'inbound_forward', 'auto'))`,
+  ];
+  const ran = [];
+  for (const stmt of statements) {
+    await sql.query(stmt);
+    ran.push(stmt.split("\n")[0].trim());
+  }
+  return json({ ran });
 }
 
 // ---------------------------------------------------------------------------
@@ -787,6 +982,14 @@ export default {
         }
         return await handleCompanyLookup(url, sql);
       }
+      if (url.pathname === "/internal/procore-sync" && request.method === "POST") {
+        if (!isSyncCaller(request, env)) return json({ error: "unauthorized" }, 401);
+        return await handleProcoreSync(request, sql);
+      }
+      if (url.pathname === "/internal/admin/migrate" && request.method === "POST") {
+        if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
+        return await handleAdminMigrate(sql);
+      }
 
       // Everything else needs a real Einbau ID session
       const auth = await requireLogin(request, env);
@@ -825,6 +1028,8 @@ export default {
         if (parts.length === 1 && request.method === "GET") return withRefresh(await handleNotificationsList(url, sql));
         if (isUuid(parts[1]) && parts[2] === "ack" && request.method === "POST") return withRefresh(await handleNotificationAck(parts[1], sql, auth.user));
       }
+
+      if (url.pathname === "/followups" && request.method === "GET") return withRefresh(await handleFollowupsList(url, sql, auth.user));
 
       if (url.pathname === "/dashboard/summary" && request.method === "GET") return withRefresh(await handleDashboardSummary(sql, url.searchParams.get("range")));
 

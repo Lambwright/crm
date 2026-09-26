@@ -54,5 +54,7 @@
 	 *   DATABASE_URL          - Neon Postgres connection string (dedicated `crm` project — do NOT reuse another app's)
 	 *   CRM_SERVICE_KEY       - shared secret SCOUT sends as X-CRM-Service-Key when pushing a qualified RFQ
 	 *   NETSUITE_SERVICE_KEY  - shared secret this worker sends to netsuite-worker as X-NetSuite-Service-Key
+	 *   CRM_SYNC_KEY          - shared secret handoff-worker sends as X-Crm-Sync-Key when pushing a Bid Board sync batch
+	 *   CRM_ADMIN_KEY         - shared secret for the one-off /internal/admin/migrate runner (X-Crm-Admin-Key)
 	 */
 }

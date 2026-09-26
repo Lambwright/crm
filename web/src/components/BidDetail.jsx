@@ -2,14 +2,18 @@ import { useEffect, useState } from "react";
 import { api, buildMailto } from "../api.js";
 import { HANDOFF_STATUS_LABELS, STAGE_LABELS, STAGE_ORDER, STAGE_REQUIREMENTS } from "../stages.js";
 
-export default function BidDetail({ id, user, onClose, onChanged }) {
+export default function BidDetail({ id, user, onClose, onChanged, prefillEmail }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [toStage, setToStage] = useState("");
   const [stageFields, setStageFields] = useState({});
   const [stageError, setStageError] = useState(null);
   const [busy, setBusy] = useState(false);
-  const [emailDraft, setEmailDraft] = useState({ direction: "outbound", subject: "", to_addresses: "", body: "" });
+  const [emailDraft, setEmailDraft] = useState(
+    prefillEmail
+      ? { direction: "outbound", subject: prefillEmail.subject || "", to_addresses: prefillEmail.to || "", body: prefillEmail.body || "" }
+      : { direction: "outbound", subject: "", to_addresses: "", body: "" }
+  );
 
   function load() {
     api.getBid(id).then(setData).catch((e) => setError(e.message));
