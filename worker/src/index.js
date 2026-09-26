@@ -28,6 +28,8 @@
 //   GET    /notifications?status=       (Einbau ID) the follow-up/staleness ledger
 //   POST   /notifications/:id/ack       (Einbau ID) acknowledge a notification
 //   GET    /followups?mine=1            (Einbau ID) open bids due (or overdue) for a follow-up touch
+//   GET    /settings                    (Einbau ID) follow-up cadence + assignable-users list
+//   PATCH  /settings                    (Einbau ID, admin) edit them — see HELM's "CRM Options" tab
 //   GET    /dashboard/summary           (Einbau ID) pipeline-by-stage, aging, win-rate aggregates
 //   POST   /internal/procore-sync       (X-Crm-Sync-Key) handoff-worker pushes Bid Board status batches here
 //   POST   /internal/admin/migrate      (X-Crm-Admin-Key) one-off manual migration runner — see bottom of file
@@ -204,12 +206,15 @@ function validateStageTransition(bid, toStage, payload) {
 
 // ---------------------------------------------------------------------------
 // Follow-up cadence (2026-09, Ben) — how often an open bid needs a human
-// touch before it's considered overdue. Pure defaults, easy to retune: only
-// used to compute `next_action_date` when nobody's set one explicitly (or
-// the one that's there has already passed), never overwrites a real future
-// date someone deliberately chose. No entry = closed stage, no cadence.
+// touch before it's considered overdue. These are just the fallback
+// defaults now — HELM's "CRM Options" tab can override any of them at
+// runtime via crm_settings.followup_cadence_days (see getCrmSettings below)
+// without a code deploy. Only used to compute `next_action_date` when
+// nobody's set one explicitly (or the one that's there has already passed);
+// never overwrites a real future date someone deliberately chose. No entry
+// = closed stage, no cadence.
 // ---------------------------------------------------------------------------
-const FOLLOWUP_CADENCE_DAYS = {
+const DEFAULT_CADENCE_DAYS = {
   rfq: 3,
   invitation: 3,
   estimating: 5,
@@ -227,15 +232,44 @@ function todayIso() {
 // Only pushes the date forward when there isn't already a sensible future
 // one sitting there — so a manual pick always wins until it itself goes
 // stale. `force` (used right after logging an outbound follow-up) always
-// resets the clock, since contact just happened.
-function autoFollowUpDate(stage, existingDateStr, { force = false } = {}) {
-  const cadence = FOLLOWUP_CADENCE_DAYS[stage];
+// resets the clock, since contact just happened. `cadenceDays` is the
+// merged (settings-over-defaults) map from getCrmSettings, not the constant
+// directly, so this stays runtime-tunable.
+function autoFollowUpDate(cadenceDays, stage, existingDateStr, { force = false } = {}) {
+  const cadence = cadenceDays[stage];
   if (!cadence) return existingDateStr ?? null;
   const today = todayIso();
   if (!force && existingDateStr && existingDateStr >= today) return existingDateStr;
   const next = new Date();
   next.setUTCDate(next.getUTCDate() + cadence);
   return next.toISOString().slice(0, 10);
+}
+
+// One row, read-modify-write from HELM's CRM Options tab (GET/PATCH
+// /settings below) — see migration 008. `cadence` is the code defaults with
+// any per-stage override layered on top; `assignableUsernames` is
+// [{username, displayName}] and empty means "not configured yet, allow
+// anything" (see isAssignableUsername).
+async function getCrmSettings(sql) {
+  const [row] = await sql`select * from crm_settings where singleton = 1`;
+  return {
+    cadence: { ...DEFAULT_CADENCE_DAYS, ...(row?.followup_cadence_days || {}) },
+    assignableUsernames: Array.isArray(row?.assignable_usernames) ? row.assignable_usernames : [],
+    updated_at: row?.updated_at || null,
+    updated_by: row?.updated_by || null,
+  };
+}
+
+// Ben, 2026-09: "only estimators or admin people who can assign follow-ups."
+// Einbau ID itself only has admin/user roles (no "estimator"), so the
+// estimator/PM set is this configurable list instead; an admin-role user
+// always bypasses it. Clearing an assignment (username null/empty) is
+// always allowed.
+function isAssignableUsername(settings, actingUser, username) {
+  if (!username) return true;
+  if (actingUser.role === "admin") return true;
+  if (!settings.assignableUsernames.length) return true;
+  return settings.assignableUsernames.some((u) => u.username === username);
 }
 
 // ---------------------------------------------------------------------------
@@ -332,6 +366,7 @@ async function handleScoutIntake(request, sql) {
   if (!project_name) return json({ error: "project_name is required" }, 400);
   if (!company_name) return json({ error: "company_name is required" }, 400);
 
+  const settings = await getCrmSettings(sql);
   const company = await findOrCreateCompany(sql, { name: company_name, procore_vendor_id });
 
   let contactRow = null;
@@ -377,7 +412,7 @@ async function handleScoutIntake(request, sql) {
       ) values (
         ${rfq_ref}, ${project_name}, ${company.id}, ${contactRow ? contactRow.id : null}, ${qualification_result || "pending_review"},
         ${scout_score ?? null}, ${scout_tier ?? null}, ${Boolean(hot_lead_applied)}, ${no_bid_reason ?? null}, ${bid_due_date ?? null}, ${initialStage},
-        ${procore_bid_board_id ?? null}, ${autoFollowUpDate(initialStage, null)}
+        ${procore_bid_board_id ?? null}, ${autoFollowUpDate(settings.cadence, initialStage, null)}
       ) returning *`;
     await sql`insert into bid_stage_history (bid_id, from_stage, to_stage, changed_by, note)
       values (${bid.id}, null, ${initialStage}, 'system', 'Created from SCOUT intake')`;
@@ -558,12 +593,22 @@ const BID_PATCHABLE = [
   "final_value", "next_action", "next_action_date", "contact_id", "handoff_status",
 ];
 
-async function handleBidPatch(id, request, sql) {
+async function handleBidPatch(id, request, sql, user) {
   const body = await parseBody(request);
   const existing = await sql`select * from bids where id = ${id}`;
   if (!existing.length) return json({ error: "not_found" }, 404);
   const fields = Object.keys(body).filter((k) => BID_PATCHABLE.includes(k));
   if (!fields.length) return json({ error: "no_valid_fields", detail: `Patchable fields: ${BID_PATCHABLE.join(", ")}` }, 400);
+
+  if (body.owner_username !== undefined || body.estimator_username !== undefined) {
+    const settings = await getCrmSettings(sql);
+    for (const field of ["owner_username", "estimator_username"]) {
+      if (body[field] !== undefined && !isAssignableUsername(settings, user, body[field])) {
+        return json({ error: "not_assignable", detail: `"${body[field]}" isn't on the assignable-users list (HELM → CRM Options).` }, 422);
+      }
+    }
+  }
+
   const merged = { ...existing[0], ...body };
   const [bid] = await sql`
     update bids set
@@ -593,12 +638,19 @@ async function handleBidStageChange(id, request, sql, user) {
   if (validation.badStage) return json({ error: "unknown_stage", detail: `"${to_stage}" isn't a recognized stage.` }, 400);
   if (!validation.ok) return json({ error: "missing_required_fields", missing: validation.missing }, 422);
 
+  const settings = await getCrmSettings(sql);
+  for (const field of ["owner_username", "estimator_username"]) {
+    if (body[field] !== undefined && !isAssignableUsername(settings, user, body[field])) {
+      return json({ error: "not_assignable", detail: `"${body[field]}" isn't on the assignable-users list (HELM → CRM Options).` }, 422);
+    }
+  }
+
   // Only auto-refresh the cadence date when the caller didn't explicitly set
   // one in this same call — a human picking a specific follow-up date always
   // wins over the generic default.
   const merged = { ...bid, ...body, stage: to_stage };
   if (body.next_action_date === undefined) {
-    merged.next_action_date = autoFollowUpDate(to_stage, bid.next_action_date);
+    merged.next_action_date = autoFollowUpDate(settings.cadence, to_stage, bid.next_action_date);
   }
   const [updated] = await sql`
     update bids set
@@ -651,7 +703,8 @@ async function handleEmailCreate(bidId, request, sql, user) {
 
   // A follow-up just happened — reset the cadence clock rather than waiting
   // for it to lapse again on its own. Inbound (a client wrote back) counts too.
-  await sql`update bids set next_action_date = ${autoFollowUpDate(bidRows[0].stage, null, { force: true })}, updated_at = now() where id = ${bidId}`;
+  const settings = await getCrmSettings(sql);
+  await sql`update bids set next_action_date = ${autoFollowUpDate(settings.cadence, bidRows[0].stage, null, { force: true })}, updated_at = now() where id = ${bidId}`;
 
   return json({ email }, 201);
 }
@@ -721,6 +774,7 @@ async function handleProcoreSync(request, sql) {
   const rows = Array.isArray(body.rows) ? body.rows : [];
   if (!rows.length) return json({ received: 0, attached: 0, updated: 0 });
 
+  const settings = await getCrmSettings(sql);
   const known = await sql`select * from bids where procore_bid_board_id is not null`;
   const byBoardId = new Map(known.map((b) => [b.procore_bid_board_id, b]));
 
@@ -763,7 +817,7 @@ async function handleProcoreSync(request, sql) {
         stage = ${stageKnown ? newStage : bid.stage},
         source_status = ${row.status || null},
         source_archived = ${Boolean(row.archived)},
-        next_action_date = ${stageChanged ? autoFollowUpDate(newStage, bid.next_action_date) : bid.next_action_date},
+        next_action_date = ${stageChanged ? autoFollowUpDate(settings.cadence, newStage, bid.next_action_date) : bid.next_action_date},
         handoff_triggered_at = ${stageChanged && newStage === "complete" ? bid.handoff_triggered_at || new Date().toISOString() : bid.handoff_triggered_at},
         handoff_status = ${stageChanged && newStage === "complete" ? bid.handoff_status || "pending" : bid.handoff_status},
         updated_at = now()
@@ -791,6 +845,33 @@ async function handleProcoreSync(request, sql) {
 }
 
 // ---------------------------------------------------------------------------
+// Settings — read by any logged-in user (the CRM web app needs the
+// assignable-users list for its own owner/estimator picker, and everyone's
+// follow-up dates depend on the cadence); written only by an admin, from
+// HELM's "CRM Options" tab (helm-app, not this repo — it just calls this
+// Worker directly with the logged-in user's own Einbau ID token).
+// ---------------------------------------------------------------------------
+
+async function handleSettingsGet(sql) {
+  return json(await getCrmSettings(sql));
+}
+
+async function handleSettingsPatch(request, sql, user) {
+  if (user.role !== "admin") return json({ error: "forbidden", detail: "Admin access required." }, 403);
+  const body = await parseBody(request);
+  const current = await getCrmSettings(sql);
+  const cadence = body.followup_cadence_days !== undefined ? body.followup_cadence_days : current.cadence;
+  const assignable = body.assignable_usernames !== undefined ? body.assignable_usernames : current.assignableUsernames;
+  await sql`
+    update crm_settings set
+      followup_cadence_days = ${JSON.stringify(cadence)}::jsonb,
+      assignable_usernames = ${JSON.stringify(assignable)}::jsonb,
+      updated_at = now(), updated_by = ${user.username}
+    where singleton = 1`;
+  return json(await getCrmSettings(sql));
+}
+
+// ---------------------------------------------------------------------------
 // Admin — a manual, one-off migration runner (same "temporary /admin/* probe
 // route" pattern HANDOFF used for its own Procore probe). Not wired into any
 // UI; Ben/Claude calls it directly with X-Crm-Admin-Key after adding a new
@@ -812,6 +893,14 @@ async function handleAdminMigrate(sql) {
     `alter table bid_emails drop constraint if exists bid_emails_source_check`,
     `alter table bid_emails add constraint bid_emails_source_check
        check (source in ('manual', 'inbound_forward', 'auto'))`,
+    `create table if not exists crm_settings (
+       singleton int primary key default 1 check (singleton = 1),
+       followup_cadence_days jsonb not null default '{}'::jsonb,
+       assignable_usernames jsonb not null default '[]'::jsonb,
+       updated_at timestamptz not null default now(),
+       updated_by text
+     )`,
+    `insert into crm_settings (singleton) values (1) on conflict (singleton) do nothing`,
   ];
   const ran = [];
   for (const stmt of statements) {
@@ -1018,7 +1107,7 @@ export default {
       if (parts[0] === "bids") {
         if (parts.length === 1 && request.method === "GET") return withRefresh(await handleBidsList(url, sql));
         if (isUuid(parts[1]) && !parts[2] && request.method === "GET") return withRefresh(await handleBidDetail(parts[1], sql));
-        if (isUuid(parts[1]) && !parts[2] && request.method === "PATCH") return withRefresh(await handleBidPatch(parts[1], request, sql));
+        if (isUuid(parts[1]) && !parts[2] && request.method === "PATCH") return withRefresh(await handleBidPatch(parts[1], request, sql, auth.user));
         if (isUuid(parts[1]) && parts[2] === "stage" && request.method === "POST") return withRefresh(await handleBidStageChange(parts[1], request, sql, auth.user));
         if (isUuid(parts[1]) && parts[2] === "emails" && request.method === "GET") return withRefresh(await handleEmailsList(parts[1], sql));
         if (isUuid(parts[1]) && parts[2] === "emails" && request.method === "POST") return withRefresh(await handleEmailCreate(parts[1], request, sql, auth.user));
@@ -1030,6 +1119,9 @@ export default {
       }
 
       if (url.pathname === "/followups" && request.method === "GET") return withRefresh(await handleFollowupsList(url, sql, auth.user));
+
+      if (url.pathname === "/settings" && request.method === "GET") return withRefresh(await handleSettingsGet(sql));
+      if (url.pathname === "/settings" && request.method === "PATCH") return withRefresh(await handleSettingsPatch(request, sql, auth.user));
 
       if (url.pathname === "/dashboard/summary" && request.method === "GET") return withRefresh(await handleDashboardSummary(sql, url.searchParams.get("range")));
 

@@ -8,12 +8,9 @@ import CompanyList from "./components/CompanyList.jsx";
 import Dashboard from "./components/Dashboard.jsx";
 import Followups from "./components/Followups.jsx";
 
-// CRM has no "PM" role of its own (that's a HANDOFF/PUNCH-side distinction —
-// see HANDOFF's users table) — this is purely a tab-ORDER nicety for people
-// who open CRM mainly to work their follow-up list, not an access gate.
-// TODO(ben): fill in the real Einbau usernames of the PMs who'll use this tab.
-const PM_USERNAMES = [];
-
+// "PM" here is CRM's assignable-users list (HELM → CRM Options), not a real
+// role — anyone on it gets Follow-ups first in the nav, since they're the
+// ones actually expected to work that list day to day.
 const BASE_TABS = [
   { key: "dashboard", label: "Dashboard" },
   { key: "pipeline", label: "Pipeline" },
@@ -21,9 +18,8 @@ const BASE_TABS = [
   { key: "companies", label: "Companies" },
 ];
 
-function tabsFor(username) {
-  if (!PM_USERNAMES.includes(username)) return BASE_TABS;
-  // For a PM, Follow-ups leads — everything else keeps its relative order.
+function tabsFor(username, assignableUsernames) {
+  if (!(assignableUsernames || []).some((u) => u.username === username)) return BASE_TABS;
   const followups = BASE_TABS.find((t) => t.key === "followups");
   return [followups, ...BASE_TABS.filter((t) => t.key !== "followups")];
 }
@@ -34,6 +30,7 @@ export default function App() {
   const [tab, setTab] = useState("dashboard");
   const [notificationCount, setNotificationCount] = useState(0);
   const [followupCount, setFollowupCount] = useState(0);
+  const [settings, setSettings] = useState(null);
 
   useEffect(() => {
     const token = getStoredToken();
@@ -61,6 +58,11 @@ export default function App() {
     refreshNotificationCount();
   }, [refreshNotificationCount]);
 
+  useEffect(() => {
+    if (authState !== "in") return;
+    api.getSettings().then(setSettings).catch(() => {});
+  }, [authState]);
+
   function handleLoggedIn(u) {
     setUser(u);
     setAuthState("in");
@@ -87,7 +89,7 @@ export default function App() {
       <Header user={user} onLogout={handleLogout} />
       <div className="container">
         <div className="tabs">
-          {tabsFor(user.username).map((t) => (
+          {tabsFor(user.username, settings?.assignableUsernames).map((t) => (
             <button key={t.key} className={`tab ${tab === t.key ? "active" : ""}`} onClick={() => setTab(t.key)}>
               {t.label}
               {t.key === "pipeline" && notificationCount > 0 && <span className="tab-count">({notificationCount})</span>}
@@ -95,8 +97,8 @@ export default function App() {
             </button>
           ))}
         </div>
-        {tab === "pipeline" && <BidBoard user={user} onNotificationsChanged={refreshNotificationCount} />}
-        {tab === "followups" && <Followups user={user} onNotificationsChanged={refreshNotificationCount} />}
+        {tab === "pipeline" && <BidBoard user={user} assignableUsers={settings?.assignableUsernames || []} onNotificationsChanged={refreshNotificationCount} />}
+        {tab === "followups" && <Followups user={user} assignableUsers={settings?.assignableUsernames || []} onNotificationsChanged={refreshNotificationCount} />}
         {tab === "companies" && <CompanyList />}
         {tab === "dashboard" && <Dashboard />}
       </div>

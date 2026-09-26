@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { api, buildMailto } from "../api.js";
 import { HANDOFF_STATUS_LABELS, STAGE_LABELS, STAGE_ORDER, STAGE_REQUIREMENTS } from "../stages.js";
 
-export default function BidDetail({ id, user, onClose, onChanged, prefillEmail }) {
+export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, assignableUsers = [] }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [toStage, setToStage] = useState("");
@@ -36,6 +36,40 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail }
 
   const { bid, stage_history, emails } = data;
   const requirements = toStage ? STAGE_REQUIREMENTS[toStage] || [] : [];
+
+  async function assignField(field, value) {
+    setStageError(null);
+    try {
+      await api.patchBid(id, { [field]: value || null });
+      load();
+      onChanged?.();
+    } catch (e) {
+      setStageError(e.data?.detail || e.message);
+    }
+  }
+
+  function assignSelect(field, currentValue) {
+    if (!assignableUsers.length) {
+      return (
+        <input
+          defaultValue={currentValue || ""}
+          onBlur={(e) => e.target.value !== (currentValue || "") && assignField(field, e.target.value)}
+          style={{ fontSize: 12, padding: "2px 6px" }}
+        />
+      );
+    }
+    const options = assignableUsers.some((u) => u.username === currentValue) || !currentValue
+      ? assignableUsers
+      : [{ username: currentValue, displayName: currentValue }, ...assignableUsers];
+    return (
+      <select value={currentValue || ""} onChange={(e) => assignField(field, e.target.value)} style={{ fontSize: 12, padding: "2px 4px" }}>
+        <option value="">— unassigned —</option>
+        {options.map((u) => (
+          <option key={u.username} value={u.username}>{u.displayName || u.username}</option>
+        ))}
+      </select>
+    );
+  }
 
   async function handleMoveStage() {
     if (!toStage) return;
@@ -88,8 +122,8 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail }
         <div className="kv-grid" style={{ marginBottom: 16 }}>
           <div className="kv"><span className="kv-label">Stage</span><span className="kv-value">{STAGE_LABELS[bid.stage]}</span></div>
           <div className="kv"><span className="kv-label">SCOUT Tier</span><span className="kv-value">{bid.scout_tier || "—"}{bid.hot_lead_applied ? " (hot-lead bump)" : ""}</span></div>
-          <div className="kv"><span className="kv-label">Owner</span><span className="kv-value">{bid.owner_username || "—"}</span></div>
-          <div className="kv"><span className="kv-label">Estimator</span><span className="kv-value">{bid.estimator_username || "—"}</span></div>
+          <div className="kv"><span className="kv-label">Owner</span><span className="kv-value">{assignSelect("owner_username", bid.owner_username)}</span></div>
+          <div className="kv"><span className="kv-label">Estimator</span><span className="kv-value">{assignSelect("estimator_username", bid.estimator_username)}</span></div>
           <div className="kv"><span className="kv-label">Bid Due</span><span className="kv-value">{bid.bid_due_date || "—"}</span></div>
           <div className="kv"><span className="kv-label">Next Action</span><span className="kv-value">{bid.next_action ? `${bid.next_action} (${bid.next_action_date || "no date"})` : "—"}</span></div>
         </div>

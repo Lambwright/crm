@@ -10,7 +10,7 @@ function daysOverdue(dateStr) {
   return days;
 }
 
-export default function Followups({ user, onNotificationsChanged }) {
+export default function Followups({ user, assignableUsers = [], onNotificationsChanged }) {
   const [bids, setBids] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -83,6 +83,7 @@ export default function Followups({ user, onNotificationsChanged }) {
         <BidDetail
           id={selected.id}
           user={user}
+          assignableUsers={assignableUsers}
           prefillEmail={selected.prefillEmail}
           onClose={() => setSelected(null)}
           onChanged={handleChanged}

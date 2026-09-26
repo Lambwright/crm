@@ -3,7 +3,7 @@ import { api } from "../api.js";
 import { BOARD_STAGES, STAGE_LABELS } from "../stages.js";
 import BidDetail from "./BidDetail.jsx";
 
-export default function BidBoard({ user, onNotificationsChanged }) {
+export default function BidBoard({ user, assignableUsers = [], onNotificationsChanged }) {
   const [bids, setBids] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -68,6 +68,7 @@ export default function BidBoard({ user, onNotificationsChanged }) {
         <BidDetail
           id={selectedId}
           user={user}
+          assignableUsers={assignableUsers}
           onClose={() => setSelectedId(null)}
           onChanged={handleChanged}
         />

@@ -69,6 +69,9 @@ export const api = {
 
   // Dashboard
   getDashboardSummary: (range) => request(`/dashboard/summary${range ? `?range=${encodeURIComponent(range)}` : ""}`),
+
+  // Settings — cadence + assignable-users list, edited from HELM's CRM Options tab
+  getSettings: () => request(`/settings`),
 };
 
 // Builds a prefilled mailto: link for the tender-email popout. Kept client-side

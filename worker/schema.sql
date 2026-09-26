@@ -308,3 +308,17 @@ create table notifications (
 create index notifications_bid_idx on notifications (bid_id);
 create index notifications_company_idx on notifications (company_id);
 create index notifications_status_idx on notifications (status) where status = 'pending';
+
+-- ---------------------------------------------------------------------------
+-- crm_settings — a tunable singleton editable from HELM's CRM Options tab
+-- instead of a code deploy (migration 008, 2026-09). See worker/src/index.js
+-- getCrmSettings/handleSettingsPatch for how the two fields are used.
+-- ---------------------------------------------------------------------------
+create table crm_settings (
+  singleton int primary key default 1 check (singleton = 1),
+  followup_cadence_days jsonb not null default '{}'::jsonb,
+  assignable_usernames jsonb not null default '[]'::jsonb,
+  updated_at timestamptz not null default now(),
+  updated_by text
+);
+insert into crm_settings (singleton) values (1) on conflict (singleton) do nothing;
