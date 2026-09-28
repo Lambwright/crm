@@ -946,6 +946,14 @@ async function handleAdminMigrate(sql) {
 // real historical Procore creation date, not the date it was imported.
 function rangeCutoffDate(range) {
   const now = new Date();
+  if (range === "week") {
+    // Calendar week starting Monday, matching the other ranges' "start of
+    // the current calendar period" meaning rather than a rolling 7 days.
+    const day = now.getDay(); // 0 = Sunday
+    const diffToMonday = day === 0 ? 6 : day - 1;
+    const monday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - diffToMonday);
+    return monday;
+  }
   if (range === "month") return new Date(now.getFullYear(), now.getMonth(), 1);
   if (range === "quarter") return new Date(now.getFullYear(), Math.floor(now.getMonth() / 3) * 3, 1);
   if (range === "year") return new Date(now.getFullYear(), 0, 1);
@@ -971,6 +979,16 @@ async function handleDashboardSummary(sql, range) {
       and next_action_date is not null and next_action_date < current_date`;
   const hotLeads = await sql`select count(*)::int as hot_lead_count from companies where hot_lead = true`;
   const totals = await sql`select count(*)::int as total_bids, coalesce(avg(estimated_value),0)::float as avg_bid_value from bids where created_at >= ${cutoffIso}`;
+
+  // "Follow-ups completed" = outbound tender emails logged in range — that's
+  // literally what the Follow-ups tab's "Follow up ->" action produces
+  // (handleEmailCreate), so it's a direct count of real follow-up touches,
+  // not a derived/estimated figure. Counts every outbound email logged
+  // against a bid, not just ones opened from the Follow-ups tab specifically
+  // — the tab and the Pipeline's own compose-and-log box write to the same
+  // table, and distinguishing "was this technically overdue" isn't tracked.
+  const followupsCompleted = await sql`
+    select count(*)::int as count from bid_emails where direction = 'outbound' and sent_at >= ${cutoffIso}`;
 
   // Top 10 companies by total bid value in range — a quick "who matters most" view.
   const byCompany = await sql`
@@ -1014,6 +1032,7 @@ async function handleDashboardSummary(sql, range) {
     total_bids: totals[0]?.total_bids || 0,
     avg_bid_value: totals[0]?.avg_bid_value || 0,
     overdue_followups: aging[0]?.overdue_count || 0,
+    followups_completed: followupsCompleted[0]?.count || 0,
     hot_leads: hotLeads[0]?.hot_lead_count || 0,
     by_company: byCompany,
     by_region: byRegion,

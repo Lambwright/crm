@@ -7,6 +7,7 @@ const RANGES = [
   { key: "year", label: "This Year" },
   { key: "quarter", label: "This Quarter" },
   { key: "month", label: "This Month" },
+  { key: "week", label: "This Week" },
 ];
 
 function fmtMoney(n) {
@@ -52,6 +53,7 @@ export default function Dashboard() {
         <div className="card"><div className="kv-label">Total bids tracked</div><div className="kv-value mono stat">{summary.total_bids}</div></div>
         <div className="card"><div className="kv-label">Avg bid value</div><div className="kv-value mono stat">{fmtMoney(summary.avg_bid_value)}</div></div>
         <div className="card"><div className="kv-label">Overdue follow-ups</div><div className="kv-value mono stat" style={{ color: summary.overdue_followups > 0 ? "var(--red)" : undefined }}>{summary.overdue_followups}</div></div>
+        <div className="card"><div className="kv-label">Follow-ups completed ({RANGES.find((r) => r.key === range)?.label})</div><div className="kv-value mono stat">{summary.followups_completed}</div></div>
         <div className="card"><div className="kv-label">Hot leads flagged</div><div className="kv-value mono stat">🔥 {summary.hot_leads}</div></div>
       </div>
 
