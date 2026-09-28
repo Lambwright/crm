@@ -1,19 +1,27 @@
 import { useEffect, useRef, useState } from "react";
 
-// Same suite switcher every other app carries. CRM isn't wired into the other
-// apps' own switchers yet — that's a small addition to make in each sibling
-// app's Header.jsx once this one is actually deployed, not done here.
-function appLinks() {
-  return [
-    { name: "PUNCH", url: "https://lambwright.github.io/PUNCH/" },
-    { name: "SCOUT", url: "https://lambwright.github.io/scout-addin/app.html" },
-    { name: "INTAKE", url: "https://lambwright.github.io/scout-intake/" },
-    { name: "TALLY", url: "https://lambwright.github.io/tally/" },
-    { name: "HANDOFF", url: "https://lambwright.github.io/handoff/" },
-    { name: "LEDGER", url: "https://lambwright.github.io/ledger/" },
-    { name: "HELM", url: "https://lambwright.github.io/helm/" },
-    { name: "CRM", url: "https://lambwright.github.io/crm/", current: true },
-  ];
+const CURRENT_APP = "CRM";
+const APP_LINKS = [
+  { name: "PUNCH", url: "https://lambwright.github.io/PUNCH/" },
+  { name: "SCOUT", url: "https://lambwright.github.io/scout-addin/app.html" },
+  { name: "INTAKE", url: "https://lambwright.github.io/scout-intake/" },
+  { name: "TALLY", url: "https://lambwright.github.io/tally/" },
+  { name: "HANDOFF", url: "https://lambwright.github.io/handoff/" },
+  { name: "LEDGER", url: "https://lambwright.github.io/ledger/" },
+  { name: "CRM", url: "https://lambwright.github.io/crm/" },
+];
+const HELM_LINK = { name: "HELM", url: "https://lambwright.github.io/helm/" };
+
+// Only apps this user can open, then HELM always last (it's where settings
+// live). No apps granted = nothing but this app and HELM (access fails
+// closed — see auth-worker/README.md).
+function appLinks(user) {
+  const apps = (Array.isArray(user?.apps) ? user.apps : []).map((a) => String(a).toUpperCase());
+  const allowed = (name) => apps.includes(name);
+  return [...APP_LINKS.filter((a) => a.name === CURRENT_APP || allowed(a.name)), HELM_LINK].map((a) => ({
+    ...a,
+    current: a.name === CURRENT_APP,
+  }));
 }
 
 export default function Header({ user, onLogout }) {
@@ -43,7 +51,7 @@ export default function Header({ user, onLogout }) {
         <span className="header-brand-tag">An Einbau Product</span>
         {open && (
           <div className="app-switcher-menu">
-            {appLinks().map((app) => (
+            {appLinks(user).map((app) => (
               <a className={`app-switcher-item${app.current ? " current" : ""}`} href={app.url} key={app.name}>
                 {app.name}
               </a>

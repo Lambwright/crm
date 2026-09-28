@@ -1,10 +1,10 @@
 import { useState } from "react";
 import { login } from "../auth.js";
 
-export default function LoginScreen({ onLoggedIn }) {
+export default function LoginScreen({ onLoggedIn, initialError }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState(null);
+  const [error, setError] = useState(initialError || null);
   const [busy, setBusy] = useState(false);
 
   async function handleSubmit(e) {

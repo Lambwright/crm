@@ -33,6 +33,7 @@
 //   GET    /dashboard/summary           (Einbau ID) pipeline-by-stage, aging, win-rate aggregates
 //   POST   /internal/procore-sync       (X-Crm-Sync-Key) handoff-worker pushes Bid Board status batches here
 //   POST   /internal/admin/migrate      (X-Crm-Admin-Key) one-off manual migration runner — see bottom of file
+//   POST   /internal/admin/backfill-followup-dates  (X-Crm-Admin-Key) one-off: real created_at + cadence -> next_action_date for open bids missing one
 //   scheduled (cron 0 13 * * *)         flag stale/ownerless/actionless open bids into notifications
 //
 // Secrets: DATABASE_URL, CRM_SERVICE_KEY, NETSUITE_SERVICE_KEY, CRM_SYNC_KEY, CRM_ADMIN_KEY
@@ -119,14 +120,13 @@ async function requireLogin(request, env) {
     if (!data.valid) return { ok: false, reason: "Session is invalid or expired — please log in again." };
     if (!data.user) return { ok: false, reason: "auth-worker returned no user for this session." };
 
-    // Per-app access list from HELM (auth-worker/README.md). Absent apps =
-    // unrestricted (every user today) — only deny when it's a present array
-    // that doesn't include "CRM".
-    if (data.user.apps !== undefined) {
-      const apps = Array.isArray(data.user.apps) ? data.user.apps : [];
-      if (!apps.includes("CRM")) {
-        return { ok: false, reason: `"${data.user.username}" doesn't have CRM access (HELM apps list).` };
-      }
+    // Per-app access list from HELM (auth-worker/README.md, "The user object,
+    // and the apps field") — auth-worker now always returns `apps` as an
+    // array (never undefined) and fails closed: no apps granted means no
+    // access, full stop, not "unrestricted." Admin role does NOT bypass this
+    // (matches every other suite app's post-2026-09-28 gate).
+    if (!Array.isArray(data.user.apps) || !data.user.apps.includes("CRM")) {
+      return { ok: false, reason: `"${data.user.username}" doesn't have CRM access (HELM apps list).` };
     }
 
     const allowedRoles = String(env.ALLOWED_ROLES || "admin,user").split(",").map((r) => r.trim());
@@ -884,6 +884,32 @@ function isAdminCaller(request, env) {
   return Boolean(key) && Boolean(env.CRM_ADMIN_KEY) && key === env.CRM_ADMIN_KEY;
 }
 
+// One-off: give every currently-open bid a real next_action_date instead of
+// null (Ben, 2026-09: "real date created... informing the stage change
+// logic, not placeholder dates"). Anchored on the bid's actual created_at —
+// not today — so a bid that's sat untouched since early 2025 shows up
+// genuinely, deeply overdue rather than looking freshly due. `offset`/`limit`
+// let a huge backlog be run in a few calls if one invocation can't finish in
+// time; safe to re-run (only ever touches rows still null).
+async function handleAdminBackfillFollowupDates(sql, { offset = 0, limit = 2000 } = {}) {
+  const settings = await getCrmSettings(sql);
+  const rows = await sql`
+    select id, stage, created_at from bids
+    where stage not in ('complete', 'lost', 'no_bid') and next_action_date is null
+    order by id
+    offset ${offset} limit ${limit}`;
+  let updated = 0;
+  for (const b of rows) {
+    const cadence = settings.cadence[b.stage];
+    if (!cadence) continue;
+    const anchor = new Date(b.created_at);
+    anchor.setUTCDate(anchor.getUTCDate() + cadence);
+    await sql`update bids set next_action_date = ${anchor.toISOString().slice(0, 10)} where id = ${b.id}`;
+    updated++;
+  }
+  return json({ scanned: rows.length, updated, offset, nextOffset: offset + rows.length });
+}
+
 async function handleAdminMigrate(sql) {
   const statements = [
     `alter table bids add column if not exists source_archived boolean not null default false`,
@@ -1078,6 +1104,11 @@ export default {
       if (url.pathname === "/internal/admin/migrate" && request.method === "POST") {
         if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
         return await handleAdminMigrate(sql);
+      }
+      if (url.pathname === "/internal/admin/backfill-followup-dates" && request.method === "POST") {
+        if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
+        const body = await parseBody(request);
+        return await handleAdminBackfillFollowupDates(sql, { offset: body.offset || 0, limit: body.limit || 2000 });
       }
 
       // Everything else needs a real Einbau ID session

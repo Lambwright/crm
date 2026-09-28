@@ -27,6 +27,7 @@ function tabsFor(username, assignableUsernames) {
 export default function App() {
   const [authState, setAuthState] = useState("checking"); // checking | out | in
   const [user, setUser] = useState(null);
+  const [loginNotice, setLoginNotice] = useState(null);
   const [tab, setTab] = useState("dashboard");
   const [notificationCount, setNotificationCount] = useState(0);
   const [followupCount, setFollowupCount] = useState(0);
@@ -43,6 +44,9 @@ export default function App() {
         setUser(data.user);
         setAuthState("in");
       } else {
+        if (data.error === "no_app_access") {
+          setLoginNotice("Your account doesn't have access to any apps yet. Ask an admin to grant you access in HELM.");
+        }
         setAuthState("out");
       }
     });
@@ -81,7 +85,7 @@ export default function App() {
     );
   }
   if (authState === "out") {
-    return <LoginScreen onLoggedIn={handleLoggedIn} />;
+    return <LoginScreen onLoggedIn={handleLoggedIn} initialError={loginNotice} />;
   }
 
   return (
