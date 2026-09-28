@@ -7,6 +7,18 @@ function fmtMoney(n) {
   return `$${Math.round(n || 0).toLocaleString()}`;
 }
 
+// Sorted entirely client-side — the company list is already fully loaded for
+// search/segment filtering, so there's no reason to round-trip to the worker
+// just to reorder what's already in memory.
+const SORT_COLUMNS = {
+  name: { label: "Company", get: (c) => (c.name || "").toLowerCase(), dir: "asc" },
+  account_segment: { label: "Segment", get: (c) => (ACCOUNT_SEGMENT_LABELS[c.account_segment] || ""), dir: "asc" },
+  bid_count: { label: "Bids", get: (c) => c.bid_count || 0, dir: "desc" },
+  won_count: { label: "Won", get: (c) => c.won_count || 0, dir: "desc" },
+  lost_count: { label: "Lost", get: (c) => c.lost_count || 0, dir: "desc" },
+  total_value: { label: "Total value", get: (c) => c.total_value || 0, dir: "desc" },
+};
+
 export default function CompanyList() {
   const [companies, setCompanies] = useState([]);
   const [q, setQ] = useState("");
@@ -15,6 +27,24 @@ export default function CompanyList() {
   const [error, setError] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
   const [expiringHotLeads, setExpiringHotLeads] = useState([]);
+  const [sortKey, setSortKey] = useState("name");
+  const [sortDir, setSortDir] = useState("asc");
+
+  function toggleSort(key) {
+    if (key === sortKey) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(key);
+      setSortDir(SORT_COLUMNS[key].dir); // each column's natural first click direction
+    }
+  }
+
+  const sortedCompanies = [...companies].sort((a, b) => {
+    const get = SORT_COLUMNS[sortKey].get;
+    const va = get(a), vb = get(b);
+    const cmp = typeof va === "string" ? va.localeCompare(vb) : va - vb;
+    return sortDir === "asc" ? cmp : -cmp;
+  });
 
   const load = useCallback(() => {
     setLoading(true);
@@ -75,14 +105,18 @@ export default function CompanyList() {
       {error && <div className="card" style={{ color: "var(--red)" }}>{error}</div>}
       <div className="row-list">
         <div className="row-item" style={{ background: "transparent", border: "none", cursor: "default", padding: "0 16px" }}>
-          <div className="kv-label">Company</div>
-          <div className="kv-label">Segment</div>
-          <div className="kv-label" style={{ textAlign: "right" }}>Bids</div>
-          <div className="kv-label" style={{ textAlign: "right" }}>Won</div>
-          <div className="kv-label" style={{ textAlign: "right" }}>Lost</div>
-          <div className="kv-label" style={{ textAlign: "right" }}>Total value</div>
+          {Object.entries(SORT_COLUMNS).map(([key, col]) => (
+            <div
+              key={key}
+              className="kv-label"
+              style={{ textAlign: key === "name" || key === "account_segment" ? "left" : "right", cursor: "pointer", userSelect: "none" }}
+              onClick={() => toggleSort(key)}
+            >
+              {col.label}{sortKey === key ? (sortDir === "asc" ? " ▲" : " ▼") : ""}
+            </div>
+          ))}
         </div>
-        {companies.map((c) => (
+        {sortedCompanies.map((c) => (
           <div className="row-item" key={c.id} onClick={() => setSelectedId(c.id)}>
             <div className="row-primary">
               {c.hot_lead && <span className="hot-lead-flame">🔥</span>}

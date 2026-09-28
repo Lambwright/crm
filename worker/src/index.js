@@ -1124,6 +1124,13 @@ export default {
         if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
         return await handleAdminMigrate(sql);
       }
+      if (url.pathname === "/internal/admin/backfill-stats" && request.method === "GET") {
+        if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
+        const all = await sql`select min(created_at) as min_created, max(created_at) as max_created, count(*)::int as total from bids`;
+        const backfilled = await sql`select min(created_at) as min_created, max(created_at) as max_created, count(*)::int as total from bids where rfq_ref like 'PROCORE-%'`;
+        const nonBackfilled = await sql`select min(created_at) as min_created, max(created_at) as max_created, count(*)::int as total from bids where rfq_ref not like 'PROCORE-%'`;
+        return json({ all: all[0], backfilled: backfilled[0], non_backfilled: nonBackfilled[0] });
+      }
       if (url.pathname === "/internal/admin/backfill-followup-dates" && request.method === "POST") {
         if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
         const body = await parseBody(request);
