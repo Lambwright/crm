@@ -57,6 +57,13 @@ export default function Dashboard() {
         <div className="card"><div className="kv-label">Open pipeline value</div><div className="kv-value mono stat">{fmtMoney(totalPipeline)}</div></div>
         <div className="card"><div className="kv-label" title="Cohort: of bids created in this range, how many are won">Win rate (count)</div><div className="kv-value mono stat">{fmtPct(summary.win_rate)}</div></div>
         <div className="card"><div className="kv-label" title="Cohort: of bids created in this range, how many $ are won">Win rate ($ value)</div><div className="kv-value mono stat">{fmtPct(summary.win_rate_by_value)}</div></div>
+        <div className="card">
+          <div className="kv-label" title="Awarded / (Awarded + Lost + everything past qualification) — excludes RFQ/Invitation/Estimating and archived">Win rate (pipeline)</div>
+          <div className="kv-value mono stat">{fmtPct(summary.pipeline_win_rate)}</div>
+          {summary.pipeline_win_rate_components && (
+            <div className="field-help">{summary.pipeline_win_rate_components.complete} won / {summary.pipeline_win_rate_components.total} in pipeline</div>
+          )}
+        </div>
         <div className="card"><div className="kv-label">Won / Lost (cohort)</div><div className="kv-value mono stat">{summary.won} / {summary.lost}</div></div>
         <div className="card"><div className="kv-label">Total bids tracked</div><div className="kv-value mono stat">{summary.total_bids}</div></div>
         <div className="card"><div className="kv-label">Avg bid value</div><div className="kv-value mono stat">{fmtMoney(summary.avg_bid_value)}</div></div>

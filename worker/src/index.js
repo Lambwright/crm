@@ -1008,6 +1008,25 @@ async function handleDashboardSummary(sql, range) {
   // this honest: only transitions with a real timestamp — a manual move or
   // the Procore sync bridge — count toward a specific period.
   const excludeBackfillArtifacts = Boolean(range) && range !== "all";
+
+  // Pipeline win rate (Ben, 2026-09-29): Awarded / (Awarded + Lost + every
+  // bid that's actually past qualification — bid_submitted through delayed)
+  // — RFQ/Invitation/Estimating are excluded because nothing's been bid yet
+  // at that point, and archived is excluded because Procore's own board UI
+  // doesn't count it either (confirmed live: CRM's raw complete/lost counts
+  // were inflated relative to Procore's own visible board precisely because
+  // they included archived records Procore's UI hides by default).
+  const pipelineCounts = await sql`
+    select
+      count(*) filter (where stage = 'complete')::int as complete_count,
+      count(*) filter (where stage = 'lost')::int as lost_count,
+      count(*) filter (where stage in ('bid_submitted','accepted','in_progress','to_do','delayed'))::int as midlate_count
+    from bids
+    where source_archived = false and created_at >= ${cutoffIso}`;
+  const pcRow = pipelineCounts[0] || { complete_count: 0, lost_count: 0, midlate_count: 0 };
+  const pipelineTotal = pcRow.complete_count + pcRow.lost_count + pcRow.midlate_count;
+  const pipelineWinRate = pipelineTotal > 0 ? pcRow.complete_count / pipelineTotal : null;
+
   const wonInRange = await sql`
     select count(distinct h.bid_id)::int as count, coalesce(sum(b.final_value),0)::float as value
     from bid_stage_history h join bids b on b.id = h.bid_id
@@ -1083,6 +1102,8 @@ async function handleDashboardSummary(sql, range) {
     won_in_range: wonInRange[0] || { count: 0, value: 0 },
     lost_in_range: lostInRange[0] || { count: 0, value: 0 },
     needs_cleanup: needsCleanup[0]?.count || 0,
+    pipeline_win_rate: pipelineWinRate,
+    pipeline_win_rate_components: { complete: pcRow.complete_count, lost: pcRow.lost_count, midlate: pcRow.midlate_count, total: pipelineTotal },
     hot_leads: hotLeads[0]?.hot_lead_count || 0,
     by_company: byCompany,
     by_region: byRegion,
@@ -1251,9 +1272,52 @@ export default {
         const lostFrom = await sql`update bid_stage_history set from_stage = 'lost' where from_stage = 'closed_lost' returning id`;
         return json({ to_stage_won_fixed: won.length, to_stage_lost_fixed: lost.length, from_stage_won_fixed: wonFrom.length, from_stage_lost_fixed: lostFrom.length });
       }
+      // One-off: bulk-delete bids Ben confirmed as orphaned (2026-09-29) — no
+      // longer present on Procore's Bid Board at all (active or archived, per
+      // a full scan) and never tied to a real Procore project
+      // (procore_project_id null). Per Ben: "just bids not tied to a project"
+      // is the operative rule — a bid IS allowed to gain a project_id after
+      // being awarded (that's the normal handoff flow), so this never
+      // touches a bid that has one. Returns what it deleted so nothing is
+      // silently lost without a record of exactly what and why.
+      if (url.pathname === "/internal/admin/delete-orphaned-bids" && request.method === "POST") {
+        if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
+        const body = await parseBody(request);
+        // Not `= any($1)` — @neondatabase/serverless's sql`` tag doesn't bind
+        // raw arrays for that (see handleBidsList's comment on the same
+        // limitation); validated one-at-a-time instead, same as everywhere
+        // else in this file that needs a bounded id list.
+        const ids = (Array.isArray(body.ids) ? body.ids : []).filter(isUuid);
+        const deleted = [];
+        const blocked = [];
+        for (const id of ids) {
+          const [r] = await sql`select id, rfq_ref, project_name, stage, procore_project_id,
+              (select count(*) from bid_emails e where e.bid_id = bids.id)::int as email_count
+            from bids where id = ${id}`;
+          if (!r) continue;
+          if (r.procore_project_id || r.email_count > 0) { blocked.push(r); continue; }
+          await sql`delete from bids where id = ${id}`;
+          deleted.push({ id: r.id, rfq_ref: r.rfq_ref, project_name: r.project_name, stage: r.stage });
+        }
+        return json({ deleted_count: deleted.length, deleted, blocked_count: blocked.length, blocked });
+      }
+      if (url.pathname === "/internal/admin/sync-progress" && request.method === "GET") {
+        if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
+        // source_status gets overwritten to Procore's raw uppercase value
+        // (e.g. "IN_PROGRESS") the first time the sync bridge touches a bid;
+        // anything still holding the old human-label format (e.g. "Active
+        // (60-90+ days)") from the original backfill hasn't been reached by
+        // a full pass yet — a rough progress proxy given there's no
+        // dedicated tracking table on CRM's side for this.
+        const total = await sql`select count(*)::int as count from bids where procore_bid_board_id is not null`;
+        const touched = await sql`select count(*)::int as count from bids where procore_bid_board_id is not null and source_status = upper(source_status)`;
+        const recentSync = await sql`select count(*)::int as count from bid_stage_history where changed_by = 'procore_sync' and changed_at > now() - interval '24 hours'`;
+        const lastSync = await sql`select max(changed_at) as at from bid_stage_history where changed_by = 'procore_sync'`;
+        return json({ total: total[0].count, touched_by_sync: touched[0].count, stage_changes_last_24h: recentSync[0].count, last_sync_stage_change: lastSync[0].at });
+      }
       if (url.pathname === "/internal/admin/all-board-ids" && request.method === "GET") {
         if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
-        const rows = await sql`select id, rfq_ref, project_name, stage, procore_bid_board_id, source_archived, created_at from bids where procore_bid_board_id is not null`;
+        const rows = await sql`select id, rfq_ref, project_name, stage, procore_bid_board_id, procore_project_id, source_archived, created_at, final_value, company_id from bids where procore_bid_board_id is not null`;
         return json({ bids: rows });
       }
       if (url.pathname === "/internal/admin/dashboard-check" && request.method === "GET") {
