@@ -17,6 +17,7 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
       ? { direction: "outbound", subject: prefillEmail.subject || "", to_addresses: prefillEmail.to || "", body: prefillEmail.body || "" }
       : { direction: "outbound", subject: "", to_addresses: "", body: "" }
   );
+  const [expandedEmailId, setExpandedEmailId] = useState(null);
 
   function load() {
     api.getBid(id).then(setData).catch((e) => setError(e.message));
@@ -214,12 +215,32 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
 
         <div className="card-title">Tender emails ({emails.length})</div>
         <div className="row-list" style={{ marginBottom: 10, maxHeight: 260, overflowY: "auto", border: emails.length > 3 ? "1px solid var(--border-color)" : "none", borderRadius: "var(--radius-sm)", padding: emails.length > 3 ? 4 : 0 }}>
-          {emails.map((e) => (
-            <div className="card" key={e.id} style={{ padding: 10, marginBottom: 0 }}>
-              <div style={{ fontSize: 11, color: "var(--text-tertiary)" }}>{e.direction === "outbound" ? "→ sent" : "← received"} · {new Date(e.sent_at).toLocaleString()}</div>
-              <div style={{ fontWeight: 600, fontSize: 13 }}>{e.subject || "(no subject)"}</div>
-            </div>
-          ))}
+          {emails.map((e) => {
+            const expanded = expandedEmailId === e.id;
+            return (
+              <div
+                className="card"
+                key={e.id}
+                style={{ padding: 10, marginBottom: 0, cursor: "pointer" }}
+                onClick={() => setExpandedEmailId(expanded ? null : e.id)}
+              >
+                <div style={{ fontSize: 11, color: "var(--text-tertiary)" }}>
+                  {e.direction === "outbound" ? "→ sent" : "← received"} · {new Date(e.sent_at).toLocaleString()}
+                  {e.logged_by ? ` · by ${e.logged_by}` : ""}
+                  <span style={{ float: "right" }}>{expanded ? "▲ collapse" : "▼ view"}</span>
+                </div>
+                <div style={{ fontWeight: 600, fontSize: 13 }}>{e.subject || "(no subject)"}</div>
+                {expanded && (
+                  <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--border-color)" }} onClick={(ev) => ev.stopPropagation()}>
+                    {e.to_addresses && <div style={{ fontSize: 11, color: "var(--text-secondary)", marginBottom: 4 }}>To: {e.to_addresses}</div>}
+                    {e.from_address && <div style={{ fontSize: 11, color: "var(--text-secondary)", marginBottom: 4 }}>From: {e.from_address}</div>}
+                    {e.cc_addresses && <div style={{ fontSize: 11, color: "var(--text-secondary)", marginBottom: 4 }}>Cc: {e.cc_addresses}</div>}
+                    <div style={{ fontSize: 13, whiteSpace: "pre-wrap", marginTop: 6 }}>{e.body || "(no body logged)"}</div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
           {emails.length === 0 && <div className="empty-state">No tender emails logged yet.</div>}
         </div>
         {emails.length > 3 && <div className="field-help" style={{ marginTop: -6, marginBottom: 10 }}>Scroll above to see all {emails.length}.</div>}

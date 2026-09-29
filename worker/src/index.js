@@ -1251,6 +1251,11 @@ export default {
         const lostFrom = await sql`update bid_stage_history set from_stage = 'lost' where from_stage = 'closed_lost' returning id`;
         return json({ to_stage_won_fixed: won.length, to_stage_lost_fixed: lost.length, from_stage_won_fixed: wonFrom.length, from_stage_lost_fixed: lostFrom.length });
       }
+      if (url.pathname === "/internal/admin/all-board-ids" && request.method === "GET") {
+        if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
+        const rows = await sql`select id, rfq_ref, project_name, stage, procore_bid_board_id, source_archived, created_at from bids where procore_bid_board_id is not null`;
+        return json({ bids: rows });
+      }
       if (url.pathname === "/internal/admin/dashboard-check" && request.method === "GET") {
         if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
         return await handleDashboardSummary(sql, url.searchParams.get("range") || "all");
