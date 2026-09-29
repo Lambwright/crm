@@ -302,6 +302,23 @@ input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.7); }
 .pipeline-column-drop-zone { min-height: 40px; border-radius: var(--radius-sm); transition: background 0.1s; }
 .pipeline-column-drop-zone.drag-over { background: rgba(var(--accent-rgb), 0.08); outline: 1px dashed var(--accent); }
 
+/* Stat-tile explanation popovers — pure CSS hover, no JS state. Ben,
+   2026-09-29: "someone off the street should be able to log on and, based
+   on the tooltips and info here, understand how we came to these numbers." */
+.stat-tooltip-wrap { position: relative; cursor: help; display: inline-flex; align-items: center; gap: 4px; }
+.stat-tooltip-icon { font-size: 10px; color: var(--text-tertiary); border: 1px solid var(--text-tertiary); border-radius: 50%; width: 13px; height: 13px; display: inline-flex; align-items: center; justify-content: center; line-height: 1; }
+.stat-tooltip-popup {
+  display: none;
+  position: absolute; bottom: 100%; left: 0; z-index: 50;
+  width: 260px; padding: 10px 12px; margin-bottom: 6px;
+  background: var(--bg-page); border: 1px solid var(--accent); border-radius: var(--radius-sm);
+  font-size: 11px; line-height: 1.5; color: var(--text-primary); font-weight: 400;
+  text-transform: none; letter-spacing: normal;
+  box-shadow: var(--shadow-md);
+}
+.stat-tooltip-popup strong { color: var(--accent); }
+.stat-tooltip-wrap:hover .stat-tooltip-popup { display: block; }
+
 .hot-lead-flame { color: var(--red); }
 
 /* --- Dashboard breakdown tables (by company / by region) --- */

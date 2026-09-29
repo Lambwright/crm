@@ -17,6 +17,19 @@ function fmtPct(n) {
   return n != null ? `${Math.round(n * 100)}%` : "—";
 }
 
+// A stat label with a hover explanation — the formula in plain language
+// plus the actual numbers behind the current figure, so nobody has to take
+// the percentage on faith (Ben, 2026-09-29).
+function Tip({ label, children }) {
+  return (
+    <div className="kv-label stat-tooltip-wrap">
+      {label}
+      <span className="stat-tooltip-icon">?</span>
+      <div className="stat-tooltip-popup">{children}</div>
+    </div>
+  );
+}
+
 export default function Dashboard() {
   const [range, setRange] = useState("all");
   const [summary, setSummary] = useState(null);
@@ -45,26 +58,40 @@ export default function Dashboard() {
         ))}
       </div>
 
-      {range !== "all" && (
-        <p className="field-help" style={{ marginBottom: 10, maxWidth: 720 }}>
-          Win rate below is a <em>cohort</em> figure — of bids created in this range, how many are currently won/lost
-          — so a bid opened months ago that just got awarded won't move it. "Won/Lost this range" further down uses
-          the actual award/lost date instead, so that case shows up there.
-        </p>
-      )}
-
       <div className="kv-grid" style={{ marginBottom: 20 }}>
         <div className="card"><div className="kv-label">Open pipeline value</div><div className="kv-value mono stat">{fmtMoney(totalPipeline)}</div></div>
-        <div className="card"><div className="kv-label" title="Cohort: of bids created in this range, how many are won">Win rate (count)</div><div className="kv-value mono stat">{fmtPct(summary.win_rate)}</div></div>
-        <div className="card"><div className="kv-label" title="Cohort: of bids created in this range, how many $ are won">Win rate ($ value)</div><div className="kv-value mono stat">{fmtPct(summary.win_rate_by_value)}</div></div>
+
         <div className="card">
-          <div className="kv-label" title="Awarded / (Awarded + Lost + everything past qualification) — excludes RFQ/Invitation/Estimating and archived">Win rate (pipeline)</div>
-          <div className="kv-value mono stat">{fmtPct(summary.pipeline_win_rate)}</div>
-          {summary.pipeline_win_rate_components && (
-            <div className="field-help">{summary.pipeline_win_rate_components.complete} won / {summary.pipeline_win_rate_components.total} in pipeline</div>
-          )}
+          <Tip label="Win rate (decided)">
+            Of bids that have actually been decided one way or the other — Awarded or Lost, not counting anything
+            Procore has archived — what share were wins.<br /><br />
+            <strong>{summary.decided_win_rate_components?.complete ?? 0} Awarded</strong> ÷ (
+            <strong>{summary.decided_win_rate_components?.complete ?? 0} Awarded</strong> + <strong>{summary.decided_win_rate_components?.lost ?? 0} Lost</strong>
+            ) = <strong>{fmtPct(summary.decided_win_rate)}</strong>
+          </Tip>
+          <div className="kv-value mono stat">{fmtPct(summary.decided_win_rate)}</div>
         </div>
-        <div className="card"><div className="kv-label">Won / Lost (cohort)</div><div className="kv-value mono stat">{summary.won} / {summary.lost}</div></div>
+
+        <div className="card">
+          <Tip label="Win rate (pipeline)">
+            Of everything that's actually been bid — Awarded, Lost, or still active past the qualification stage
+            (Submitted through Watch List) — what share are wins. RFQ/Invitation/Estimating aren't counted, since
+            nothing's actually been bid yet at that point; archived bids aren't counted either.<br /><br />
+            <strong>{summary.pipeline_win_rate_components?.complete ?? 0} Awarded</strong> ÷ (
+            <strong>{summary.pipeline_win_rate_components?.complete ?? 0}</strong> Awarded + <strong>{summary.pipeline_win_rate_components?.lost ?? 0}</strong> Lost + <strong>{summary.pipeline_win_rate_components?.midlate ?? 0}</strong> still active
+            ) = <strong>{fmtPct(summary.pipeline_win_rate)}</strong>
+          </Tip>
+          <div className="kv-value mono stat">{fmtPct(summary.pipeline_win_rate)}</div>
+        </div>
+
+        <div className="card">
+          <Tip label="Won / Lost">
+            Same basis as the win-rate figures above — Awarded and Lost bids, archived excluded. This is the
+            plain count each of those percentages is built from.
+          </Tip>
+          <div className="kv-value mono stat">{summary.decided_win_rate_components?.complete ?? 0} / {summary.decided_win_rate_components?.lost ?? 0}</div>
+        </div>
+
         <div className="card"><div className="kv-label">Total bids tracked</div><div className="kv-value mono stat">{summary.total_bids}</div></div>
         <div className="card"><div className="kv-label">Avg bid value</div><div className="kv-value mono stat">{fmtMoney(summary.avg_bid_value)}</div></div>
         <div className="card"><div className="kv-label">Overdue follow-ups</div><div className="kv-value mono stat" style={{ color: summary.overdue_followups > 0 ? "var(--red)" : undefined }}>{summary.overdue_followups}</div></div>
@@ -73,17 +100,17 @@ export default function Dashboard() {
       </div>
 
       <div className="card-title">Won / Lost this range, by actual date</div>
+      <p className="field-help" style={{ marginBottom: 10, maxWidth: 720 }}>
+        The figures above are a current snapshot of the whole pipeline. These use each bid's real stage-change
+        date instead — so a bid opened months ago that just got awarded this week shows up here, not lumped into
+        "bids created."
+      </p>
       <div className="kv-grid" style={{ marginBottom: 20 }}>
         <div className="card"><div className="kv-label">Bids created</div><div className="kv-value mono stat">{summary.total_bids}</div></div>
         <div className="card"><div className="kv-label">Won this range</div><div className="kv-value mono stat" style={{ color: "var(--green)" }}>{summary.won_in_range?.count ?? 0}</div></div>
         <div className="card"><div className="kv-label">Won value</div><div className="kv-value mono stat">{fmtMoney(summary.won_in_range?.value)}</div></div>
         <div className="card"><div className="kv-label">Lost this range</div><div className="kv-value mono stat" style={{ color: "var(--text-tertiary)" }}>{summary.lost_in_range?.count ?? 0}</div></div>
         <div className="card"><div className="kv-label">Lost value</div><div className="kv-value mono stat">{fmtMoney(summary.lost_in_range?.value)}</div></div>
-        <div className="card">
-          <div className="kv-label">Needs cleanup</div>
-          <div className="kv-value mono stat" style={{ color: summary.needs_cleanup > 0 ? "var(--yellow)" : undefined }}>{summary.needs_cleanup}</div>
-          <div className="field-help">Archived in Procore, never closed out here</div>
-        </div>
       </div>
 
       <div className="card-title">Pipeline by stage</div>

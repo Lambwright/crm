@@ -1027,6 +1027,12 @@ async function handleDashboardSummary(sql, range) {
   const pipelineTotal = pcRow.complete_count + pcRow.lost_count + pcRow.midlate_count;
   const pipelineWinRate = pipelineTotal > 0 ? pcRow.complete_count / pipelineTotal : null;
 
+  // Decided win rate: of bids that have actually been decided (Awarded or
+  // Lost, archived excluded), what fraction were wins — the classic "win
+  // rate" number, without in-flight bids diluting it either direction.
+  const decidedTotal = pcRow.complete_count + pcRow.lost_count;
+  const decidedWinRate = decidedTotal > 0 ? pcRow.complete_count / decidedTotal : null;
+
   const wonInRange = await sql`
     select count(distinct h.bid_id)::int as count, coalesce(sum(b.final_value),0)::float as value
     from bid_stage_history h join bids b on b.id = h.bid_id
@@ -1037,14 +1043,6 @@ async function handleDashboardSummary(sql, range) {
     from bid_stage_history h join bids b on b.id = h.bid_id
     where h.to_stage = 'lost' and h.changed_at >= ${cutoffIso} and b.stage = 'lost'
       and (${!excludeBackfillArtifacts} or h.changed_by != 'system')`;
-
-  // Bids Procore has drained into its annual archive folder but that never
-  // got a real outcome recorded here — Ben flagged these as the likely
-  // source of an inflated win rate (silently missing from the 'lost' bucket)
-  // and as the backlog needing a manual pass. Not resolvable automatically —
-  // Procore's archive doesn't say WHY something never got closed out.
-  const needsCleanup = await sql`
-    select count(*)::int as count from bids where source_archived = true and stage not in ('complete', 'lost', 'no_bid')`;
 
   // "Follow-ups completed" = outbound tender emails logged in range — that's
   // literally what the Follow-ups tab's "Follow up ->" action produces
@@ -1101,9 +1099,10 @@ async function handleDashboardSummary(sql, range) {
     followups_completed: followupsCompleted[0]?.count || 0,
     won_in_range: wonInRange[0] || { count: 0, value: 0 },
     lost_in_range: lostInRange[0] || { count: 0, value: 0 },
-    needs_cleanup: needsCleanup[0]?.count || 0,
     pipeline_win_rate: pipelineWinRate,
     pipeline_win_rate_components: { complete: pcRow.complete_count, lost: pcRow.lost_count, midlate: pcRow.midlate_count, total: pipelineTotal },
+    decided_win_rate: decidedWinRate,
+    decided_win_rate_components: { complete: pcRow.complete_count, lost: pcRow.lost_count, total: decidedTotal },
     hot_leads: hotLeads[0]?.hot_lead_count || 0,
     by_company: byCompany,
     by_region: byRegion,
@@ -1280,6 +1279,26 @@ export default {
       // being awarded (that's the normal handoff flow), so this never
       // touches a bid that has one. Returns what it deleted so nothing is
       // silently lost without a record of exactly what and why.
+      // One-off: bids Procore has archived (drained into its annual archive
+      // folder) that never got a real outcome recorded here — the "Needs
+      // Cleanup" bucket. Ben, 2026-09-29: delete these rather than keep
+      // tracking them as a to-do list; same safety checks as the orphan
+      // delete above (refuses anything with a project or a logged email).
+      if (url.pathname === "/internal/admin/delete-archived-unresolved" && request.method === "POST") {
+        if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
+        const candidates = await sql`
+          select id, rfq_ref, project_name, stage, procore_project_id,
+            (select count(*) from bid_emails e where e.bid_id = bids.id)::int as email_count
+          from bids where source_archived = true and stage not in ('complete', 'lost', 'no_bid')`;
+        const deleted = [];
+        const blocked = [];
+        for (const r of candidates) {
+          if (r.procore_project_id || r.email_count > 0) { blocked.push(r); continue; }
+          await sql`delete from bids where id = ${r.id}`;
+          deleted.push({ id: r.id, rfq_ref: r.rfq_ref, project_name: r.project_name, stage: r.stage });
+        }
+        return json({ deleted_count: deleted.length, deleted, blocked_count: blocked.length, blocked });
+      }
       if (url.pathname === "/internal/admin/delete-orphaned-bids" && request.method === "POST") {
         if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
         const body = await parseBody(request);
