@@ -67,7 +67,20 @@ export default function Followups({ user, assignableUsers = [], onNotificationsC
                   {bid.company_hot_lead && <span className="hot-lead-flame">🔥 </span>}
                   {bid.project_name}
                 </div>
-                <div className="row-secondary">{bid.company_name || "—"}</div>
+                <div className="row-secondary">
+                  {bid.company_name || "—"}
+                  {bid.procore_bid_board_id && (
+                    <a
+                      href={`https://us02.procore.com/webclients/host/companies/562949953508586/tools/bid-board/project/${bid.procore_bid_board_id}/details`}
+                      target="_blank"
+                      rel="noreferrer"
+                      onClick={(e) => e.stopPropagation()}
+                      style={{ marginLeft: 8, color: "var(--accent)" }}
+                    >
+                      ↗ Procore
+                    </a>
+                  )}
+                </div>
               </div>
               <div className="row-secondary">{STAGE_LABELS[bid.stage]}</div>
               <div className="row-secondary">{bid.owner_username || bid.estimator_username || "unassigned"}</div>

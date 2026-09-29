@@ -136,6 +136,11 @@ export default function BidBoard({ user, assignableUsers = [], onNotificationsCh
                       {bid.project_name}
                     </div>
                     <div className="pipeline-card-company">{bid.company_name || "—"}</div>
+                    {bid.source_archived && (
+                      <div style={{ fontSize: 10, color: "var(--yellow)", marginBottom: 4 }} title="Archived in Procore but still open here — needs a manual close-out">
+                        🗄 Archived in Procore, still open here
+                      </div>
+                    )}
                     <div className="pipeline-card-meta">
                       <span>{bid.scout_tier ? `Tier ${bid.scout_tier}` : ""}</span>
                       <span>{bid.next_action_date ? `Next: ${bid.next_action_date}` : ""}</span>

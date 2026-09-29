@@ -77,11 +77,17 @@ export const api = {
 // Builds a prefilled mailto: link for the tender-email popout. Kept client-side
 // (no backend round-trip needed) — logging what was sent is a separate,
 // explicit step (api.logEmail) once the user has actually sent it.
+//
+// Deliberately NOT URLSearchParams here — its .toString() form-encodes
+// spaces as "+" (application/x-www-form-urlencoded), but a mailto: URI's
+// query needs RFC 6068 percent-encoding ("%20"), so mail clients were
+// showing literal "+" characters instead of spaces (Ben, 2026-09).
+// encodeURIComponent gives the correct escaping.
 export function buildMailto({ to, subject, body }) {
-  const params = new URLSearchParams();
-  if (subject) params.set("subject", subject);
-  if (body) params.set("body", body);
-  const query = params.toString();
+  const parts = [];
+  if (subject) parts.push(`subject=${encodeURIComponent(subject)}`);
+  if (body) parts.push(`body=${encodeURIComponent(body)}`);
+  const query = parts.join("&");
   return `mailto:${encodeURIComponent(to || "").replace(/%40/g, "@")}${query ? `?${query}` : ""}`;
 }
 

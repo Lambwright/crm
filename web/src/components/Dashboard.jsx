@@ -45,16 +45,38 @@ export default function Dashboard() {
         ))}
       </div>
 
+      {range !== "all" && (
+        <p className="field-help" style={{ marginBottom: 10, maxWidth: 720 }}>
+          Win rate below is a <em>cohort</em> figure — of bids created in this range, how many are currently won/lost
+          — so a bid opened months ago that just got awarded won't move it. "Won/Lost this range" further down uses
+          the actual award/lost date instead, so that case shows up there.
+        </p>
+      )}
+
       <div className="kv-grid" style={{ marginBottom: 20 }}>
         <div className="card"><div className="kv-label">Open pipeline value</div><div className="kv-value mono stat">{fmtMoney(totalPipeline)}</div></div>
-        <div className="card"><div className="kv-label">Win rate (count)</div><div className="kv-value mono stat">{fmtPct(summary.win_rate)}</div></div>
-        <div className="card"><div className="kv-label">Win rate ($ value)</div><div className="kv-value mono stat">{fmtPct(summary.win_rate_by_value)}</div></div>
-        <div className="card"><div className="kv-label">Won / Lost</div><div className="kv-value mono stat">{summary.won} / {summary.lost}</div></div>
+        <div className="card"><div className="kv-label" title="Cohort: of bids created in this range, how many are won">Win rate (count)</div><div className="kv-value mono stat">{fmtPct(summary.win_rate)}</div></div>
+        <div className="card"><div className="kv-label" title="Cohort: of bids created in this range, how many $ are won">Win rate ($ value)</div><div className="kv-value mono stat">{fmtPct(summary.win_rate_by_value)}</div></div>
+        <div className="card"><div className="kv-label">Won / Lost (cohort)</div><div className="kv-value mono stat">{summary.won} / {summary.lost}</div></div>
         <div className="card"><div className="kv-label">Total bids tracked</div><div className="kv-value mono stat">{summary.total_bids}</div></div>
         <div className="card"><div className="kv-label">Avg bid value</div><div className="kv-value mono stat">{fmtMoney(summary.avg_bid_value)}</div></div>
         <div className="card"><div className="kv-label">Overdue follow-ups</div><div className="kv-value mono stat" style={{ color: summary.overdue_followups > 0 ? "var(--red)" : undefined }}>{summary.overdue_followups}</div></div>
         <div className="card"><div className="kv-label">Follow-ups completed ({RANGES.find((r) => r.key === range)?.label})</div><div className="kv-value mono stat">{summary.followups_completed}</div></div>
         <div className="card"><div className="kv-label">Hot leads flagged</div><div className="kv-value mono stat">🔥 {summary.hot_leads}</div></div>
+      </div>
+
+      <div className="card-title">Won / Lost this range, by actual date</div>
+      <div className="kv-grid" style={{ marginBottom: 20 }}>
+        <div className="card"><div className="kv-label">Bids created</div><div className="kv-value mono stat">{summary.total_bids}</div></div>
+        <div className="card"><div className="kv-label">Won this range</div><div className="kv-value mono stat" style={{ color: "var(--green)" }}>{summary.won_in_range?.count ?? 0}</div></div>
+        <div className="card"><div className="kv-label">Won value</div><div className="kv-value mono stat">{fmtMoney(summary.won_in_range?.value)}</div></div>
+        <div className="card"><div className="kv-label">Lost this range</div><div className="kv-value mono stat" style={{ color: "var(--text-tertiary)" }}>{summary.lost_in_range?.count ?? 0}</div></div>
+        <div className="card"><div className="kv-label">Lost value</div><div className="kv-value mono stat">{fmtMoney(summary.lost_in_range?.value)}</div></div>
+        <div className="card">
+          <div className="kv-label">Needs cleanup</div>
+          <div className="kv-value mono stat" style={{ color: summary.needs_cleanup > 0 ? "var(--yellow)" : undefined }}>{summary.needs_cleanup}</div>
+          <div className="field-help">Archived in Procore, never closed out here</div>
+        </div>
       </div>
 
       <div className="card-title">Pipeline by stage</div>

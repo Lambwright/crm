@@ -104,10 +104,14 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
     setBusy(true);
     try {
       await api.logEmail(id, { ...emailDraft, from_address: emailDraft.direction === "outbound" ? user.username : undefined, sent_at: new Date().toISOString() });
+      // Refresh before handing off to the mail client — setting
+      // window.location to a mailto: URI is usually intercepted without a
+      // real navigation, but doing it first risks this fetch getting cut
+      // short in browsers that treat it as one anyway.
+      load();
       const mailto = buildMailto({ to: emailDraft.to_addresses, subject: emailDraft.subject, body: emailDraft.body });
       window.location.href = mailto;
       setEmailDraft({ direction: "outbound", subject: "", to_addresses: "", body: "" });
-      load();
     } catch (e) {
       setStageError(e.message);
     } finally {
@@ -120,7 +124,19 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
       <div className="modal" style={{ width: 640 }} onClick={(e) => e.stopPropagation()}>
         <div className="card-title">{bid.rfq_ref}</div>
         <h2 style={{ marginBottom: 4 }}>{bid.project_name}</h2>
-        <div className="row-secondary" style={{ marginBottom: 16 }}>{bid.company_name || "—"}</div>
+        <div className="row-secondary" style={{ marginBottom: 16, display: "flex", alignItems: "center", gap: 10 }}>
+          {bid.company_name || "—"}
+          {bid.procore_bid_board_id && (
+            <a
+              href={`https://us02.procore.com/webclients/host/companies/562949953508586/tools/bid-board/project/${bid.procore_bid_board_id}/details`}
+              target="_blank"
+              rel="noreferrer"
+              style={{ color: "var(--accent)", fontSize: 11 }}
+            >
+              ↗ View in Procore
+            </a>
+          )}
+        </div>
 
         <div className="kv-grid" style={{ marginBottom: 16 }}>
           <div className="kv"><span className="kv-label">Stage</span><span className="kv-value">{STAGE_LABELS[bid.stage]}</span></div>
@@ -197,7 +213,7 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
         )}
 
         <div className="card-title">Tender emails ({emails.length})</div>
-        <div className="row-list" style={{ marginBottom: 10, maxHeight: 140, overflowY: "auto" }}>
+        <div className="row-list" style={{ marginBottom: 10, maxHeight: 260, overflowY: "auto", border: emails.length > 3 ? "1px solid var(--border-color)" : "none", borderRadius: "var(--radius-sm)", padding: emails.length > 3 ? 4 : 0 }}>
           {emails.map((e) => (
             <div className="card" key={e.id} style={{ padding: 10, marginBottom: 0 }}>
               <div style={{ fontSize: 11, color: "var(--text-tertiary)" }}>{e.direction === "outbound" ? "→ sent" : "← received"} · {new Date(e.sent_at).toLocaleString()}</div>
@@ -206,6 +222,7 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
           ))}
           {emails.length === 0 && <div className="empty-state">No tender emails logged yet.</div>}
         </div>
+        {emails.length > 3 && <div className="field-help" style={{ marginTop: -6, marginBottom: 10 }}>Scroll above to see all {emails.length}.</div>}
         <div className="field-row" style={{ marginBottom: 6 }}>
           <div className="field">
             <label>Direction</label>

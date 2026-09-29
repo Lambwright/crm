@@ -987,6 +987,46 @@ async function handleDashboardSummary(sql, range) {
   const hotLeads = await sql`select count(*)::int as hot_lead_count from companies where hot_lead = true`;
   const totals = await sql`select count(*)::int as total_bids, coalesce(avg(estimated_value),0)::float as avg_bid_value from bids where created_at >= ${cutoffIso}`;
 
+  // won_in_range/lost_in_range (Ben, 2026-09): the win-rate figures above are
+  // a COHORT view — "of bids CREATED in this range, how many are won/lost
+  // right now" — which silently drops a bid created six months ago that gets
+  // awarded this month (it's outside the created_at window, so it never
+  // counts toward "This Month" at all). These instead use the bid's actual
+  // most recent transition INTO that stage (bid_stage_history.changed_at,
+  // which the sync bridge and every manual move both write), so "won this
+  // month" genuinely means "awarded this month" regardless of when the RFQ
+  // first came in. Deliberately reported as separate created/won/lost counts
+  // rather than folded into one ratio — the two are different time bases and
+  // forcing them into a single "win rate %" is exactly what was misleading.
+  // The bulk historical backfill wrote every transition with changed_at =
+  // the day it was IMPORTED (2026-09), not the real historical event date —
+  // there was no per-transition date in Procore's export to use instead (see
+  // kickoff prompt). Harmless for 'all' (everything counts regardless of
+  // date), but for a narrower range it would make the entire multi-year
+  // backfill look like it happened this month. Excluding changed_by='system'
+  // (the backfill's own attribution) for anything narrower than 'all' keeps
+  // this honest: only transitions with a real timestamp — a manual move or
+  // the Procore sync bridge — count toward a specific period.
+  const excludeBackfillArtifacts = Boolean(range) && range !== "all";
+  const wonInRange = await sql`
+    select count(distinct h.bid_id)::int as count, coalesce(sum(b.final_value),0)::float as value
+    from bid_stage_history h join bids b on b.id = h.bid_id
+    where h.to_stage = 'complete' and h.changed_at >= ${cutoffIso} and b.stage = 'complete'
+      and (${!excludeBackfillArtifacts} or h.changed_by != 'system')`;
+  const lostInRange = await sql`
+    select count(distinct h.bid_id)::int as count, coalesce(sum(b.estimated_value),0)::float as value
+    from bid_stage_history h join bids b on b.id = h.bid_id
+    where h.to_stage = 'lost' and h.changed_at >= ${cutoffIso} and b.stage = 'lost'
+      and (${!excludeBackfillArtifacts} or h.changed_by != 'system')`;
+
+  // Bids Procore has drained into its annual archive folder but that never
+  // got a real outcome recorded here — Ben flagged these as the likely
+  // source of an inflated win rate (silently missing from the 'lost' bucket)
+  // and as the backlog needing a manual pass. Not resolvable automatically —
+  // Procore's archive doesn't say WHY something never got closed out.
+  const needsCleanup = await sql`
+    select count(*)::int as count from bids where source_archived = true and stage not in ('complete', 'lost', 'no_bid')`;
+
   // "Follow-ups completed" = outbound tender emails logged in range — that's
   // literally what the Follow-ups tab's "Follow up ->" action produces
   // (handleEmailCreate), so it's a direct count of real follow-up touches,
@@ -1040,6 +1080,9 @@ async function handleDashboardSummary(sql, range) {
     avg_bid_value: totals[0]?.avg_bid_value || 0,
     overdue_followups: aging[0]?.overdue_count || 0,
     followups_completed: followupsCompleted[0]?.count || 0,
+    won_in_range: wonInRange[0] || { count: 0, value: 0 },
+    lost_in_range: lostInRange[0] || { count: 0, value: 0 },
+    needs_cleanup: needsCleanup[0]?.count || 0,
     hot_leads: hotLeads[0]?.hot_lead_count || 0,
     by_company: byCompany,
     by_region: byRegion,
@@ -1192,6 +1235,37 @@ export default {
           else correct++;
         }
         return json({ total: ids.length, correct, missing_count: missing.length, missing, wrong_stage_count: wrongStage.length, wrong_stage: wrongStage });
+      }
+      // One-off: migration 005 renamed the STAGE enum (closed_won/closed_lost
+      // -> complete/lost) but never touched the historical bid_stage_history
+      // rows already written under the old names — found 2026-09-29 when
+      // "won this range" (which reads to_stage) matched almost nothing for
+      // 'all' time despite 390 cohort wins existing. Bids' own `stage`
+      // column was never affected (it's a live check-constraint column, the
+      // rename touched it directly); this is purely the audit-log text.
+      if (url.pathname === "/internal/admin/fix-stage-history-labels" && request.method === "POST") {
+        if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
+        const won = await sql`update bid_stage_history set to_stage = 'complete' where to_stage = 'closed_won' returning id`;
+        const lost = await sql`update bid_stage_history set to_stage = 'lost' where to_stage = 'closed_lost' returning id`;
+        const wonFrom = await sql`update bid_stage_history set from_stage = 'complete' where from_stage = 'closed_won' returning id`;
+        const lostFrom = await sql`update bid_stage_history set from_stage = 'lost' where from_stage = 'closed_lost' returning id`;
+        return json({ to_stage_won_fixed: won.length, to_stage_lost_fixed: lost.length, from_stage_won_fixed: wonFrom.length, from_stage_lost_fixed: lostFrom.length });
+      }
+      if (url.pathname === "/internal/admin/dashboard-check" && request.method === "GET") {
+        if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
+        return await handleDashboardSummary(sql, url.searchParams.get("range") || "all");
+      }
+      if (url.pathname === "/internal/admin/email-check" && request.method === "GET") {
+        if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
+        const multi = await sql`
+          select bid_id, count(*)::int as email_count from bid_emails group by bid_id having count(*) > 1 order by count(*) desc limit 10`;
+        const out = [];
+        for (const m of multi) {
+          const emails = await sql`select id, direction, subject, sent_at, source, created_at from bid_emails where bid_id = ${m.bid_id} order by sent_at desc`;
+          const [bid] = await sql`select project_name from bids where id = ${m.bid_id}`;
+          out.push({ bid_id: m.bid_id, project_name: bid?.project_name, email_count: m.email_count, emails });
+        }
+        return json({ results: out });
       }
       if (url.pathname === "/internal/admin/company-check" && request.method === "GET") {
         if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
