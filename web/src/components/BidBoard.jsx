@@ -126,7 +126,7 @@ export default function BidBoard({ user, assignableUsers = [], onNotificationsCh
                     className={`pipeline-card${bid.has_activity ? " has-activity" : ""}${draggingId === bid.id ? " dragging" : ""}`}
                     key={bid.id}
                     draggable
-                    onDragStart={() => setDraggingId(bid.id)}
+                    onDragStart={(e) => { e.dataTransfer.setData("text/plain", bid.id); setDraggingId(bid.id); }}
                     onDragEnd={() => { setDraggingId(null); setDragOverStage(null); }}
                     onClick={() => setSelectedId(bid.id)}
                     title={bid.has_activity ? "Has recent activity (email logged, a stage move, or a follow-up noted)" : undefined}
