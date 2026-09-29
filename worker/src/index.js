@@ -1307,6 +1307,11 @@ export default {
         // limitation); validated one-at-a-time instead, same as everywhere
         // else in this file that needs a bounded id list.
         const ids = (Array.isArray(body.ids) ? body.ids : []).filter(isUuid);
+        // force_email: Ben confirmed by name (Chagall "Procore Hosting",
+        // 2026-09-29) that a logged email shouldn't block deleting an
+        // otherwise-orphaned bid in this specific case — still never
+        // bypasses the procore_project_id check, that one stays a hard stop.
+        const forceEmail = Boolean(body.force_email);
         const deleted = [];
         const blocked = [];
         for (const id of ids) {
@@ -1314,7 +1319,7 @@ export default {
               (select count(*) from bid_emails e where e.bid_id = bids.id)::int as email_count
             from bids where id = ${id}`;
           if (!r) continue;
-          if (r.procore_project_id || r.email_count > 0) { blocked.push(r); continue; }
+          if (r.procore_project_id || (r.email_count > 0 && !forceEmail)) { blocked.push(r); continue; }
           await sql`delete from bids where id = ${id}`;
           deleted.push({ id: r.id, rfq_ref: r.rfq_ref, project_name: r.project_name, stage: r.stage });
         }
