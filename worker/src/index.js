@@ -563,8 +563,15 @@ async function handleBidsList(url, sql) {
   // work around that, filter in JS: pipeline size for a subcontractor's bid
   // board is realistically dozens to low hundreds of rows, well within what's
   // reasonable to filter after one indexed fetch. Revisit if that stops being true.
+  // has_activity: any real CRM-side touch beyond the bid just existing — a
+  // tender email logged, a stage move beyond the initial creation entry, or a
+  // next-action note set. Drives the Pipeline board's "bring touched bids to
+  // the top" + highlight behavior (Ben, 2026-09).
   const rows = await sql`
-    select b.*, c.name as company_name, c.hot_lead as company_hot_lead
+    select b.*, c.name as company_name, c.hot_lead as company_hot_lead,
+      (exists(select 1 from bid_emails e where e.bid_id = b.id)
+        or (select count(*) from bid_stage_history h where h.bid_id = b.id) > 1
+        or b.next_action is not null) as has_activity
     from bids b left join companies c on c.id = b.company_id
     order by b.updated_at desc limit 1000`;
 
@@ -1123,6 +1130,81 @@ export default {
       if (url.pathname === "/internal/admin/migrate" && request.method === "POST") {
         if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
         return await handleAdminMigrate(sql);
+      }
+      // One-off: insert real Awarded Procore Bid Board records the original
+      // backfill missed (found via /internal/admin/check-board-ids, 2026-09 —
+      // Ben spotted a hot-listed company showing zero wins that should have
+      // had some). Same shape/conventions as the original backfill: rfq_ref
+      // "PROCORE-<board id>", stage 'complete', source_status 'COMPLETE',
+      // created_at/award_date from the board record's own due_date (the only
+      // date signal Procore's Bid Board API exposes, confirmed against
+      // several already-correct backfilled rows before relying on it here).
+      if (url.pathname === "/internal/admin/insert-missing-wins" && request.method === "POST") {
+        if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
+        const body = await parseBody(request);
+        const rows = Array.isArray(body.rows) ? body.rows : [];
+        const inserted = [];
+        const skipped = [];
+        for (const r of rows) {
+          const boardId = String(r.id);
+          const existing = await sql`select id from bids where procore_bid_board_id = ${boardId}`;
+          if (existing.length) { skipped.push({ id: boardId, reason: "already exists" }); continue; }
+          const rfqRef = `PROCORE-${boardId}`;
+          const dup = await sql`select id from bids where rfq_ref = ${rfqRef}`;
+          if (dup.length) { skipped.push({ id: boardId, reason: "rfq_ref collision" }); continue; }
+
+          let companyId = null;
+          if (r.customer_name) {
+            const company = await findOrCreateCompany(sql, { name: r.customer_name });
+            companyId = company.id;
+          }
+          const dateOnly = r.due_date ? r.due_date.slice(0, 10) : null;
+          const value = r.total && r.total > 0 ? r.total : null;
+
+          const [bid] = await sql`
+            insert into bids (
+              rfq_ref, project_name, company_id, stage, source_status, source_archived,
+              procore_bid_board_id, procore_project_id, final_value, award_date, created_at
+            ) values (
+              ${rfqRef}, ${r.name}, ${companyId}, 'complete', 'COMPLETE', false,
+              ${boardId}, ${r.project_id ? String(r.project_id) : null}, ${value}, ${dateOnly},
+              ${r.due_date}
+            ) returning id`;
+          await sql`insert into bid_stage_history (bid_id, from_stage, to_stage, changed_by, note)
+            values (${bid.id}, null, 'complete', 'system', 'Backfilled from Procore Bid Board export (missed in original import, added 2026-09-28)')`;
+          inserted.push({ id: boardId, bid_id: bid.id, company_id: companyId });
+        }
+        return json({ inserted_count: inserted.length, inserted, skipped });
+      }
+      if (url.pathname === "/internal/admin/check-board-ids" && request.method === "POST") {
+        if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
+        const body = await parseBody(request);
+        const ids = Array.isArray(body.ids) ? body.ids.map(String) : [];
+        const known = await sql`select procore_bid_board_id, stage, project_name from bids where procore_bid_board_id is not null`;
+        const byId = new Map(known.map((b) => [b.procore_bid_board_id, b]));
+        const missing = [];
+        const wrongStage = [];
+        let correct = 0;
+        for (const id of ids) {
+          const hit = byId.get(id);
+          if (!hit) missing.push(id);
+          else if (hit.stage !== "complete") wrongStage.push({ id, stage: hit.stage, project_name: hit.project_name });
+          else correct++;
+        }
+        return json({ total: ids.length, correct, missing_count: missing.length, missing, wrong_stage_count: wrongStage.length, wrong_stage: wrongStage });
+      }
+      if (url.pathname === "/internal/admin/company-check" && request.method === "GET") {
+        if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
+        const name = url.searchParams.get("name");
+        const companies = name
+          ? await sql`select * from companies where lower(name) like ${"%" + name.toLowerCase() + "%"}`
+          : await sql`select * from companies where hot_lead = true order by hot_lead_set_at desc nulls last limit 5`;
+        const out = [];
+        for (const c of companies) {
+          const bids = await sql`select id, rfq_ref, project_name, stage, source_status, procore_bid_board_id, procore_project_id, created_at, final_value from bids where company_id = ${c.id} order by created_at desc`;
+          out.push({ company: c, bids });
+        }
+        return json({ results: out });
       }
       if (url.pathname === "/internal/admin/backfill-stats" && request.method === "GET") {
         if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);

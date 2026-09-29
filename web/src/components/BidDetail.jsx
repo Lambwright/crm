@@ -2,10 +2,13 @@ import { useEffect, useState } from "react";
 import { api, buildMailto } from "../api.js";
 import { HANDOFF_STATUS_LABELS, STAGE_LABELS, STAGE_ORDER, STAGE_REQUIREMENTS } from "../stages.js";
 
-export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, assignableUsers = [] }) {
+export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, assignableUsers = [], initialToStage }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
-  const [toStage, setToStage] = useState("");
+  // Set when a kanban drag-and-drop landed on a stage that needs required
+  // fields (STAGE_REQUIREMENTS) — the drop itself can't collect those, so it
+  // opens the bid here instead, already pointed at the target stage.
+  const [toStage, setToStage] = useState(initialToStage || "");
   const [stageFields, setStageFields] = useState({});
   const [stageError, setStageError] = useState(null);
   const [busy, setBusy] = useState(false);
