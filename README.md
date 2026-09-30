@@ -84,8 +84,9 @@ Einbau ID permissions are moving from the flat `admin`/`user` role to company
 job roles (Super Admin, Admin, Estimator, Project Manager, Project
 Coordinator, CRM, Accounting, Logistics) plus a per-app access matrix edited
 in HELM by the Super Admin only. `/auth/login` and `/auth/verify` will add
-`user.appRoles` (e.g. `{ CRM: "estimator" }`, always an object, absent key =
-no access) and `user.jobRole` (informational, never gate on it); `user.role`
+`user.appRoles` (e.g. `{ CRM: "estimator" }`, always an object, `"no_access"`
+as the value for an app the user can't open — confirmed by Ben 2026-09-30,
+not an absent key) and `user.jobRole` (informational, never gate on it); `user.role`
 stays as a legacy field but will only ever be `"admin"` for the Super Admin
 after the switch.
 
