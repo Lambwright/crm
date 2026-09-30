@@ -77,6 +77,42 @@ table and every design decision are documented at the top of
   any other app's project, same reasoning as every other suite app's own
   dedicated project.
 
+## Coming change: Einbau ID role matrix
+
+Signed off by Ben, 2026-09-30, not built yet — tracking here as it lands.
+Einbau ID permissions are moving from the flat `admin`/`user` role to company
+job roles (Super Admin, Admin, Estimator, Project Manager, Project
+Coordinator, CRM, Accounting, Logistics) plus a per-app access matrix edited
+in HELM by the Super Admin only. `/auth/login` and `/auth/verify` will add
+`user.appRoles` (e.g. `{ CRM: "estimator" }`, always an object, absent key =
+no access) and `user.jobRole` (informational, never gate on it); `user.role`
+stays as a legacy field but will only ever be `"admin"` for the Super Admin
+after the switch.
+
+CRM's three levels once this lands: **admin** (all features — Admin/CRM job
+roles), **estimator** (move stages, hot-lead a company, assign follow-ups to
+anyone — Estimator job role), **pm** (can be assigned a follow-up, can't
+assign one to someone else — Project Manager/Project Coordinator). This
+replaces `crm_settings.assignable_usernames` (the HELM → CRM Options
+"Assignable users" list) entirely — assignability becomes a function of
+`appRoles.CRM`, computed from the matrix, not a list maintained here.
+
+Everywhere CRM currently decides permissions from something else, all in
+`worker/src/index.js`, needs to move to `appRoles.CRM`:
+- `requireLogin`'s `ALLOWED_ROLES` check against `user.role` (line ~132) —
+  drop once `apps.includes("CRM")` plus a real `appRoles.CRM` are the actual
+  gate; there's no "user" level in the new model.
+- `isAssignableUsername`'s `actingUser.role === "admin"` bypass and its
+  `settings.assignableUsernames` list lookup — becomes a check that the
+  *actor* has `appRoles.CRM` in `admin`/`estimator` to assign, and the
+  *target* has `appRoles.CRM` in `admin`/`estimator`/`pm` to be assignable.
+- `handleSettingsPatch`'s `user.role !== "admin"` check (who can edit the
+  follow-up cadence) — becomes `appRoles.CRM === "admin"`.
+
+No hardcoded usernames anywhere in this app's source — the only
+username-keyed data is `assignable_usernames` itself, which is DB content
+(set via HELM), not code, and goes away with this change.
+
 ## Explicitly deferred / not built here
 
 See the kickoff prompt for the full list and reasoning. In short: fuzzy
