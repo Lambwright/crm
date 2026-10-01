@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { api, buildMailto } from "../api.js";
 import { HANDOFF_STATUS_LABELS, STAGE_LABELS, STAGE_ORDER, STAGE_REQUIREMENTS } from "../stages.js";
 
-export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, assignableUsers = [], initialToStage }) {
+export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, assignableUsers = [], initialToStage, autoHandoffOnComplete }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   // Set when a kanban drag-and-drop landed on a stage that needs required
@@ -81,6 +81,12 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
     setStageError(null);
     try {
       await api.moveBidStage(id, toStage, stageFields);
+      // "Start Handoff" on a Pipeline card (Ben, 2026-10-01): one action —
+      // move to Awarded, then straight into HANDOFF's purgatory — not
+      // "move it, then notice a link appeared, then click that too."
+      if (autoHandoffOnComplete && toStage === "complete" && bid.procore_bid_board_id) {
+        window.open(`https://lambwright.github.io/handoff/#/bids?open=${encodeURIComponent(bid.procore_bid_board_id)}`, "_blank");
+      }
       setToStage("");
       setStageFields({});
       load();

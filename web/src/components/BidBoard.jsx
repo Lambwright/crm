@@ -3,6 +3,20 @@ import { api } from "../api.js";
 import { BOARD_STAGES, STAGE_LABELS, STAGE_REQUIREMENTS } from "../stages.js";
 import BidDetail from "./BidDetail.jsx";
 
+// Ben, 2026-10-01: "if I'm an estimator, admin or super admin" — the real
+// appRoles.CRM distinction (which would exclude "pm") isn't live yet (see
+// README "Coming change: Einbau ID role matrix"), so this uses today's
+// closest equivalent: the HELM-curated assignable-users list (today's
+// estimator-ish population) or the legacy admin role. Tighten to
+// appRoles.CRM in ('admin','estimator') once that lands.
+function canStartHandoff(user, assignableUsers) {
+  if (!user) return false;
+  if (user.role === "admin") return true;
+  return assignableUsers.some((u) => u.username === user.username);
+}
+
+const HANDOFF_URL = (boardId) => `https://lambwright.github.io/handoff/#/bids?open=${encodeURIComponent(boardId)}`;
+
 const SORTS = {
   updated: { label: "Recently updated", cmp: (a, b) => new Date(b.updated_at) - new Date(a.updated_at) },
   next_action: { label: "Follow-up date", cmp: (a, b) => (a.next_action_date || "9999").localeCompare(b.next_action_date || "9999") },
@@ -16,7 +30,7 @@ export default function BidBoard({ user, assignableUsers = [], onNotificationsCh
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
-  const [gatedMove, setGatedMove] = useState(null); // { id, toStage } — a drop that needs required fields first
+  const [gatedMove, setGatedMove] = useState(null); // { id, toStage, autoHandoff? } — a drop (or Start Handoff click) that needs required fields first
   const [showClosed, setShowClosed] = useState(false);
   const [search, setSearch] = useState("");
   const [sortKey, setSortKey] = useState("updated");
@@ -79,6 +93,25 @@ export default function BidBoard({ user, assignableUsers = [], onNotificationsCh
     } catch (e) {
       setError(e.message);
     }
+  }
+
+  // One action from the card itself, not "find the Awarded column, drag it
+  // there, notice a link appeared, click that too" (Ben, 2026-10-01):
+  // already-awarded bids jump straight into HANDOFF; anything else opens
+  // the bid pre-aimed at Awarded, and completing that move (final value +
+  // award date — can't skip those, they're real required fields) continues
+  // straight into HANDOFF on its own.
+  function handleStartHandoff(e, bid) {
+    e.stopPropagation();
+    if (!bid.procore_bid_board_id) {
+      setError(`"${bid.project_name}" has no Procore Bid Board ID — can't start a handoff for it.`);
+      return;
+    }
+    if (bid.stage === "complete") {
+      window.open(HANDOFF_URL(bid.procore_bid_board_id), "_blank");
+      return;
+    }
+    setGatedMove({ id: bid.id, toStage: "complete", autoHandoff: true });
   }
 
   return (
@@ -145,6 +178,15 @@ export default function BidBoard({ user, assignableUsers = [], onNotificationsCh
                       <span>{bid.scout_tier ? `Tier ${bid.scout_tier}` : ""}</span>
                       <span>{bid.next_action_date ? `Next: ${bid.next_action_date}` : ""}</span>
                     </div>
+                    {stage !== "complete" && canStartHandoff(user, assignableUsers) && (
+                      <button
+                        className="btn btn-accent btn-sm"
+                        style={{ marginTop: 8, width: "100%" }}
+                        onClick={(e) => handleStartHandoff(e, bid)}
+                      >
+                        🚀 Start Handoff
+                      </button>
+                    )}
                   </div>
                 ))}
                 {stageBids.length === 0 && <div className="empty-state" style={{ padding: 12, fontSize: 11 }}>—</div>}
@@ -168,6 +210,7 @@ export default function BidBoard({ user, assignableUsers = [], onNotificationsCh
           user={user}
           assignableUsers={assignableUsers}
           initialToStage={gatedMove.toStage}
+          autoHandoffOnComplete={gatedMove.autoHandoff}
           onClose={() => setGatedMove(null)}
           onChanged={handleChanged}
         />
