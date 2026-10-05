@@ -18,8 +18,14 @@ const BASE_TABS = [
   { key: "companies", label: "Companies" },
 ];
 
-function tabsFor(username, assignableUsernames) {
-  if (!(assignableUsernames || []).some((u) => u.username === username)) return BASE_TABS;
+// Who gets Follow-ups first. Live (role matrix): the people who actually work
+// follow-ups — estimators and PMs; admins keep the default order. Legacy (CRM
+// not switched yet): unchanged — anyone on the HELM assignable-users list.
+function tabsFor(username, access, assignableUsernames) {
+  const leadsWithFollowups = access && access.mode === "live"
+    ? access.level === "estimator" || access.level === "pm"
+    : (assignableUsernames || []).some((u) => u.username === username);
+  if (!leadsWithFollowups) return BASE_TABS;
   const followups = BASE_TABS.find((t) => t.key === "followups");
   return [followups, ...BASE_TABS.filter((t) => t.key !== "followups")];
 }
@@ -32,6 +38,7 @@ export default function App() {
   const [notificationCount, setNotificationCount] = useState(0);
   const [followupCount, setFollowupCount] = useState(0);
   const [settings, setSettings] = useState(null);
+  const [access, setAccess] = useState(null);
 
   useEffect(() => {
     const token = getStoredToken();
@@ -65,6 +72,9 @@ export default function App() {
   useEffect(() => {
     if (authState !== "in") return;
     api.getSettings().then(setSettings).catch(() => {});
+    // If this fails the UI behaves as legacy (everything shown); the server
+    // still enforces every privileged action regardless.
+    api.getAccess().then(setAccess).catch(() => {});
   }, [authState]);
 
   function handleLoggedIn(u) {
@@ -76,6 +86,13 @@ export default function App() {
     setUser(null);
     setAuthState("out");
   }
+
+  // Who can be picked as an owner/estimator. Live (role matrix): everyone with
+  // CRM access at PM level or above, read from auth-worker via /access.
+  // Legacy (CRM not switched yet): the HELM assignable-users list, as before.
+  const assignableUsers = access && access.mode === "live"
+    ? access.people || []
+    : settings?.assignableUsernames || [];
 
   if (authState === "checking") {
     return (
@@ -93,7 +110,7 @@ export default function App() {
       <Header user={user} onLogout={handleLogout} />
       <div className="container">
         <div className="tabs">
-          {tabsFor(user.username, settings?.assignableUsernames).map((t) => (
+          {tabsFor(user.username, access, settings?.assignableUsernames).map((t) => (
             <button key={t.key} className={`tab ${tab === t.key ? "active" : ""}`} onClick={() => setTab(t.key)}>
               {t.label}
               {t.key === "pipeline" && notificationCount > 0 && <span className="tab-count">({notificationCount})</span>}
@@ -101,9 +118,9 @@ export default function App() {
             </button>
           ))}
         </div>
-        {tab === "pipeline" && <BidBoard user={user} assignableUsers={settings?.assignableUsernames || []} onNotificationsChanged={refreshNotificationCount} />}
-        {tab === "followups" && <Followups user={user} assignableUsers={settings?.assignableUsernames || []} onNotificationsChanged={refreshNotificationCount} />}
-        {tab === "companies" && <CompanyList />}
+        {tab === "pipeline" && <BidBoard user={user} access={access} assignableUsers={assignableUsers} onNotificationsChanged={refreshNotificationCount} />}
+        {tab === "followups" && <Followups user={user} access={access} assignableUsers={assignableUsers} onNotificationsChanged={refreshNotificationCount} />}
+        {tab === "companies" && <CompanyList access={access} />}
         {tab === "dashboard" && <Dashboard />}
       </div>
     </>

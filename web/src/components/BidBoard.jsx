@@ -3,14 +3,14 @@ import { api } from "../api.js";
 import { BOARD_STAGES, STAGE_LABELS, STAGE_REQUIREMENTS } from "../stages.js";
 import BidDetail from "./BidDetail.jsx";
 
-// Ben, 2026-10-01: "if I'm an estimator, admin or super admin" — the real
-// appRoles.CRM distinction (which would exclude "pm") isn't live yet (see
-// README "Coming change: Einbau ID role matrix"), so this uses today's
-// closest equivalent: the HELM-curated assignable-users list (today's
-// estimator-ish population) or the legacy admin role. Tighten to
-// appRoles.CRM in ('admin','estimator') once that lands.
-function canStartHandoff(user, assignableUsers) {
+// Ben, 2026-10-01: "if I'm an estimator, admin or super admin". Once CRM is
+// switched to the role matrix that's exactly access.can.move_stages
+// (estimator/admin). Until then (legacy mode) this keeps using the closest
+// equivalent: the HELM-curated assignable-users list or the legacy admin role.
+function canStartHandoff(user, assignableUsers, access) {
   if (!user) return false;
+  // Live (role matrix): same people who can move a bid between stages.
+  if (access && access.mode === "live") return Boolean(access.can?.move_stages);
   if (user.role === "admin") return true;
   return assignableUsers.some((u) => u.username === user.username);
 }
@@ -25,7 +25,9 @@ const SORTS = {
   name: { label: "Project name", cmp: (a, b) => (a.project_name || "").localeCompare(b.project_name || "") },
 };
 
-export default function BidBoard({ user, assignableUsers = [], onNotificationsChanged }) {
+export default function BidBoard({ user, access, assignableUsers = [], onNotificationsChanged }) {
+  const can = access?.can;
+  const canMove = can?.move_stages ?? true; // cosmetic; the worker enforces it
   const [bids, setBids] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -76,7 +78,7 @@ export default function BidBoard({ user, assignableUsers = [], onNotificationsCh
     setDragOverStage(null);
     const bidId = draggingId;
     setDraggingId(null);
-    if (!bidId) return;
+    if (!bidId || !canMove) return;
     const bid = bids.find((b) => b.id === bidId);
     if (!bid || bid.stage === toStage) return;
 
@@ -158,7 +160,7 @@ export default function BidBoard({ user, assignableUsers = [], onNotificationsCh
                   <div
                     className={`pipeline-card${bid.has_activity ? " has-activity" : ""}${draggingId === bid.id ? " dragging" : ""}`}
                     key={bid.id}
-                    draggable
+                    draggable={canMove}
                     onDragStart={(e) => { e.dataTransfer.setData("text/plain", bid.id); setDraggingId(bid.id); }}
                     onDragEnd={() => { setDraggingId(null); setDragOverStage(null); }}
                     onClick={() => setSelectedId(bid.id)}
@@ -178,7 +180,7 @@ export default function BidBoard({ user, assignableUsers = [], onNotificationsCh
                       <span>{bid.scout_tier ? `Tier ${bid.scout_tier}` : ""}</span>
                       <span>{bid.next_action_date ? `Next: ${bid.next_action_date}` : ""}</span>
                     </div>
-                    {stage !== "complete" && canStartHandoff(user, assignableUsers) && (
+                    {stage !== "complete" && canStartHandoff(user, assignableUsers, access) && (
                       <button
                         className="btn btn-accent btn-sm"
                         style={{ marginTop: 8, width: "100%" }}
@@ -200,6 +202,7 @@ export default function BidBoard({ user, assignableUsers = [], onNotificationsCh
           id={selectedId}
           user={user}
           assignableUsers={assignableUsers}
+          can={can}
           onClose={() => setSelectedId(null)}
           onChanged={handleChanged}
         />
@@ -210,6 +213,7 @@ export default function BidBoard({ user, assignableUsers = [], onNotificationsCh
           user={user}
           assignableUsers={assignableUsers}
           initialToStage={gatedMove.toStage}
+          can={can}
           autoHandoffOnComplete={gatedMove.autoHandoff}
           onClose={() => setGatedMove(null)}
           onChanged={handleChanged}

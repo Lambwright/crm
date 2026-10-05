@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { api, buildMailto } from "../api.js";
 import { HANDOFF_STATUS_LABELS, STAGE_LABELS, STAGE_ORDER, STAGE_REQUIREMENTS } from "../stages.js";
 
-export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, assignableUsers = [], initialToStage, autoHandoffOnComplete }) {
+export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, assignableUsers = [], initialToStage, autoHandoffOnComplete, can }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   // Set when a kanban drag-and-drop landed on a stage that needs required
@@ -18,6 +18,10 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
       : { direction: "outbound", subject: "", to_addresses: "", body: "" }
   );
   const [expandedEmailId, setExpandedEmailId] = useState(null);
+  // Role matrix (GET /access). Cosmetic only — the worker enforces both of
+  // these regardless. Undefined (legacy mode, or /access not loaded) = allowed.
+  const canMove = can?.move_stages ?? true;
+  const canAssign = can?.assign ?? true;
 
   function load() {
     api.getBid(id).then(setData).catch((e) => setError(e.message));
@@ -53,6 +57,10 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
   }
 
   function assignSelect(field, currentValue) {
+    if (!canAssign) {
+      const who = assignableUsers.find((u) => u.username === currentValue);
+      return <span>{currentValue ? who?.displayName || currentValue : "— unassigned —"}</span>;
+    }
     if (!assignableUsers.length) {
       return (
         <input
@@ -186,6 +194,8 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
           </div>
         )}
 
+        {canMove ? (
+        <>
         <div className="card-title">Move stage</div>
         <div className="field-row" style={{ marginBottom: 8 }}>
           <div className="field">
@@ -212,8 +222,12 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
             ))}
           </div>
         )}
+        </>
+        ) : (
+          <div className="field-help" style={{ marginBottom: 12 }}>Only estimators and admins can move a bid between stages.</div>
+        )}
         {stageError && <div className="login-error" style={{ marginBottom: 8 }}>{stageError}</div>}
-        {toStage && (
+        {canMove && toStage && (
           <button className="btn btn-accent btn-sm" onClick={handleMoveStage} disabled={busy} style={{ marginBottom: 16 }}>
             Move to {STAGE_LABELS[toStage]}
           </button>

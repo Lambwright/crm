@@ -28,6 +28,7 @@
 //   GET    /notifications?status=       (Einbau ID) the follow-up/staleness ledger
 //   POST   /notifications/:id/ack       (Einbau ID) acknowledge a notification
 //   GET    /followups?mine=1            (Einbau ID) open bids due (or overdue) for a follow-up touch
+//   GET    /access                      (Einbau ID) the caller's CRM level/permissions + who they can assign follow-ups to
 //   GET    /settings                    (Einbau ID) follow-up cadence + assignable-users list
 //   PATCH  /settings                    (Einbau ID, admin) edit them — see HELM's "CRM Options" tab
 //   GET    /dashboard/summary           (Einbau ID) pipeline-by-stage, aging, win-rate aggregates
@@ -129,14 +130,131 @@ async function requireLogin(request, env) {
       return { ok: false, reason: `"${data.user.username}" doesn't have CRM access (HELM apps list).` };
     }
 
-    const allowedRoles = String(env.ALLOWED_ROLES || "admin,user").split(",").map((r) => r.trim());
-    if (!allowedRoles.includes(data.user.role)) {
-      return { ok: false, reason: `Logged in as "${data.user.username}" (role "${data.user.role}"), which isn't allowed in CRM.` };
+    // Role-matrix switch-over (auth-worker/README.md "Role matrix"): three
+    // states for appRoles.CRM, decided by resolveCrmAccess below.
+    //   live    -> a real level (admin/estimator/pm); the matrix is the gate
+    //   legacy  -> "access" (CRM's Live switch in HELM is still off): keep
+    //              today's checks exactly (ALLOWED_ROLES on user.role,
+    //              user.role === "admin", assignable_usernames) so deploying
+    //              this before Ben flips the switch changes nobody's access
+    //   denied  -> "no_access" or any value we don't recognise
+    const crm = resolveCrmAccess(data.user);
+    if (crm.mode === "denied") {
+      return { ok: false, reason: `"${data.user.username}" has no CRM access in the role matrix.` };
     }
-    return { ok: true, user: data.user, refreshedToken: data.refreshedToken || null };
+    if (crm.mode === "legacy") {
+      const allowedRoles = String(env.ALLOWED_ROLES || "admin,user").split(",").map((r) => r.trim());
+      if (!allowedRoles.includes(data.user.role)) {
+        return { ok: false, reason: `Logged in as "${data.user.username}" (role "${data.user.role}"), which isn't allowed in CRM.` };
+      }
+    }
+    // _crm / _token are internal: handlers read the resolved level and the
+    // caller's own token (to look people up through auth-worker) from here.
+    return { ok: true, user: { ...data.user, _crm: crm, _token: token }, refreshedToken: data.refreshedToken || null };
   } catch (e) {
     return { ok: false, reason: `Couldn't reach auth-worker: ${e.message}` };
   }
+}
+
+// ---------------------------------------------------------------------------
+// CRM permissions from the Einbau ID role matrix (2026-10). Levels, per Ben:
+//   admin     - everything, including settings
+//   estimator - move bids between stages, hot-lead a company, assign follow-ups
+//   pm        - can be assigned follow-ups, can't assign them (or do the above)
+// Everything privileged is checked here on the server; hiding it in the UI is
+// cosmetic only.
+// ---------------------------------------------------------------------------
+
+const CRM_LEVELS = ["admin", "estimator", "pm"];
+
+function resolveCrmAccess(user) {
+  const roles = user && user.appRoles && typeof user.appRoles === "object" ? user.appRoles : null;
+  const level = roles ? roles.CRM : undefined;
+  if (typeof level === "string" && CRM_LEVELS.includes(level)) return { mode: "live", level };
+  // "access" is the matrix's neutral "granted, app not switched yet". A
+  // missing appRoles / missing CRM key is treated the same way rather than
+  // as a denial: it can only mean an auth-worker that predates the matrix,
+  // and falling back to today's checks is no looser than what CRM already
+  // does — whereas denying would lock everyone out.
+  if (level === "access" || level === undefined) return { mode: "legacy", level: null };
+  return { mode: "denied", level: null }; // "no_access" or anything unrecognised
+}
+
+function crmOf(user) {
+  return (user && user._crm) || { mode: "legacy", level: null };
+}
+
+// In legacy mode every one of these keeps today's behaviour: stage moves and
+// hot-lead edits were never restricted by role, and the admin check was the
+// legacy user.role.
+function canMoveStages(user) {
+  const c = crmOf(user);
+  return c.mode === "live" ? c.level === "admin" || c.level === "estimator" : true;
+}
+function canSetHotLead(user) {
+  const c = crmOf(user);
+  return c.mode === "live" ? c.level === "admin" || c.level === "estimator" : true;
+}
+function canAssignFollowups(user) {
+  const c = crmOf(user);
+  return c.mode === "live" ? c.level === "admin" || c.level === "estimator" : true;
+}
+function isCrmAdmin(user) {
+  const c = crmOf(user);
+  return c.mode === "live" ? c.level === "admin" : user.role === "admin";
+}
+
+function forbidden(detail) {
+  return json({ error: "forbidden", detail }, 403);
+}
+
+// Everyone who can open CRM, with their level — POST /auth/app/users over the
+// AUTH_WORKER binding using the caller's own token. Short in-isolate cache:
+// the answer is the same for every caller with CRM access, and pickers hit it
+// on every page load.
+let crmPeopleCache = { at: 0, users: null };
+async function getCrmPeople(env, user) {
+  if (crmPeopleCache.users && Date.now() - crmPeopleCache.at < 60_000) return crmPeopleCache.users;
+  const res = await env.AUTH_WORKER.fetch("https://auth.ben-a90.workers.dev/auth/app/users", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${user._token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ app: "CRM" }),
+  });
+  if (!res.ok) throw new Error(`auth-worker /auth/app/users failed (HTTP ${res.status})`);
+  const data = await res.json();
+  const users = Array.isArray(data.users) ? data.users : [];
+  crmPeopleCache = { at: Date.now(), users };
+  return users;
+}
+
+// Who can be set as a bid's owner/estimator. Live mode: anyone whose CRM level
+// is pm, estimator or admin (read from auth-worker, not a list kept here).
+async function eligibleAssignees(env, user) {
+  return (await getCrmPeople(env, user)).filter((p) => CRM_LEVELS.includes(p.level));
+}
+
+// Changing a bid's owner/estimator. `changes` is [[field, newValue, oldValue]];
+// only a real change counts — re-sending the current value is not an
+// assignment. Returns null if fine, else a 4xx Response.
+async function checkAssignmentChange(env, settings, user, changes) {
+  const real = changes.filter(([, next, prev]) => (next || null) !== (prev || null));
+  if (!real.length) return null;
+  if (crmOf(user).mode === "live") {
+    if (!canAssignFollowups(user)) return forbidden("Only estimators and admins can assign follow-ups.");
+    const eligible = new Set((await eligibleAssignees(env, user)).map((p) => p.username));
+    for (const [field, next] of real) {
+      if (next && !eligible.has(next)) {
+        return json({ error: "not_assignable", detail: `"${next}" can't be assigned follow-ups — they need CRM access at PM level or above.` }, 422);
+      }
+    }
+    return null;
+  }
+  for (const [field, next] of real) {
+    if (!isAssignableUsername(settings, user, next)) {
+      return json({ error: "not_assignable", detail: `"${next}" isn't on the assignable-users list (HELM → CRM Options).` }, 422);
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +595,9 @@ const COMPANY_PATCHABLE = ["account_segment", "region", "vertical", "tier", "not
 
 async function handleCompanyPatch(id, request, sql, env, user) {
   const body = await parseBody(request);
+  if (["hot_lead", "hot_lead_weight", "hot_lead_reason"].some((f) => body[f] !== undefined) && !canSetHotLead(user)) {
+    return forbidden("Only estimators and admins can add or change the hot-lead designation.");
+  }
   const existing = await sql`select * from companies where id = ${id}`;
   if (!existing.length) return json({ error: "not_found" }, 404);
 
@@ -600,7 +721,7 @@ const BID_PATCHABLE = [
   "final_value", "next_action", "next_action_date", "contact_id", "handoff_status",
 ];
 
-async function handleBidPatch(id, request, sql, user) {
+async function handleBidPatch(id, request, sql, env, user) {
   const body = await parseBody(request);
   const existing = await sql`select * from bids where id = ${id}`;
   if (!existing.length) return json({ error: "not_found" }, 404);
@@ -609,11 +730,13 @@ async function handleBidPatch(id, request, sql, user) {
 
   if (body.owner_username !== undefined || body.estimator_username !== undefined) {
     const settings = await getCrmSettings(sql);
-    for (const field of ["owner_username", "estimator_username"]) {
-      if (body[field] !== undefined && !isAssignableUsername(settings, user, body[field])) {
-        return json({ error: "not_assignable", detail: `"${body[field]}" isn't on the assignable-users list (HELM → CRM Options).` }, 422);
-      }
-    }
+    const denied = await checkAssignmentChange(
+      env, settings, user,
+      ["owner_username", "estimator_username"]
+        .filter((f) => body[f] !== undefined)
+        .map((f) => [f, body[f], existing[0][f]])
+    );
+    if (denied) return denied;
   }
 
   const merged = { ...existing[0], ...body };
@@ -632,7 +755,8 @@ async function handleBidPatch(id, request, sql, user) {
   return json({ bid });
 }
 
-async function handleBidStageChange(id, request, sql, user) {
+async function handleBidStageChange(id, request, sql, env, user) {
+  if (!canMoveStages(user)) return forbidden("Only estimators and admins can move bids between stages.");
   const body = await parseBody(request);
   const { to_stage } = body;
   if (!to_stage) return json({ error: "to_stage is required" }, 400);
@@ -646,11 +770,13 @@ async function handleBidStageChange(id, request, sql, user) {
   if (!validation.ok) return json({ error: "missing_required_fields", missing: validation.missing }, 422);
 
   const settings = await getCrmSettings(sql);
-  for (const field of ["owner_username", "estimator_username"]) {
-    if (body[field] !== undefined && !isAssignableUsername(settings, user, body[field])) {
-      return json({ error: "not_assignable", detail: `"${body[field]}" isn't on the assignable-users list (HELM → CRM Options).` }, 422);
-    }
-  }
+  const assignDenied = await checkAssignmentChange(
+    env, settings, user,
+    ["owner_username", "estimator_username"]
+      .filter((f) => body[f] !== undefined)
+      .map((f) => [f, body[f], bid[f]])
+  );
+  if (assignDenied) return assignDenied;
 
   // Only auto-refresh the cadence date when the caller didn't explicitly set
   // one in this same call — a human picking a specific follow-up date always
@@ -859,12 +985,34 @@ async function handleProcoreSync(request, sql) {
 // Worker directly with the logged-in user's own Einbau ID token).
 // ---------------------------------------------------------------------------
 
+// What the signed-in user can do in CRM, plus (live mode) who they can assign
+// follow-ups to. The web app builds its pickers and hides what a person can't
+// use from this — cosmetic only; every action above is enforced server-side.
+// Legacy mode (CRM not switched yet) reports everything allowed and no people
+// list, so the UI falls back to the HELM assignable-users list exactly as before.
+async function handleAccess(env, user) {
+  const c = crmOf(user);
+  const can = {
+    move_stages: canMoveStages(user),
+    hot_lead: canSetHotLead(user),
+    assign: canAssignFollowups(user),
+    admin: isCrmAdmin(user),
+  };
+  if (c.mode !== "live") return json({ mode: c.mode, level: c.level, can, people: null });
+  try {
+    const people = (await eligibleAssignees(env, user)).map((p) => ({ username: p.username, displayName: p.displayName, level: p.level }));
+    return json({ mode: c.mode, level: c.level, can, people });
+  } catch (e) {
+    return json({ mode: c.mode, level: c.level, can, people: [], people_error: e.message });
+  }
+}
+
 async function handleSettingsGet(sql) {
   return json(await getCrmSettings(sql));
 }
 
 async function handleSettingsPatch(request, sql, user) {
-  if (user.role !== "admin") return json({ error: "forbidden", detail: "Admin access required." }, 403);
+  if (!isCrmAdmin(user)) return forbidden("Admin access required.");
   const body = await parseBody(request);
   const current = await getCrmSettings(sql);
   const cadence = body.followup_cadence_days !== undefined ? body.followup_cadence_days : current.cadence;
@@ -1447,8 +1595,8 @@ export default {
       if (parts[0] === "bids") {
         if (parts.length === 1 && request.method === "GET") return withRefresh(await handleBidsList(url, sql));
         if (isUuid(parts[1]) && !parts[2] && request.method === "GET") return withRefresh(await handleBidDetail(parts[1], sql));
-        if (isUuid(parts[1]) && !parts[2] && request.method === "PATCH") return withRefresh(await handleBidPatch(parts[1], request, sql, auth.user));
-        if (isUuid(parts[1]) && parts[2] === "stage" && request.method === "POST") return withRefresh(await handleBidStageChange(parts[1], request, sql, auth.user));
+        if (isUuid(parts[1]) && !parts[2] && request.method === "PATCH") return withRefresh(await handleBidPatch(parts[1], request, sql, env, auth.user));
+        if (isUuid(parts[1]) && parts[2] === "stage" && request.method === "POST") return withRefresh(await handleBidStageChange(parts[1], request, sql, env, auth.user));
         if (isUuid(parts[1]) && parts[2] === "emails" && request.method === "GET") return withRefresh(await handleEmailsList(parts[1], sql));
         if (isUuid(parts[1]) && parts[2] === "emails" && request.method === "POST") return withRefresh(await handleEmailCreate(parts[1], request, sql, auth.user));
       }
@@ -1460,6 +1608,7 @@ export default {
 
       if (url.pathname === "/followups" && request.method === "GET") return withRefresh(await handleFollowupsList(url, sql, auth.user));
 
+      if (url.pathname === "/access" && request.method === "GET") return withRefresh(await handleAccess(env, auth.user));
       if (url.pathname === "/settings" && request.method === "GET") return withRefresh(await handleSettingsGet(sql));
       if (url.pathname === "/settings" && request.method === "PATCH") return withRefresh(await handleSettingsPatch(request, sql, auth.user));
 

@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../api.js";
 import { ACCOUNT_SEGMENT_LABELS, ACCOUNT_SEGMENTS, STAGE_LABELS } from "../stages.js";
 
-export default function CompanyDetail({ id, onClose, onChanged }) {
+export default function CompanyDetail({ id, onClose, onChanged, canHotLead = true }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [saving, setSaving] = useState(false);
@@ -80,7 +80,7 @@ export default function CompanyDetail({ id, onClose, onChanged }) {
             parallel-run period.
           </div>
           <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-            <input type="checkbox" checked={company.hot_lead} onChange={(e) => patch({ hot_lead: e.target.checked, hot_lead_reason: hotLeadReason })} disabled={saving} />
+            <input type="checkbox" checked={company.hot_lead} onChange={(e) => patch({ hot_lead: e.target.checked, hot_lead_reason: hotLeadReason })} disabled={saving || !canHotLead} />
             Hot lead
           </label>
           <div className="field">
@@ -88,10 +88,12 @@ export default function CompanyDetail({ id, onClose, onChanged }) {
             <input
               value={hotLeadReason}
               onChange={(e) => setHotLeadReason(e.target.value)}
-              onBlur={() => patch({ hot_lead_reason: hotLeadReason })}
+              onBlur={() => canHotLead && hotLeadReason !== (company.hot_lead_reason || "") && patch({ hot_lead_reason: hotLeadReason })}
+              disabled={!canHotLead}
               placeholder="Why this account gets weighted (relationship, strategic account, referral…)"
             />
           </div>
+          {!canHotLead && <div className="field-help" style={{ marginTop: 6 }}>Only estimators and admins can add or change the hot-lead designation.</div>}
           {company.hot_lead_set_by && (
             <div className="field-help" style={{ marginTop: 6 }}>
               Set by {company.hot_lead_set_by} on {new Date(company.hot_lead_set_at).toLocaleString()}

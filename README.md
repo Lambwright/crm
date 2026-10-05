@@ -77,42 +77,53 @@ table and every design decision are documented at the top of
   any other app's project, same reasoning as every other suite app's own
   dedicated project.
 
-## Coming change: Einbau ID role matrix
+## Einbau ID role matrix — built, waiting on CRM's Live switch
 
-Signed off by Ben, 2026-09-30, not built yet — tracking here as it lands.
-Einbau ID permissions are moving from the flat `admin`/`user` role to company
-job roles (Super Admin, Admin, Estimator, Project Manager, Project
-Coordinator, CRM, Accounting, Logistics) plus a per-app access matrix edited
-in HELM by the Super Admin only. `/auth/login` and `/auth/verify` will add
-`user.appRoles` (e.g. `{ CRM: "estimator" }`, always an object, `"no_access"`
-as the value for an app the user can't open — confirmed by Ben 2026-09-30,
-not an absent key) and `user.jobRole` (informational, never gate on it); `user.role`
-stays as a legacy field but will only ever be `"admin"` for the Super Admin
-after the switch.
+Built 2026-10-05 against auth-worker/README.md "Role matrix". CRM reads
+`user.appRoles.CRM` from `/auth/verify` and handles three states:
 
-CRM's three levels once this lands: **admin** (all features — Admin/CRM job
-roles), **estimator** (move stages, hot-lead a company, assign follow-ups to
-anyone — Estimator job role), **pm** (can be assigned a follow-up, can't
-assign one to someone else — Project Manager/Project Coordinator). This
-replaces `crm_settings.assignable_usernames` (the HELM → CRM Options
-"Assignable users" list) entirely — assignability becomes a function of
-`appRoles.CRM`, computed from the matrix, not a list maintained here.
+| `appRoles.CRM`            | Mode      | What CRM does |
+|---------------------------|-----------|---------------|
+| `admin` / `estimator` / `pm` | **live**   | The matrix is the gate. `ALLOWED_ROLES` and `user.role` are ignored. |
+| `access` (or the key missing) | **legacy** | CRM isn't switched yet: today's checks exactly — `ALLOWED_ROLES` on `user.role`, `user.role === "admin"`, `assignable_usernames`. Deploying changed nobody's access. |
+| `no_access` / anything else | **denied** | 401 on every route. |
 
-Everywhere CRM currently decides permissions from something else, all in
-`worker/src/index.js`, needs to move to `appRoles.CRM`:
-- `requireLogin`'s `ALLOWED_ROLES` check against `user.role` (line ~132) —
-  drop once `apps.includes("CRM")` plus a real `appRoles.CRM` are the actual
-  gate; there's no "user" level in the new model.
-- `isAssignableUsername`'s `actingUser.role === "admin"` bypass and its
-  `settings.assignableUsernames` list lookup — becomes a check that the
-  *actor* has `appRoles.CRM` in `admin`/`estimator` to assign, and the
-  *target* has `appRoles.CRM` in `admin`/`estimator`/`pm` to be assignable.
-- `handleSettingsPatch`'s `user.role !== "admin"` check (who can edit the
-  follow-up cadence) — becomes `appRoles.CRM === "admin"`.
+A missing `appRoles` is treated as legacy rather than denied: it can only mean
+an auth-worker older than the matrix, and falling back to today's checks is no
+looser than what CRM already did, whereas denying would lock everyone out.
 
-No hardcoded usernames anywhere in this app's source — the only
-username-keyed data is `assignable_usernames` itself, which is DB content
-(set via HELM), not code, and goes away with this change.
+**Levels (live mode), all enforced in `worker/src/index.js`:**
+- `admin` — everything, including `PATCH /settings` (follow-up cadence).
+- `estimator` — move bids between stages (`POST /bids/:id/stage`, which includes
+  Awarded and Start Handoff), set the hot-lead designation (`hot_lead`,
+  `hot_lead_weight`, `hot_lead_reason` on `PATCH /companies/:id`), and assign
+  follow-ups (change `owner_username` / `estimator_username`).
+- `pm` — can be assigned follow-ups; cannot do any of the above. Can still log
+  emails, edit bid dates/values/next action, edit company notes/segment, and
+  acknowledge notifications.
+
+**Assignment is split by actor and target.** The actor must be estimator or
+admin; the target must currently have CRM access at pm, estimator or admin,
+read live from auth-worker (`POST /auth/app/users { app: "CRM" }` over the
+`AUTH_WORKER` binding with the caller's own token, cached 60s per isolate). Only
+a real change counts: re-sending a bid's current owner isn't an assignment.
+
+**`GET /access`** returns the caller's mode, level, a `can` map
+(`move_stages`, `hot_lead`, `assign`, `admin`) and, in live mode, the eligible
+assignee list. The web app builds the owner/estimator pickers, hides what a
+person can't use, and decides nav order from it — all cosmetic; the worker
+enforces every action. Follow-ups leads the nav for estimators and PMs in live
+mode (admins keep the default order); in legacy mode it's still anyone on the
+HELM assignable-users list.
+
+**Still to remove once CRM is live and settled** (a later follow-up, not done):
+`ALLOWED_ROLES` and the `user.role` checks in `requireLogin`, `isCrmAdmin` and
+`isAssignableUsername`; the `crm_settings.assignable_usernames` column and the
+`assignable_usernames` handling in `handleSettingsPatch`/`getCrmSettings`; and,
+in HELM, the "Assignable users" section of the CRM Options tab (HELM's code).
+Not restricted by any level, because the spec doesn't name them: company
+account segment and blacklist (`do_not_pursue` / `do_not_work_with`) edits, and
+`handoff_status` edits — worth a decision before CRM goes live.
 
 ## On hold: backlog / resource forecast
 

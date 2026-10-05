@@ -72,6 +72,9 @@ export const api = {
 
   // Settings — cadence + assignable-users list, edited from HELM's CRM Options tab
   getSettings: () => request(`/settings`),
+
+  // What the signed-in user can do in CRM (role matrix) + who they can assign follow-ups to
+  getAccess: () => request(`/access`),
 };
 
 // Builds a prefilled mailto: link for the tender-email popout. Kept client-side

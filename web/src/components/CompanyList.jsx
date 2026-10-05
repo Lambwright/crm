@@ -19,7 +19,8 @@ const SORT_COLUMNS = {
   total_value: { label: "Total value", get: (c) => c.total_value || 0, dir: "desc" },
 };
 
-export default function CompanyList() {
+export default function CompanyList({ access }) {
+  const canHotLead = access?.can?.hot_lead ?? true; // cosmetic; the worker enforces it
   const [companies, setCompanies] = useState([]);
   const [q, setQ] = useState("");
   const [segment, setSegment] = useState("");
@@ -86,8 +87,8 @@ export default function CompanyList() {
         <div className="notification-banner" key={n.id}>
           <span>🔥 {n.message}</span>
           <div style={{ display: "flex", gap: 8 }}>
-            <button className="btn btn-accent btn-sm" onClick={() => renewHotLead(n)}>Renew</button>
-            <button className="btn btn-ghost btn-sm" onClick={() => letHotLeadExpire(n)}>Let it expire</button>
+            {canHotLead && <button className="btn btn-accent btn-sm" onClick={() => renewHotLead(n)}>Renew</button>}
+            {canHotLead && <button className="btn btn-ghost btn-sm" onClick={() => letHotLeadExpire(n)}>Let it expire</button>}
           </div>
         </div>
       ))}
@@ -133,7 +134,7 @@ export default function CompanyList() {
       </div>
 
       {selectedId && (
-        <CompanyDetail id={selectedId} onClose={() => setSelectedId(null)} onChanged={load} />
+        <CompanyDetail id={selectedId} canHotLead={canHotLead} onClose={() => setSelectedId(null)} onChanged={load} />
       )}
     </>
   );
