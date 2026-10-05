@@ -114,6 +114,44 @@ No hardcoded usernames anywhere in this app's source — the only
 username-keyed data is `assignable_usernames` itself, which is DB content
 (set via HELM), not code, and goes away with this change.
 
+## On hold: backlog / resource forecast
+
+Decisions from Ben, 2026-10-05. **Nothing here is built, and nothing gets
+built until the Einbau ID role matrix above is running.** Source material:
+`Bid Board and Backlog Report Oct 1.xlsx` (a Procore report: estimate total,
+labour total, project start date per awarded-not-started project).
+
+Purpose: put a rough, close-to-the-truth picture of expected resource demand
+in front of people — e.g. "three big projects, six to ten people each, same
+region, same two-month window." Not precision. Human in the loop: each
+project lands on a Backlog view with everything known plus a guessed crew
+and end date, and a person adjusts it.
+
+- **End date, in order of precedence:** a fixed end date if the project has
+  one; otherwise a crew size entered by hand (end date follows from it);
+  otherwise the calculated optimum crew and the end date that implies.
+- **Calculation:** crew from a size table keyed on labour dollars; weeks =
+  labour $ ÷ $100/hr ÷ 40 hrs/week ÷ crew; end date = start + weeks × 7
+  calendar days. This fixes the sheet's end-date column (it added weeks × 7
+  and weeks × 5, overshooting by about 70%) and its chart (it treated working
+  days as calendar days).
+- **Tier table fix:** the sheet's header says "Project Value (Max)" but its
+  XLOOKUP takes the next *lower* tier, so a $34k labour job got a crew of 2.
+  Make it behave as labelled: a job takes the smallest tier whose max covers
+  it (≤$500 → 1, ≤$20k → 2, ≤$50k → 3, ≤$100k → 4, ≤$200k → 5, ≤$300k → 6,
+  ≤$500k → 8, ≤$1M → 10).
+- **Totals:** the sheet's "Grand Total 45" is a sum of crew sizes, not
+  concurrent need. Show a wide set of metrics first (peak concurrent
+  headcount, average, total person-weeks, headcount by week/period) and prune
+  to the ones that prove useful.
+- **Open questions for when this resumes:** whether Procore Resource Planning
+  can take an unnamed role with a headcount and dates (nobody has confirmed;
+  needs a read-only probe through HANDOFF, whose RP startup task is stubbed
+  for this reason); whether to use real labour hours from the estimate lines
+  (already stored on `bids.labor_hours`) instead of dollars ÷ $100; and where
+  "region" comes from (company region is mostly empty; project-name prefixes
+  like `ON -` / `BC -` are the obvious source).
+
 ## Explicitly deferred / not built here
 
 See the kickoff prompt for the full list and reasoning. In short: fuzzy
