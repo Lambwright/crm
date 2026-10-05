@@ -93,14 +93,18 @@ an auth-worker older than the matrix, and falling back to today's checks is no
 looser than what CRM already did, whereas denying would lock everyone out.
 
 **Levels (live mode), all enforced in `worker/src/index.js`:**
-- `admin` — everything, including `PATCH /settings` (follow-up cadence).
+- `admin` — everything, including `PATCH /settings` (follow-up cadence) and
+  adding or removing a blacklist designation (account segment `do_not_pursue` /
+  `do_not_work_with`) — admin only, in both directions.
 - `estimator` — move bids between stages (`POST /bids/:id/stage`, which includes
   Awarded and Start Handoff), set the hot-lead designation (`hot_lead`,
   `hot_lead_weight`, `hot_lead_reason` on `PATCH /companies/:id`), and assign
-  follow-ups (change `owner_username` / `estimator_username`).
+  follow-ups (change `owner_username` / `estimator_username`), change an account
+  segment (anything other than a blacklist designation), and change a bid's
+  `handoff_status`.
 - `pm` — can be assigned follow-ups; cannot do any of the above. Can still log
-  emails, edit bid dates/values/next action, edit company notes/segment, and
-  acknowledge notifications.
+  emails, edit bid dates/values/next action, edit company notes/region/vertical,
+  and acknowledge notifications.
 
 **Assignment is split by actor and target.** The actor must be estimator or
 admin; the target must currently have CRM access at pm, estimator or admin,
@@ -121,9 +125,6 @@ HELM assignable-users list.
 `isAssignableUsername`; the `crm_settings.assignable_usernames` column and the
 `assignable_usernames` handling in `handleSettingsPatch`/`getCrmSettings`; and,
 in HELM, the "Assignable users" section of the CRM Options tab (HELM's code).
-Not restricted by any level, because the spec doesn't name them: company
-account segment and blacklist (`do_not_pursue` / `do_not_work_with`) edits, and
-`handoff_status` edits — worth a decision before CRM goes live.
 
 ## On hold: backlog / resource forecast
 

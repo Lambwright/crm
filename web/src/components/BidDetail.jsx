@@ -172,6 +172,7 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
             <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
               <select
                 value={bid.handoff_status || "pending"}
+                disabled={!(can?.handoff_status ?? true)}
                 onChange={async (e) => { await api.patchBid(id, { handoff_status: e.target.value }); load(); onChanged?.(); }}
               >
                 {Object.entries(HANDOFF_STATUS_LABELS).map(([k, label]) => (

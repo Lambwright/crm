@@ -134,7 +134,7 @@ export default function CompanyList({ access }) {
       </div>
 
       {selectedId && (
-        <CompanyDetail id={selectedId} canHotLead={canHotLead} onClose={() => setSelectedId(null)} onChanged={load} />
+        <CompanyDetail id={selectedId} canHotLead={canHotLead} can={access?.can} onClose={() => setSelectedId(null)} onChanged={load} />
       )}
     </>
   );

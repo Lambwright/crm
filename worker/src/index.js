@@ -199,6 +199,22 @@ function canAssignFollowups(user) {
   const c = crmOf(user);
   return c.mode === "live" ? c.level === "admin" || c.level === "estimator" : true;
 }
+// Ben, 2026-10-05 (live mode only — legacy keeps today's no-restriction behaviour):
+// blacklist designation = admin only; account segment and handoff_status =
+// estimator and admin.
+const BLACKLIST_SEGMENTS = ["do_not_pursue", "do_not_work_with"];
+function canManageBlacklist(user) {
+  const c = crmOf(user);
+  return c.mode === "live" ? c.level === "admin" : true;
+}
+function canChangeSegment(user) {
+  const c = crmOf(user);
+  return c.mode === "live" ? c.level === "admin" || c.level === "estimator" : true;
+}
+function canSetHandoffStatus(user) {
+  const c = crmOf(user);
+  return c.mode === "live" ? c.level === "admin" || c.level === "estimator" : true;
+}
 function isCrmAdmin(user) {
   const c = crmOf(user);
   return c.mode === "live" ? c.level === "admin" : user.role === "admin";
@@ -604,6 +620,17 @@ async function handleCompanyPatch(id, request, sql, env, user) {
   const fields = Object.keys(body).filter((k) => COMPANY_PATCHABLE.includes(k));
   if (!fields.length) return json({ error: "no_valid_fields", detail: `Patchable fields: ${COMPANY_PATCHABLE.join(", ")}` }, 400);
 
+  // Only a real change counts. Adding OR removing a blacklist designation is
+  // admin-only (an estimator un-blacklisting would defeat the point); any
+  // other segment change is estimator/admin.
+  if (body.account_segment !== undefined && body.account_segment !== existing[0].account_segment) {
+    if (BLACKLIST_SEGMENTS.includes(body.account_segment) || BLACKLIST_SEGMENTS.includes(existing[0].account_segment)) {
+      if (!canManageBlacklist(user)) return forbidden("Only admins can add or remove a Do Not Pursue / Do Not Work With designation.");
+    } else if (!canChangeSegment(user)) {
+      return forbidden("Only estimators and admins can change an account's segment.");
+    }
+  }
+
   const hotLeadTouched = fields.includes("hot_lead") || fields.includes("hot_lead_weight");
   const setClauses = { ...existing[0], ...body };
   if (hotLeadTouched) {
@@ -727,6 +754,10 @@ async function handleBidPatch(id, request, sql, env, user) {
   if (!existing.length) return json({ error: "not_found" }, 404);
   const fields = Object.keys(body).filter((k) => BID_PATCHABLE.includes(k));
   if (!fields.length) return json({ error: "no_valid_fields", detail: `Patchable fields: ${BID_PATCHABLE.join(", ")}` }, 400);
+
+  if (body.handoff_status !== undefined && (body.handoff_status || null) !== (existing[0].handoff_status || null) && !canSetHandoffStatus(user)) {
+    return forbidden("Only estimators and admins can change a bid's handoff status.");
+  }
 
   if (body.owner_username !== undefined || body.estimator_username !== undefined) {
     const settings = await getCrmSettings(sql);
@@ -997,6 +1028,9 @@ async function handleAccess(env, user) {
     hot_lead: canSetHotLead(user),
     assign: canAssignFollowups(user),
     admin: isCrmAdmin(user),
+    segment: canChangeSegment(user),
+    blacklist: canManageBlacklist(user),
+    handoff_status: canSetHandoffStatus(user),
   };
   if (c.mode !== "live") return json({ mode: c.mode, level: c.level, can, people: null });
   try {

@@ -2,7 +2,12 @@ import { useEffect, useState } from "react";
 import { api } from "../api.js";
 import { ACCOUNT_SEGMENT_LABELS, ACCOUNT_SEGMENTS, STAGE_LABELS } from "../stages.js";
 
-export default function CompanyDetail({ id, onClose, onChanged, canHotLead = true }) {
+const BLACKLIST = ["do_not_pursue", "do_not_work_with"];
+
+export default function CompanyDetail({ id, onClose, onChanged, canHotLead = true, can }) {
+  // Role matrix — cosmetic; the worker enforces all of these.
+  const canSegment = can?.segment ?? true;
+  const canBlacklist = can?.blacklist ?? true;
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [saving, setSaving] = useState(false);
@@ -58,8 +63,13 @@ export default function CompanyDetail({ id, onClose, onChanged, canHotLead = tru
         <div className="field-row" style={{ marginBottom: 12 }}>
           <div className="field">
             <label>Account Segment</label>
-            <select value={company.account_segment} onChange={(e) => patch({ account_segment: e.target.value })} disabled={saving}>
-              {ACCOUNT_SEGMENTS.map((s) => <option key={s} value={s}>{ACCOUNT_SEGMENT_LABELS[s]}</option>)}
+            <select
+              value={company.account_segment}
+              onChange={(e) => patch({ account_segment: e.target.value })}
+              disabled={saving || (BLACKLIST.includes(company.account_segment) ? !canBlacklist : !canSegment)}
+              title={!canSegment ? "Only estimators and admins can change an account's segment" : BLACKLIST.includes(company.account_segment) && !canBlacklist ? "Only admins can remove a Do Not Pursue / Do Not Work With designation" : undefined}
+            >
+              {ACCOUNT_SEGMENTS.map((s) => <option key={s} value={s} disabled={BLACKLIST.includes(s) && !canBlacklist}>{ACCOUNT_SEGMENT_LABELS[s]}</option>)}
             </select>
           </div>
           <div className="field">
