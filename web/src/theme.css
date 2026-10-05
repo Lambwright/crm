@@ -310,7 +310,7 @@ input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.7); }
 .stat-tooltip-popup {
   display: none;
   position: absolute; bottom: 100%; left: 0; z-index: 50;
-  width: 260px; padding: 10px 12px; margin-bottom: 6px;
+  width: 280px; max-width: 80vw; padding: 10px 12px; margin-bottom: 6px;
   background: var(--bg-page); border: 1px solid var(--accent); border-radius: var(--radius-sm);
   font-size: 11px; line-height: 1.5; color: var(--text-primary); font-weight: 400;
   text-transform: none; letter-spacing: normal;

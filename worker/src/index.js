@@ -967,10 +967,25 @@ function rangeCutoffDate(range) {
   return new Date(0); // 'all' or anything unrecognized
 }
 
-async function handleDashboardSummary(sql, range) {
-  const cutoffIso = rangeCutoffDate(range).toISOString();
+// Last Week is the only range with an upper bound — the previous full
+// Monday-to-Sunday calendar week (Ben, 2026-10-05). Everything else is
+// "from the start of the current period until now", so its end is just a
+// far-future date that never excludes anything.
+function rangeBounds(range) {
+  if (range === "last_week") {
+    const thisMonday = rangeCutoffDate("week");
+    const lastMonday = new Date(thisMonday.getFullYear(), thisMonday.getMonth(), thisMonday.getDate() - 7);
+    return { start: lastMonday, end: thisMonday };
+  }
+  return { start: rangeCutoffDate(range), end: new Date("9999-12-31T00:00:00Z") };
+}
 
-  const byStage = await sql`select stage, count(*)::int as count, coalesce(sum(estimated_value),0)::float as pipeline_value from bids where created_at >= ${cutoffIso} group by stage`;
+async function handleDashboardSummary(sql, range) {
+  const bounds = rangeBounds(range);
+  const cutoffIso = bounds.start.toISOString();
+  const endIso = bounds.end.toISOString();
+
+  const byStage = await sql`select stage, count(*)::int as count, coalesce(sum(estimated_value),0)::float as pipeline_value from bids where created_at >= ${cutoffIso} and created_at < ${endIso} group by stage`;
 
   const winRateRows = await sql`
     select
@@ -978,14 +993,14 @@ async function handleDashboardSummary(sql, range) {
       count(*) filter (where stage = 'lost')::int as lost,
       coalesce(sum(estimated_value) filter (where stage = 'complete'),0)::float as won_value,
       coalesce(sum(estimated_value) filter (where stage = 'lost'),0)::float as lost_value
-    from bids where created_at >= ${cutoffIso}`;
+    from bids where created_at >= ${cutoffIso} and created_at < ${endIso}`;
   const aging = await sql`
     select count(*)::int as overdue_count
     from bids
-    where stage not in ('complete', 'lost', 'no_bid') and created_at >= ${cutoffIso}
+    where stage not in ('complete', 'lost', 'no_bid') and created_at >= ${cutoffIso} and created_at < ${endIso}
       and next_action_date is not null and next_action_date < current_date`;
   const hotLeads = await sql`select count(*)::int as hot_lead_count from companies where hot_lead = true`;
-  const totals = await sql`select count(*)::int as total_bids, coalesce(avg(estimated_value),0)::float as avg_bid_value from bids where created_at >= ${cutoffIso}`;
+  const totals = await sql`select count(*)::int as total_bids, coalesce(avg(estimated_value),0)::float as avg_bid_value, coalesce(sum(estimated_value),0)::float as total_value, count(estimated_value)::int as valued_count from bids where created_at >= ${cutoffIso} and created_at < ${endIso}`;
 
   // won_in_range/lost_in_range (Ben, 2026-09): the win-rate figures above are
   // a COHORT view — "of bids CREATED in this range, how many are won/lost
@@ -1016,14 +1031,21 @@ async function handleDashboardSummary(sql, range) {
   // doesn't count it either (confirmed live: CRM's raw complete/lost counts
   // were inflated relative to Procore's own visible board precisely because
   // they included archived records Procore's UI hides by default).
+  // $ basis (Ben, 2026-10-05): Awarded uses the confirmed final value where one was
+  // entered, else the estimate — most historical wins never had a final_value keyed
+  // in, so final_value alone would count nearly all of them as zero. Lost and
+  // still-active use the estimate (what was bid).
   const pipelineCounts = await sql`
     select
       count(*) filter (where stage = 'complete')::int as complete_count,
       count(*) filter (where stage = 'lost')::int as lost_count,
-      count(*) filter (where stage in ('bid_submitted','accepted','in_progress','to_do','delayed'))::int as midlate_count
+      count(*) filter (where stage in ('bid_submitted','accepted','in_progress','to_do','delayed'))::int as midlate_count,
+      coalesce(sum(coalesce(final_value, estimated_value)) filter (where stage = 'complete'),0)::float as complete_value,
+      coalesce(sum(estimated_value) filter (where stage = 'lost'),0)::float as lost_value,
+      coalesce(sum(estimated_value) filter (where stage in ('bid_submitted','accepted','in_progress','to_do','delayed')),0)::float as midlate_value
     from bids
-    where source_archived = false and created_at >= ${cutoffIso}`;
-  const pcRow = pipelineCounts[0] || { complete_count: 0, lost_count: 0, midlate_count: 0 };
+    where source_archived = false and created_at >= ${cutoffIso} and created_at < ${endIso}`;
+  const pcRow = pipelineCounts[0] || { complete_count: 0, lost_count: 0, midlate_count: 0, complete_value: 0, lost_value: 0, midlate_value: 0 };
   const pipelineTotal = pcRow.complete_count + pcRow.lost_count + pcRow.midlate_count;
   const pipelineWinRate = pipelineTotal > 0 ? pcRow.complete_count / pipelineTotal : null;
 
@@ -1033,15 +1055,21 @@ async function handleDashboardSummary(sql, range) {
   const decidedTotal = pcRow.complete_count + pcRow.lost_count;
   const decidedWinRate = decidedTotal > 0 ? pcRow.complete_count / decidedTotal : null;
 
+  // Same two rates by dollar value instead of by number of bids.
+  const pipelineValueTotal = pcRow.complete_value + pcRow.lost_value + pcRow.midlate_value;
+  const pipelineWinRateValue = pipelineValueTotal > 0 ? pcRow.complete_value / pipelineValueTotal : null;
+  const decidedValueTotal = pcRow.complete_value + pcRow.lost_value;
+  const decidedWinRateValue = decidedValueTotal > 0 ? pcRow.complete_value / decidedValueTotal : null;
+
   const wonInRange = await sql`
-    select count(distinct h.bid_id)::int as count, coalesce(sum(b.final_value),0)::float as value
+    select count(distinct h.bid_id)::int as count, coalesce(sum(coalesce(b.final_value, b.estimated_value)),0)::float as value
     from bid_stage_history h join bids b on b.id = h.bid_id
-    where h.to_stage = 'complete' and h.changed_at >= ${cutoffIso} and b.stage = 'complete'
+    where h.to_stage = 'complete' and h.changed_at >= ${cutoffIso} and h.changed_at < ${endIso} and b.stage = 'complete'
       and (${!excludeBackfillArtifacts} or h.changed_by != 'system')`;
   const lostInRange = await sql`
     select count(distinct h.bid_id)::int as count, coalesce(sum(b.estimated_value),0)::float as value
     from bid_stage_history h join bids b on b.id = h.bid_id
-    where h.to_stage = 'lost' and h.changed_at >= ${cutoffIso} and b.stage = 'lost'
+    where h.to_stage = 'lost' and h.changed_at >= ${cutoffIso} and h.changed_at < ${endIso} and b.stage = 'lost'
       and (${!excludeBackfillArtifacts} or h.changed_by != 'system')`;
 
   // "Follow-ups completed" = outbound tender emails logged in range — that's
@@ -1052,7 +1080,7 @@ async function handleDashboardSummary(sql, range) {
   // — the tab and the Pipeline's own compose-and-log box write to the same
   // table, and distinguishing "was this technically overdue" isn't tracked.
   const followupsCompleted = await sql`
-    select count(*)::int as count from bid_emails where direction = 'outbound' and sent_at >= ${cutoffIso}`;
+    select count(*)::int as count from bid_emails where direction = 'outbound' and sent_at >= ${cutoffIso} and sent_at < ${endIso}`;
 
   // Top 10 companies by total bid value in range — a quick "who matters most" view.
   const byCompany = await sql`
@@ -1061,7 +1089,7 @@ async function handleDashboardSummary(sql, range) {
       coalesce(sum(b.estimated_value),0)::float as total_value,
       count(*) filter (where b.stage = 'complete')::int as won_count
     from companies c join bids b on b.company_id = c.id
-    where b.created_at >= ${cutoffIso}
+    where b.created_at >= ${cutoffIso} and b.created_at < ${endIso}
     group by c.id, c.name
     order by total_value desc
     limit 10`;
@@ -1074,7 +1102,7 @@ async function handleDashboardSummary(sql, range) {
       count(*) filter (where b.stage = 'complete')::int as won_count,
       count(*) filter (where b.stage = 'lost')::int as lost_count
     from bids b left join companies c on c.id = b.company_id
-    where b.created_at >= ${cutoffIso}
+    where b.created_at >= ${cutoffIso} and b.created_at < ${endIso}
     group by coalesce(c.region, 'Unspecified')
     order by total_value desc`;
 
@@ -1095,6 +1123,8 @@ async function handleDashboardSummary(sql, range) {
     lost_value: lostValue,
     total_bids: totals[0]?.total_bids || 0,
     avg_bid_value: totals[0]?.avg_bid_value || 0,
+    total_value: totals[0]?.total_value || 0,
+    valued_count: totals[0]?.valued_count || 0,
     overdue_followups: aging[0]?.overdue_count || 0,
     followups_completed: followupsCompleted[0]?.count || 0,
     won_in_range: wonInRange[0] || { count: 0, value: 0 },
@@ -1103,6 +1133,10 @@ async function handleDashboardSummary(sql, range) {
     pipeline_win_rate_components: { complete: pcRow.complete_count, lost: pcRow.lost_count, midlate: pcRow.midlate_count, total: pipelineTotal },
     decided_win_rate: decidedWinRate,
     decided_win_rate_components: { complete: pcRow.complete_count, lost: pcRow.lost_count, total: decidedTotal },
+    pipeline_win_rate_value: pipelineWinRateValue,
+    pipeline_win_rate_value_components: { complete: pcRow.complete_value, lost: pcRow.lost_value, midlate: pcRow.midlate_value, total: pipelineValueTotal },
+    decided_win_rate_value: decidedWinRateValue,
+    decided_win_rate_value_components: { complete: pcRow.complete_value, lost: pcRow.lost_value, total: decidedValueTotal },
     hot_leads: hotLeads[0]?.hot_lead_count || 0,
     by_company: byCompany,
     by_region: byRegion,
