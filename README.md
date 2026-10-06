@@ -129,13 +129,14 @@ in HELM, the "Assignable users" section of the CRM Options tab (HELM's code).
 ## Win/loss dates and archived bids
 
 Decided 2026-10-06. Procore's Bid Board API has no status-change dates, so for the
-historical import a bid's due date (stored as ) stands in for its decision
-date. From the Procore sync bridge onward CRM records the real moment: is set when a bid moves to Awarded or Lost (manual move or sync) and cleared if it leaves
-that stage;  is set when the sync first sees the archived flag. Archived
-bids stay out of win rates unless  is set — i.e. CRM watched the decision
+historical import a bid's due date (stored as `created_at`) stands in for its decision
+date. From the Procore sync bridge onward CRM records the real moment: `bids.decided_at`
+is set when a bid moves to Awarded or Lost (manual move or sync) and cleared if it leaves
+that stage; `bids.archived_at` is set when the sync first sees the archived flag. Archived
+bids stay out of win rates unless `decided_at` is set, i.e. CRM watched the decision
 happen while the bid was still live. Migration 009 is applied by the worker itself
-() on first run after deploy. If a Procore report with real status dates is
-ever produced, import it into .
+(`ensureSchema`) on first run after deploy. If a Procore report with real status dates is
+ever produced, import it into `decided_at`.
 
 ## On hold: backlog / resource forecast
 
