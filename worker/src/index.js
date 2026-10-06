@@ -1159,10 +1159,31 @@ function rangeBounds(range) {
     const lastMonday = new Date(thisMonday.getFullYear(), thisMonday.getMonth(), thisMonday.getDate() - 7);
     return { start: lastMonday, end: thisMonday };
   }
+  // Einbau's fiscal year runs Oct 1 - Sep 30 and is named for the year it
+  // ends in (Ben, 2026-10-06: the year that began 2026-10-01 is FY2027).
+  // Calendar quarters already line up with fiscal quarters (Q1 = Oct-Dec), so
+  // only the year needs its own range.
+  if (range === "fy" || range === "last_fy") {
+    const now = new Date();
+    const fyStartYear = now.getMonth() >= 9 ? now.getFullYear() : now.getFullYear() - 1;
+    if (range === "fy") return { start: new Date(fyStartYear, 9, 1), end: new Date("9999-12-31T00:00:00Z") };
+    return { start: new Date(fyStartYear - 1, 9, 1), end: new Date(fyStartYear, 9, 1) };
+  }
   return { start: rangeCutoffDate(range), end: new Date("9999-12-31T00:00:00Z") };
 }
 
-async function handleDashboardSummary(sql, range) {
+// Whether archived Awarded/Lost bids count in the win-rate figures and the
+// customer table. Procore's own board UI hides archived by default, so
+// excluding them is what makes CRM's counts match what people see there
+// (241 Awarded / ~734 Lost, confirmed 2026-09-29) — but archived is also where
+// closed history goes once Estimating drains it each fiscal year (FY2025's
+// results are ~78% archived), so for anything that reaches back past the
+// current year, excluding it quietly throws the history away. Left at the
+// original behaviour pending Ben's call; flipping this one constant (or
+// passing includeArchived) switches every figure that uses it.
+const INCLUDE_ARCHIVED_IN_WIN_RATES = false;
+
+async function handleDashboardSummary(sql, range, { includeArchived = INCLUDE_ARCHIVED_IN_WIN_RATES } = {}) {
   const bounds = rangeBounds(range);
   const cutoffIso = bounds.start.toISOString();
   const endIso = bounds.end.toISOString();
@@ -1224,10 +1245,12 @@ async function handleDashboardSummary(sql, range) {
       count(*) filter (where stage in ('bid_submitted','accepted','in_progress','to_do','delayed'))::int as midlate_count,
       coalesce(sum(coalesce(final_value, estimated_value)) filter (where stage = 'complete'),0)::float as complete_value,
       coalesce(sum(estimated_value) filter (where stage = 'lost'),0)::float as lost_value,
-      coalesce(sum(estimated_value) filter (where stage in ('bid_submitted','accepted','in_progress','to_do','delayed')),0)::float as midlate_value
+      coalesce(sum(estimated_value) filter (where stage in ('bid_submitted','accepted','in_progress','to_do','delayed')),0)::float as midlate_value,
+      count(*) filter (where stage = 'complete' and coalesce(final_value, estimated_value) is not null)::int as complete_valued_count,
+      count(*) filter (where stage = 'lost' and estimated_value is not null)::int as lost_valued_count
     from bids
-    where source_archived = false and created_at >= ${cutoffIso} and created_at < ${endIso}`;
-  const pcRow = pipelineCounts[0] || { complete_count: 0, lost_count: 0, midlate_count: 0, complete_value: 0, lost_value: 0, midlate_value: 0 };
+    where (${includeArchived} or source_archived = false) and created_at >= ${cutoffIso} and created_at < ${endIso}`;
+  const pcRow = pipelineCounts[0] || { complete_count: 0, lost_count: 0, midlate_count: 0, complete_value: 0, lost_value: 0, midlate_value: 0, complete_valued_count: 0, lost_valued_count: 0 };
   const pipelineTotal = pcRow.complete_count + pcRow.lost_count + pcRow.midlate_count;
   const pipelineWinRate = pipelineTotal > 0 ? pcRow.complete_count / pipelineTotal : null;
 
@@ -1264,17 +1287,30 @@ async function handleDashboardSummary(sql, range) {
   const followupsCompleted = await sql`
     select count(*)::int as count from bid_emails where direction = 'outbound' and sent_at >= ${cutoffIso} and sent_at < ${endIso}`;
 
-  // Top 10 companies by total bid value in range — a quick "who matters most" view.
+  // Per-customer breakdown for the period (Ben, 2026-10-06): number AND dollar
+  // value of all bids, bids actually submitted, won and lost, so the web app
+  // can flip it between "# Bids" and "$ Value" and rank clients by win rate.
+  // "Submitted" = actually bid, i.e. past qualification — Submitted through
+  // Watch List plus Awarded and Lost, the same population as the pipeline win
+  // rate. Same archived rule as the win rates so Won/Lost here reconcile with
+  // them. Returns every customer with a bid in the period (capped) and lets
+  // the client sort and trim, rather than a fixed top 10.
   const byCompany = await sql`
     select c.id, c.name,
-      count(b.id)::int as bid_count,
-      coalesce(sum(b.estimated_value),0)::float as total_value,
-      count(*) filter (where b.stage = 'complete')::int as won_count
+      count(b.id)::int as all_count,
+      coalesce(sum(case when b.stage = 'complete' then coalesce(b.final_value, b.estimated_value) else b.estimated_value end),0)::float as all_value,
+      count(*) filter (where b.stage in ('bid_submitted','accepted','in_progress','to_do','delayed','complete','lost'))::int as submitted_count,
+      coalesce(sum(case when b.stage = 'complete' then coalesce(b.final_value, b.estimated_value) else b.estimated_value end) filter (where b.stage in ('bid_submitted','accepted','in_progress','to_do','delayed','complete','lost')),0)::float as submitted_value,
+      count(*) filter (where b.stage = 'complete')::int as won_count,
+      coalesce(sum(coalesce(b.final_value, b.estimated_value)) filter (where b.stage = 'complete'),0)::float as won_value,
+      count(*) filter (where b.stage = 'lost')::int as lost_count,
+      coalesce(sum(b.estimated_value) filter (where b.stage = 'lost'),0)::float as lost_value
     from companies c join bids b on b.company_id = c.id
     where b.created_at >= ${cutoffIso} and b.created_at < ${endIso}
+      and (${includeArchived} or b.source_archived = false)
     group by c.id, c.name
-    order by total_value desc
-    limit 10`;
+    order by all_value desc
+    limit 500`;
 
   // Region rollup — region lives on companies, not bids, hence the join.
   const byRegion = await sql`
@@ -1315,6 +1351,14 @@ async function handleDashboardSummary(sql, range) {
     pipeline_win_rate_components: { complete: pcRow.complete_count, lost: pcRow.lost_count, midlate: pcRow.midlate_count, total: pipelineTotal },
     decided_win_rate: decidedWinRate,
     decided_win_rate_components: { complete: pcRow.complete_count, lost: pcRow.lost_count, total: decidedTotal },
+    // Average value of a won (and, for comparison, a lost) bid — only over bids
+    // that carry a value, so unvalued ones don't drag it toward zero.
+    avg_won_value: pcRow.complete_valued_count > 0 ? pcRow.complete_value / pcRow.complete_valued_count : null,
+    avg_won_value_count: pcRow.complete_valued_count,
+    avg_lost_value: pcRow.lost_valued_count > 0 ? pcRow.lost_value / pcRow.lost_valued_count : null,
+    avg_lost_value_count: pcRow.lost_valued_count,
+    include_archived: includeArchived,
+    period: { key: range || "all", start: cutoffIso, end: bounds.end.getUTCFullYear() >= 9999 ? null : endIso },
     pipeline_win_rate_value: pipelineWinRateValue,
     pipeline_win_rate_value_components: { complete: pcRow.complete_value, lost: pcRow.lost_value, midlate: pcRow.midlate_value, total: pipelineValueTotal },
     decided_win_rate_value: decidedWinRateValue,
@@ -1562,7 +1606,7 @@ export default {
       }
       if (url.pathname === "/internal/admin/dashboard-check" && request.method === "GET") {
         if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
-        return await handleDashboardSummary(sql, url.searchParams.get("range") || "all");
+        return await handleDashboardSummary(sql, url.searchParams.get("range") || "all", { includeArchived: url.searchParams.get("archived") === "include" });
       }
       if (url.pathname === "/internal/admin/email-check" && request.method === "GET") {
         if (!isAdminCaller(request, env)) return json({ error: "unauthorized" }, 401);
