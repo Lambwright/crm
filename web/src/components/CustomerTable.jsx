@@ -17,8 +17,7 @@ function fmtPct(n) {
 
 const COLS = [
   { key: "name", label: "Customer", num: false, firstDir: "asc" },
-  { key: "all", label: "All bids", num: true, firstDir: "desc" },
-  { key: "submitted", label: "Submitted", num: true, firstDir: "desc" },
+  { key: "submitted", label: "Bids submitted", num: true, firstDir: "desc" },
   { key: "won", label: "Won", num: true, firstDir: "desc" },
   { key: "lost", label: "Lost", num: true, firstDir: "desc" },
   { key: "rate", label: "Win rate", num: true, firstDir: "desc" },
@@ -29,9 +28,10 @@ const COLS = [
 // and dollar value of all bids, bids actually submitted, and won / lost,
 // following the page's "# Bids | $ Value" toggle, plus each customer's win rate
 // against our overall one so the strong and weak accounts stand out.
-export default function CustomerTable({ rows, basis, overallRate, periodPhrase }) {
+export default function CustomerTable({ rows, basis, mode, overallRate, periodPhrase }) {
+  const isPipeline = mode === "pipeline";
   const isValue = basis === "value";
-  const [sort, setSort] = useState({ key: "all", dir: "desc" });
+  const [sort, setSort] = useState({ key: "submitted", dir: "desc" });
   const [minDecided, setMinDecided] = useState(3);
   const [limit, setLimit] = useState(15);
 
@@ -41,14 +41,15 @@ export default function CustomerTable({ rows, basis, overallRate, periodPhrase }
         const decidedCount = r.won_count + r.lost_count;
         const won = isValue ? r.won_value : r.won_count;
         const lost = isValue ? r.lost_value : r.lost_count;
-        const rate = won + lost > 0 ? won / (won + lost) : null;
+        const open = isValue ? r.open_value : r.open_count;
+        const denom = won + lost + (isPipeline ? open : 0);
+        const rate = denom > 0 ? won / denom : null;
         const enough = decidedCount >= minDecided;
         const diff = enough && rate != null && overallRate != null ? rate - overallRate : null;
         const band = diff == null ? null : diff > AT_BAND ? "over" : diff < -AT_BAND ? "under" : "at";
         return {
           ...r,
           decidedCount,
-          all: isValue ? r.all_value : r.all_count,
           submitted: isValue ? r.submitted_value : r.submitted_count,
           won,
           lost,
@@ -58,7 +59,7 @@ export default function CustomerTable({ rows, basis, overallRate, periodPhrase }
           band,
         };
       }),
-    [rows, isValue, minDecided, overallRate]
+    [rows, isValue, isPipeline, minDecided, overallRate]
   );
 
   const sorted = useMemo(() => {
@@ -85,12 +86,14 @@ export default function CustomerTable({ rows, basis, overallRate, periodPhrase }
   return (
     <div>
       <Tip label="Customers" className="card-title">
-        Every customer with a bid created {periodPhrase}, shown {isValue ? "by dollar value" : "by number of bids"} — switch with
+        Every customer with a bid decided or still active {periodPhrase}, shown {isValue ? "by dollar value" : "by number of bids"} — switch with
         the "# Bids | $ Value" buttons at the top.<br /><br />
-        <strong>All bids</strong>: everything created in the period. <strong>Submitted</strong>: bids actually bid — Submitted
-        through Watch List, plus Awarded and Lost. <strong>Won / Lost</strong>: bids decided either way.<br /><br />
-        <strong>Win rate</strong>: Won ÷ (Won + Lost) for that customer. <strong>vs average</strong> compares it to our overall
-        decided win rate ({fmtPct(overallRate)} on this basis): <em>Over</em> is more than 5 points above, <em>Under</em> more than
+        <strong>Bids submitted</strong>: bids actually bid — decided {periodPhrase} (Awarded or Lost) plus ones still active past
+        qualification (Submitted through Watch List). <strong>Won / Lost</strong>: decided {periodPhrase}, judged by when the bid was
+        actually awarded or lost.<br /><br />
+        <strong>Win rate</strong> follows the Win rate card above ({isPipeline ? "pipeline" : "decided"}):{" "}
+        {isPipeline ? "Won ÷ (Won + Lost + still active)" : "Won ÷ (Won + Lost)"} for that customer. <strong>vs average</strong> compares it to
+        our overall rate on the same basis ({fmtPct(overallRate)}): <em>Over</em> is more than 5 points above, <em>Under</em> more than
         5 points below, <em>At</em> is within 5. A customer needs at least {minDecided} decided bids to be rated — one win in one
         bid isn't a 100% customer.
       </Tip>
@@ -110,7 +113,7 @@ export default function CustomerTable({ rows, basis, overallRate, periodPhrase }
             <option value={0}>All customers</option>
           </select>
         </label>
-        <span className="field-help">Click a column to sort. Overall win rate for comparison: <strong>{fmtPct(overallRate)}</strong></span>
+        <span className="field-help">Click a column to sort. Overall {isPipeline ? "pipeline" : "decided"} win rate for comparison: <strong>{fmtPct(overallRate)}</strong></span>
       </div>
 
       <table className="data-table">
@@ -127,7 +130,6 @@ export default function CustomerTable({ rows, basis, overallRate, periodPhrase }
           {shown.map((r) => (
             <tr key={r.id}>
               <td>{r.name}</td>
-              <td className="num">{money(r.all)}</td>
               <td className="num">{money(r.submitted)}</td>
               <td className="num" style={{ color: r.won > 0 ? "var(--green)" : undefined }}>{money(r.won)}</td>
               <td className="num" style={{ color: r.lost > 0 ? "var(--text-tertiary)" : undefined }}>{money(r.lost)}</td>

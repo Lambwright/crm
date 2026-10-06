@@ -30,6 +30,11 @@ const BASES = [
   { key: "value", label: "$ Value" },
 ];
 
+const RATE_MODES = [
+  { key: "pipeline", label: "Pipeline" },
+  { key: "decided", label: "Decided" },
+];
+
 function fmtMoney(n) {
   return `$${Math.round(n || 0).toLocaleString()}`;
 }
@@ -55,20 +60,23 @@ function weekCaption(rangeKey) {
 // Exact dates for the periods that aren't obvious from their name. `period`
 // comes from the worker so the dates here can never disagree with what it ran.
 function periodCaption(range, period, rangeInfo) {
-  if (range === "week" || range === "last_week") return `${rangeInfo.label}: ${weekCaption(range)} (Monday to Sunday).`;
+  if (range === "week" || range === "last_week") return `${rangeInfo.label}: ${weekCaption(range)} (Monday to Sunday). Win rates count bids decided in it; other figures count bids created in it.`;
   if (range === "all") return "Showing every bid on record.";
   const f = (d) => d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
   if ((range === "fy" || range === "last_fy") && period) {
     const start = new Date(period.start);
     const end = period.end ? new Date(new Date(period.end).getTime() - 86400000) : null; // end is exclusive
-    return `${rangeInfo.label}: ${f(start)} – ${end ? f(end) : "today"}. Showing bids created in that period.`;
+    return `${rangeInfo.label}: ${f(start)} – ${end ? f(end) : "today"}. Win rates count bids decided in that period; other figures count bids created in it.`;
   }
-  return `Showing bids created ${rangeInfo.phrase}.`;
+  return `Win rates count bids decided ${rangeInfo.phrase}; other figures count bids created ${rangeInfo.phrase}.`;
 }
 
 export default function Dashboard() {
   const [range, setRange] = useState("all");
   const [basis, setBasis] = useState("count");
+  // Win rate card toggle (Ben, 2026-10-06): pipeline by default. The customer
+  // table rates each customer on the same basis, against the same overall rate.
+  const [rateMode, setRateMode] = useState("pipeline");
   const [summary, setSummary] = useState(null);
   const [error, setError] = useState(null);
 
@@ -87,6 +95,7 @@ export default function Dashboard() {
   const openCount = openRows.reduce((sum, r) => sum + Number(r.count || 0), 0);
 
   const isValue = basis === "value";
+  const isPipeline = rateMode === "pipeline";
   const show = (n) => (isValue ? fmtMoney(n) : fmtNum(n));
 
   const decided = isValue ? summary.decided_win_rate_value_components : summary.decided_win_rate_components;
@@ -94,9 +103,10 @@ export default function Dashboard() {
   const decidedRate = isValue ? summary.decided_win_rate_value : summary.decided_win_rate;
   const pipelineRate = isValue ? summary.pipeline_win_rate_value : summary.pipeline_win_rate;
   const wonLost = decided || { complete: 0, lost: 0 };
+  const overallRate = isPipeline ? pipelineRate : decidedRate;
 
   const archivedNote = summary.include_archived ? "archived bids included" : "archived bids excluded";
-  const cohortNote = "Judged by when each bid was created, so for a recent or short period most bids haven't been decided yet and this can read zero — the \"by actual date\" section below counts what was decided in the period.";
+  const statusNote = `Judged by when each bid was actually decided (moved to Awarded or Lost), not when it was created. Bids from the one-time historical import have no recorded decision date, so their bid due date stands in for it.`;
 
   const valueNote = isValue
     ? "An Awarded bid counts at its confirmed final value where one was entered, otherwise at its estimate (most older wins never had a final value keyed in); Lost and still-active bids count at their estimate."
@@ -105,13 +115,12 @@ export default function Dashboard() {
   return (
     <>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, marginBottom: 8 }}>
-        <div className="tabs" style={{ marginBottom: 0 }}>
-          {RANGES.map((r) => (
-            <button key={r.key} className={`tab ${range === r.key ? "active" : ""}`} onClick={() => setRange(r.key)}>
-              {r.label}
-            </button>
-          ))}
-        </div>
+        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "var(--text-secondary)" }}>
+          Period
+          <select value={range} onChange={(e) => setRange(e.target.value)} style={{ minWidth: 220 }}>
+            {RANGES.map((r) => <option key={r.key} value={r.key}>{r.label}</option>)}
+          </select>
+        </label>
         <div className="tabs" style={{ marginBottom: 0 }} title="Switch the tiles that have both between a count of bids and their dollar value">
           {BASES.map((b) => (
             <button key={b.key} className={`tab ${basis === b.key ? "active" : ""}`} onClick={() => setBasis(b.key)}>
@@ -133,32 +142,39 @@ export default function Dashboard() {
         </div>
 
         <div className="card">
-          <Tip label="Win rate (decided)">
-            Of bids that have actually been decided one way or the other — Awarded or Lost, {archivedNote} —
-            what share were wins, counted by {isValue ? "dollar value" : "number of bids"}.<br /><br />
-            <strong>{show(decided?.complete)} Awarded</strong> ÷ (<strong>{show(decided?.complete)}</strong> Awarded + <strong>{show(decided?.lost)}</strong> Lost) = <strong>{fmtPct(decidedRate)}</strong>
+          <Tip label={isPipeline ? "Win rate (pipeline)" : "Win rate (decided)"}>
+            {isPipeline ? (
+              <>
+                Of everything that's actually been bid — decided {rangeInfo.phrase}, plus bids still active past the
+                qualification stage (Submitted through Watch List) — what share are wins, counted by {isValue ? "dollar value" : "number of bids"}.
+                RFQ, Invitation and Estimating aren't counted (nothing's been bid yet); {archivedNote}.<br /><br />
+                <strong>{show(pipeline?.complete)} Awarded</strong> ÷ (<strong>{show(pipeline?.complete)}</strong> Awarded + <strong>{show(pipeline?.lost)}</strong> Lost + <strong>{show(pipeline?.midlate)}</strong> still active) = <strong>{fmtPct(pipelineRate)}</strong>
+              </>
+            ) : (
+              <>
+                Of bids decided {rangeInfo.phrase} — Awarded or Lost, {archivedNote} — what share were wins, counted by{" "}
+                {isValue ? "dollar value" : "number of bids"}. Bids still in play don't dilute it.<br /><br />
+                <strong>{show(decided?.complete)} Awarded</strong> ÷ (<strong>{show(decided?.complete)}</strong> Awarded + <strong>{show(decided?.lost)}</strong> Lost) = <strong>{fmtPct(decidedRate)}</strong>
+              </>
+            )}
             {valueNote && <><br /><br />{valueNote}</>}
-            <br /><br />{cohortNote}
+            <br /><br />{statusNote}
+            {isPipeline && <> The "still active" bids are the ones open right now (created before the period ended).</>}
           </Tip>
-          <div className="kv-value mono stat">{fmtPct(decidedRate)}</div>
-        </div>
-
-        <div className="card">
-          <Tip label="Win rate (pipeline)">
-            Of everything that's actually been bid — Awarded, Lost, or still active past the qualification stage
-            (Submitted through Watch List) — what share are wins, counted by {isValue ? "dollar value" : "number of bids"}.
-            RFQ, Invitation and Estimating aren't counted (nothing's been bid yet); {archivedNote}.<br /><br />
-            <strong>{show(pipeline?.complete)} Awarded</strong> ÷ (<strong>{show(pipeline?.complete)}</strong> Awarded + <strong>{show(pipeline?.lost)}</strong> Lost + <strong>{show(pipeline?.midlate)}</strong> still active) = <strong>{fmtPct(pipelineRate)}</strong>
-            {valueNote && <><br /><br />{valueNote}</>}
-            <br /><br />{cohortNote}
-          </Tip>
-          <div className="kv-value mono stat">{fmtPct(pipelineRate)}</div>
+          <div className="kv-value mono stat">{fmtPct(overallRate)}</div>
+          <div className="tabs" style={{ marginTop: 8, marginBottom: 0 }}>
+            {RATE_MODES.map((m) => (
+              <button key={m.key} className={`tab ${rateMode === m.key ? "active" : ""}`} onClick={() => setRateMode(m.key)} style={{ padding: "2px 8px", fontSize: 11 }}>
+                {m.label}
+              </button>
+            ))}
+          </div>
         </div>
 
         <div className="card">
           <Tip label="Won / Lost">
-            The plain totals behind the win rates above — Awarded and Lost bids ({archivedNote}), counted by {isValue ? "dollar value" : "number of bids"}.
-            Switch between "# Bids" and "$ Value" at the top right to see both.<br /><br />{cohortNote}
+            Bids decided {rangeInfo.phrase} — Awarded and Lost ({archivedNote}), counted by {isValue ? "dollar value" : "number of bids"}.
+            The same figures sit behind the win rate. Switch between "# Bids" and "$ Value" at the top right to see both.<br /><br />{statusNote}
           </Tip>
           <div className="kv-value mono stat">{show(wonLost.complete)} / {show(wonLost.lost)}</div>
         </div>
@@ -183,7 +199,7 @@ export default function Dashboard() {
 
         <div className="card">
           <Tip label="Avg won bid value">
-            The average value of an Awarded bid created {rangeInfo.phrase} ({archivedNote}). An Awarded bid counts at its
+            The average value of a bid Awarded {rangeInfo.phrase} ({archivedNote}). An Awarded bid counts at its
             confirmed final value where one was entered, otherwise at its estimate; bids with neither are left out.<br /><br />
             <strong>{fmtMoney(summary.pipeline_win_rate_value_components?.complete)}</strong> across{" "}
             <strong>{fmtNum(summary.avg_won_value_count)}</strong> won bids with a value = <strong>{summary.avg_won_value != null ? fmtMoney(summary.avg_won_value) : "—"}</strong>.<br /><br />
@@ -223,39 +239,6 @@ export default function Dashboard() {
         </div>
       </div>
 
-      <div className="card-title">Created / Won / Lost {rangeInfo.phrase}, by actual date</div>
-      <p className="field-help" style={{ marginBottom: 10, maxWidth: 720 }}>
-        The figures above are a snapshot of the pipeline as it stands. These use each bid's real stage-change
-        date instead — so a bid opened months ago that just got awarded this week shows up here, not lumped into
-        "bids created."
-      </p>
-      <div className="kv-grid" style={{ marginBottom: 20 }}>
-        <div className="card">
-          <Tip label="Bids created">
-            Bids that came in {rangeInfo.phrase} (by the date the bid was created), in whatever stage they are now.<br /><br />
-            <strong>{fmtNum(summary.total_bids)} bids</strong> worth <strong>{fmtMoney(summary.total_value)}</strong> in estimates.
-          </Tip>
-          <div className="kv-value mono stat">{isValue ? fmtMoney(summary.total_value) : fmtNum(summary.total_bids)}</div>
-        </div>
-        <div className="card">
-          <Tip label="Won this period">
-            Bids moved to Awarded {rangeInfo.phrase}, judged by when they were actually awarded — not when the bid was
-            created. Awards made in CRM or picked up by the Procore sync are counted; the one-time historical import
-            has no real award dates, so for a specific period it's left out (it still counts under All Time).<br /><br />
-            <strong>{fmtNum(summary.won_in_range?.count)}</strong> bids, <strong>{fmtMoney(summary.won_in_range?.value)}</strong> (final value where entered, otherwise the estimate).
-          </Tip>
-          <div className="kv-value mono stat" style={{ color: "var(--green)" }}>{isValue ? fmtMoney(summary.won_in_range?.value) : fmtNum(summary.won_in_range?.count)}</div>
-        </div>
-        <div className="card">
-          <Tip label="Lost this period">
-            Bids moved to Lost {rangeInfo.phrase}, judged by when they were actually marked lost — not when the bid
-            was created. Same rule as Won: CRM moves and Procore-sync detections count; the historical import only counts under All Time.<br /><br />
-            <strong>{fmtNum(summary.lost_in_range?.count)}</strong> bids, <strong>{fmtMoney(summary.lost_in_range?.value)}</strong> in estimates.
-          </Tip>
-          <div className="kv-value mono stat" style={{ color: "var(--text-tertiary)" }}>{isValue ? fmtMoney(summary.lost_in_range?.value) : fmtNum(summary.lost_in_range?.count)}</div>
-        </div>
-      </div>
-
       <div className="card-title">Pipeline by stage</div>
       <div className="row-list" style={{ marginBottom: 24 }}>
         {STAGE_ORDER.map((stage) => {
@@ -271,7 +254,13 @@ export default function Dashboard() {
       </div>
 
       <div style={{ marginBottom: 24 }}>
-        <CustomerTable rows={summary.by_company || []} basis={basis} overallRate={isValue ? summary.decided_win_rate_value : summary.decided_win_rate} periodPhrase={rangeInfo.phrase} />
+        <CustomerTable
+          rows={summary.by_company || []}
+          basis={basis}
+          mode={rateMode}
+          overallRate={overallRate}
+          periodPhrase={rangeInfo.phrase}
+        />
       </div>
 
       <div>

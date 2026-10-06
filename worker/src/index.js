@@ -1205,58 +1205,67 @@ async function handleDashboardSummary(sql, range, { includeArchived = INCLUDE_AR
   const hotLeads = await sql`select count(*)::int as hot_lead_count from companies where hot_lead = true`;
   const totals = await sql`select count(*)::int as total_bids, coalesce(avg(estimated_value),0)::float as avg_bid_value, coalesce(sum(estimated_value),0)::float as total_value, count(estimated_value)::int as valued_count from bids where created_at >= ${cutoffIso} and created_at < ${endIso}`;
 
-  // won_in_range/lost_in_range (Ben, 2026-09): the win-rate figures above are
-  // a COHORT view — "of bids CREATED in this range, how many are won/lost
-  // right now" — which silently drops a bid created six months ago that gets
-  // awarded this month (it's outside the created_at window, so it never
-  // counts toward "This Month" at all). These instead use the bid's actual
-  // most recent transition INTO that stage (bid_stage_history.changed_at,
-  // which the sync bridge and every manual move both write), so "won this
-  // month" genuinely means "awarded this month" regardless of when the RFQ
-  // first came in. Deliberately reported as separate created/won/lost counts
-  // rather than folded into one ratio — the two are different time bases and
-  // forcing them into a single "win rate %" is exactly what was misleading.
-  // The bulk historical backfill wrote every transition with changed_at =
-  // the day it was IMPORTED (2026-09), not the real historical event date —
-  // there was no per-transition date in Procore's export to use instead (see
-  // kickoff prompt). Harmless for 'all' (everything counts regardless of
-  // date), but for a narrower range it would make the entire multi-year
-  // backfill look like it happened this month. Excluding changed_by='system'
-  // (the backfill's own attribution) for anything narrower than 'all' keeps
-  // this honest: only transitions with a real timestamp — a manual move or
-  // the Procore sync bridge — count toward a specific period.
-  const excludeBackfillArtifacts = Boolean(range) && range !== "all";
+  // Win rates, average won value and the customer table all run on STATUS
+  // CHANGES, not creation dates (Ben, 2026-10-06): a bid counts as won or lost
+  // in the period in which it was actually decided. A bid's decision date is
+  // its latest transition into its current stage written by a person or the
+  // Procore sync bridge (bid_stage_history, changed_by != 'system'). The bulk
+  // historical backfill wrote every transition with changed_at = the day it
+  // was imported (not a real event), and Procore's export carries no decision
+  // date at all — the only date it has is the bid's due date, which the
+  // backfill stored as created_at. So for backfilled bids with no real
+  // transition, created_at (the bid due date) stands in as the decision date.
+  // Still-open bids (Submitted..Delayed) have no decision yet; they are the
+  // "pipeline" part of the pipeline win rate and count whenever they were
+  // created before the period ends.
+  const MIDLATE = ["bid_submitted", "accepted", "in_progress", "to_do", "delayed"];
+  const popRows = await sql`
+    select b.id, b.company_id, b.stage, b.final_value, b.estimated_value, b.created_at,
+      case when b.stage in ('complete', 'lost') then coalesce(
+        (select max(h.changed_at) from bid_stage_history h
+          where h.bid_id = b.id and h.to_stage = b.stage and h.changed_by != 'system'),
+        b.created_at) end as decided_at
+    from bids b
+    where (${includeArchived} or b.source_archived = false)
+      and b.stage in ('complete', 'lost', 'bid_submitted', 'accepted', 'in_progress', 'to_do', 'delayed')`;
+  const startMs = bounds.start.getTime();
+  const endMs = bounds.end.getTime();
+  const num = (v) => (v == null ? null : Number(v));
+  const blank = () => ({ complete_count: 0, lost_count: 0, midlate_count: 0, complete_value: 0, lost_value: 0, midlate_value: 0, complete_valued_count: 0, lost_valued_count: 0 });
+  const pcRow = blank();
+  const perCompany = new Map();
+  for (const r of popRows) {
+    let kind = null;
+    if (r.stage === "complete" || r.stage === "lost") {
+      const t = new Date(r.decided_at).getTime();
+      if (t >= startMs && t < endMs) kind = r.stage;
+    } else if (new Date(r.created_at).getTime() < endMs) {
+      kind = "midlate";
+    }
+    if (!kind) continue;
+    const value = kind === "complete" ? num(r.final_value) ?? num(r.estimated_value) : num(r.estimated_value);
+    for (const agg of [pcRow, r.company_id ? (perCompany.get(r.company_id) || perCompany.set(r.company_id, blank()).get(r.company_id)) : null]) {
+      if (!agg) continue;
+      agg[kind + "_count"] += 1;
+      agg[kind + "_value"] += value || 0;
+      if (kind !== "midlate" && value != null) agg[kind + "_valued_count"] += 1;
+    }
+  }
 
   // Pipeline win rate (Ben, 2026-09-29): Awarded / (Awarded + Lost + every
-  // bid that's actually past qualification — bid_submitted through delayed)
-  // — RFQ/Invitation/Estimating are excluded because nothing's been bid yet
-  // at that point, and archived is excluded because Procore's own board UI
-  // doesn't count it either (confirmed live: CRM's raw complete/lost counts
-  // were inflated relative to Procore's own visible board precisely because
-  // they included archived records Procore's UI hides by default).
+  // bid that's actually past qualification and still open) — RFQ/Invitation/
+  // Estimating are excluded because nothing's been bid yet at that point, and
+  // archived is excluded (unless includeArchived) because Procore's own board
+  // UI doesn't count it either.
   // $ basis (Ben, 2026-10-05): Awarded uses the confirmed final value where one was
   // entered, else the estimate — most historical wins never had a final_value keyed
   // in, so final_value alone would count nearly all of them as zero. Lost and
   // still-active use the estimate (what was bid).
-  const pipelineCounts = await sql`
-    select
-      count(*) filter (where stage = 'complete')::int as complete_count,
-      count(*) filter (where stage = 'lost')::int as lost_count,
-      count(*) filter (where stage in ('bid_submitted','accepted','in_progress','to_do','delayed'))::int as midlate_count,
-      coalesce(sum(coalesce(final_value, estimated_value)) filter (where stage = 'complete'),0)::float as complete_value,
-      coalesce(sum(estimated_value) filter (where stage = 'lost'),0)::float as lost_value,
-      coalesce(sum(estimated_value) filter (where stage in ('bid_submitted','accepted','in_progress','to_do','delayed')),0)::float as midlate_value,
-      count(*) filter (where stage = 'complete' and coalesce(final_value, estimated_value) is not null)::int as complete_valued_count,
-      count(*) filter (where stage = 'lost' and estimated_value is not null)::int as lost_valued_count
-    from bids
-    where (${includeArchived} or source_archived = false) and created_at >= ${cutoffIso} and created_at < ${endIso}`;
-  const pcRow = pipelineCounts[0] || { complete_count: 0, lost_count: 0, midlate_count: 0, complete_value: 0, lost_value: 0, midlate_value: 0, complete_valued_count: 0, lost_valued_count: 0 };
   const pipelineTotal = pcRow.complete_count + pcRow.lost_count + pcRow.midlate_count;
   const pipelineWinRate = pipelineTotal > 0 ? pcRow.complete_count / pipelineTotal : null;
 
   // Decided win rate: of bids that have actually been decided (Awarded or
-  // Lost, archived excluded), what fraction were wins — the classic "win
-  // rate" number, without in-flight bids diluting it either direction.
+  // Lost), what fraction were wins — in-flight bids don't dilute it.
   const decidedTotal = pcRow.complete_count + pcRow.lost_count;
   const decidedWinRate = decidedTotal > 0 ? pcRow.complete_count / decidedTotal : null;
 
@@ -1266,16 +1275,8 @@ async function handleDashboardSummary(sql, range, { includeArchived = INCLUDE_AR
   const decidedValueTotal = pcRow.complete_value + pcRow.lost_value;
   const decidedWinRateValue = decidedValueTotal > 0 ? pcRow.complete_value / decidedValueTotal : null;
 
-  const wonInRange = await sql`
-    select count(distinct h.bid_id)::int as count, coalesce(sum(coalesce(b.final_value, b.estimated_value)),0)::float as value
-    from bid_stage_history h join bids b on b.id = h.bid_id
-    where h.to_stage = 'complete' and h.changed_at >= ${cutoffIso} and h.changed_at < ${endIso} and b.stage = 'complete'
-      and (${!excludeBackfillArtifacts} or h.changed_by != 'system')`;
-  const lostInRange = await sql`
-    select count(distinct h.bid_id)::int as count, coalesce(sum(b.estimated_value),0)::float as value
-    from bid_stage_history h join bids b on b.id = h.bid_id
-    where h.to_stage = 'lost' and h.changed_at >= ${cutoffIso} and h.changed_at < ${endIso} and b.stage = 'lost'
-      and (${!excludeBackfillArtifacts} or h.changed_by != 'system')`;
+  const wonInRange = [{ count: pcRow.complete_count, value: pcRow.complete_value }];
+  const lostInRange = [{ count: pcRow.lost_count, value: pcRow.lost_value }];
 
   // "Follow-ups completed" = outbound tender emails logged in range — that's
   // literally what the Follow-ups tab's "Follow up ->" action produces
@@ -1287,30 +1288,31 @@ async function handleDashboardSummary(sql, range, { includeArchived = INCLUDE_AR
   const followupsCompleted = await sql`
     select count(*)::int as count from bid_emails where direction = 'outbound' and sent_at >= ${cutoffIso} and sent_at < ${endIso}`;
 
-  // Per-customer breakdown for the period (Ben, 2026-10-06): number AND dollar
-  // value of all bids, bids actually submitted, won and lost, so the web app
-  // can flip it between "# Bids" and "$ Value" and rank clients by win rate.
-  // "Submitted" = actually bid, i.e. past qualification — Submitted through
-  // Watch List plus Awarded and Lost, the same population as the pipeline win
-  // rate. Same archived rule as the win rates so Won/Lost here reconcile with
-  // them. Returns every customer with a bid in the period (capped) and lets
-  // the client sort and trim, rather than a fixed top 10.
-  const byCompany = await sql`
-    select c.id, c.name,
-      count(b.id)::int as all_count,
-      coalesce(sum(case when b.stage = 'complete' then coalesce(b.final_value, b.estimated_value) else b.estimated_value end),0)::float as all_value,
-      count(*) filter (where b.stage in ('bid_submitted','accepted','in_progress','to_do','delayed','complete','lost'))::int as submitted_count,
-      coalesce(sum(case when b.stage = 'complete' then coalesce(b.final_value, b.estimated_value) else b.estimated_value end) filter (where b.stage in ('bid_submitted','accepted','in_progress','to_do','delayed','complete','lost')),0)::float as submitted_value,
-      count(*) filter (where b.stage = 'complete')::int as won_count,
-      coalesce(sum(coalesce(b.final_value, b.estimated_value)) filter (where b.stage = 'complete'),0)::float as won_value,
-      count(*) filter (where b.stage = 'lost')::int as lost_count,
-      coalesce(sum(b.estimated_value) filter (where b.stage = 'lost'),0)::float as lost_value
-    from companies c join bids b on b.company_id = c.id
-    where b.created_at >= ${cutoffIso} and b.created_at < ${endIso}
-      and (${includeArchived} or b.source_archived = false)
-    group by c.id, c.name
-    order by all_value desc
-    limit 500`;
+  // Per-customer breakdown for the period (Ben, 2026-10-06), on the same
+  // status-change basis as the headline figures so the two reconcile exactly:
+  // bids submitted (= won + lost + still open past qualification, the pipeline
+  // win rate's population), won and lost, each as a count and a dollar value,
+  // plus the open part separately so the web app can rate a customer on either
+  // the pipeline or the decided basis. Every customer with activity in the
+  // period (capped); the client sorts and trims.
+  const names = await sql`select id, name from companies`;
+  const nameById = new Map(names.map((n) => [n.id, n.name]));
+  const byCompany = [...perCompany.entries()]
+    .map(([id, a]) => ({
+      id,
+      name: nameById.get(id) || "(unknown)",
+      submitted_count: a.complete_count + a.lost_count + a.midlate_count,
+      submitted_value: a.complete_value + a.lost_value + a.midlate_value,
+      won_count: a.complete_count,
+      won_value: a.complete_value,
+      lost_count: a.lost_count,
+      lost_value: a.lost_value,
+      open_count: a.midlate_count,
+      open_value: a.midlate_value,
+    }))
+    .filter((r) => r.submitted_count > 0)
+    .sort((x, y) => y.submitted_value - x.submitted_value)
+    .slice(0, 500);
 
   // Region rollup — region lives on companies, not bids, hence the join.
   const byRegion = await sql`
