@@ -564,7 +564,33 @@ async function handleCompanyLookup(url, sql) {
   if (!name) return json({ error: "name query param is required" }, 400);
   const rows = await sql`select id, name, account_segment, hot_lead, hot_lead_weight, hot_lead_reason from companies where lower(name) = lower(${name}) limit 1`;
   if (!rows.length) return json({ found: false });
-  return json({ found: true, company: rows[0] });
+  return json({ found: true, company: rows[0], win_stats: await companyWinStats(sql, rows[0].id) });
+}
+
+// All-time decided win rate for one company against the whole book, for SCOUT
+// to show next to the client (display only — it doesn't touch SCOUT's score).
+// Same population as the dashboard's decided rate: Awarded and Lost bids,
+// archived ones only where CRM recorded the decision itself. `band` uses the
+// dashboard's rule (within 5 points of overall = "at") and stays null until a
+// company has MIN_DECIDED_FOR_BAND decided bids.
+const MIN_DECIDED_FOR_BAND = 3;
+const AT_AVERAGE_BAND = 0.05;
+async function companyWinStats(sql, companyId) {
+  const [mine] = await sql`
+    select count(*) filter (where stage = 'complete')::int as won, count(*) filter (where stage = 'lost')::int as lost
+    from bids where company_id = ${companyId} and stage in ('complete', 'lost') and (source_archived = false or decided_at is not null)`;
+  const [all] = await sql`
+    select count(*) filter (where stage = 'complete')::int as won, count(*) filter (where stage = 'lost')::int as lost
+    from bids where stage in ('complete', 'lost') and (source_archived = false or decided_at is not null)`;
+  const decided = mine.won + mine.lost;
+  const overall = all.won + all.lost > 0 ? all.won / (all.won + all.lost) : null;
+  const rate = decided > 0 ? mine.won / decided : null;
+  let band = null;
+  if (rate != null && overall != null && decided >= MIN_DECIDED_FOR_BAND) {
+    const diff = rate - overall;
+    band = diff > AT_AVERAGE_BAND ? "over" : diff < -AT_AVERAGE_BAND ? "under" : "at";
+  }
+  return { won: mine.won, lost: mine.lost, decided_count: decided, win_rate: rate, overall_win_rate: overall, band, min_decided_for_band: MIN_DECIDED_FOR_BAND };
 }
 
 async function handleCompaniesList(url, sql) {
@@ -829,6 +855,7 @@ async function handleBidStageChange(id, request, sql, env, user) {
       hold_reason = ${merged.hold_reason}, hold_review_date = ${merged.hold_review_date},
       handoff_triggered_at = ${to_stage === "complete" ? (bid.handoff_triggered_at || new Date().toISOString()) : bid.handoff_triggered_at},
       handoff_status = ${to_stage === "complete" ? (bid.handoff_status || "pending") : bid.handoff_status},
+      decided_at = ${to_stage === "complete" || to_stage === "lost" ? (bid.stage === to_stage && bid.decided_at ? bid.decided_at : new Date().toISOString()) : null},
       updated_at = now()
     where id = ${id}
     returning *`;
@@ -974,6 +1001,7 @@ async function handleProcoreSync(request, sql) {
     const stageKnown = STAGES.includes(newStage);
     const stageChanged = stageKnown && newStage !== bid.stage;
     const archivedChanged = Boolean(row.archived) !== bid.source_archived;
+    const nowArchived = Boolean(row.archived);
     if (!stageChanged && row.status === bid.source_status && !archivedChanged) continue;
 
     const [after] = await sql`
@@ -984,6 +1012,8 @@ async function handleProcoreSync(request, sql) {
         next_action_date = ${stageChanged ? autoFollowUpDate(settings.cadence, newStage, bid.next_action_date) : bid.next_action_date},
         handoff_triggered_at = ${stageChanged && newStage === "complete" ? bid.handoff_triggered_at || new Date().toISOString() : bid.handoff_triggered_at},
         handoff_status = ${stageChanged && newStage === "complete" ? bid.handoff_status || "pending" : bid.handoff_status},
+        decided_at = ${stageChanged ? (newStage === "complete" || newStage === "lost" ? new Date().toISOString() : null) : bid.decided_at},
+        archived_at = ${nowArchived === bid.source_archived ? bid.archived_at : nowArchived ? new Date().toISOString() : null},
         updated_at = now()
       where id = ${bid.id}
       returning *`;
@@ -1097,6 +1127,26 @@ async function handleAdminBackfillFollowupDates(sql, { offset = 0, limit = 2000 
     updated++;
   }
   return json({ scanned: rows.length, updated, offset, nextOffset: offset + rows.length });
+}
+
+// Applies migration 009 (decided_at / archived_at) the first time a deployed
+// worker runs, so a deploy never needs a separate manual migrate step. Checks
+// information_schema first so every later cold start costs one cheap query.
+let schemaReady = null;
+function ensureSchema(sql) {
+  if (!schemaReady) {
+    schemaReady = (async () => {
+      const have = await sql`select 1 from information_schema.columns where table_name = 'bids' and column_name = 'archived_at'`;
+      if (have.length) return;
+      await sql.query(`alter table bids add column if not exists decided_at timestamptz`);
+      await sql.query(`alter table bids add column if not exists archived_at timestamptz`);
+      await sql.query(`update bids b set decided_at = h.t
+        from (select bid_id, to_stage, max(changed_at) as t from bid_stage_history
+              where changed_by != 'system' group by bid_id, to_stage) h
+        where h.bid_id = b.id and h.to_stage = b.stage and b.stage in ('complete', 'lost') and b.decided_at is null`);
+    })().catch((e) => { schemaReady = null; throw e; });
+  }
+  return schemaReady;
 }
 
 async function handleAdminMigrate(sql) {
@@ -1224,7 +1274,8 @@ async function handleDashboardSummary(sql, range, { includeArchived = INCLUDE_AR
   const MIDLATE = ["bid_submitted", "accepted", "in_progress", "to_do", "delayed"];
   const popRows = await sql`
     select b.id, b.company_id, b.stage, b.final_value, b.estimated_value, b.created_at, b.source_archived,
-      case when b.stage in ('complete', 'lost') then coalesce(
+      (b.decided_at is not null) as decision_recorded,
+      case when b.stage in ('complete', 'lost') then coalesce(b.decided_at,
         (select max(h.changed_at) from bid_stage_history h
           where h.bid_id = b.id and h.to_stage = b.stage and h.changed_by != 'system'),
         b.created_at) end as decided_at
@@ -1247,7 +1298,10 @@ async function handleDashboardSummary(sql, range, { includeArchived = INCLUDE_AR
       }
     };
     if (inRange(r.created_at)) add("created", num(r.estimated_value), false);
-    if (r.source_archived && !includeArchived) continue;
+    // Archived bids stay out unless CRM itself recorded the win/loss while the
+    // bid was still live (Ben, 2026-10-06) — decided_at is only ever set by a
+    // real move, never by the historical backfill.
+    if (r.source_archived && !includeArchived && !r.decision_recorded) continue;
     if (r.stage === "complete" && inRange(r.decided_at)) add("complete", num(r.final_value) ?? num(r.estimated_value), true);
     else if (r.stage === "lost" && inRange(r.decided_at)) add("lost", num(r.estimated_value), true);
     else if (MIDLATE.includes(r.stage) && inRange(r.created_at)) add("midlate", num(r.estimated_value), false);
@@ -1439,6 +1493,7 @@ export default {
     const parts = url.pathname.split("/").filter(Boolean);
 
     try {
+      await ensureSchema(sql).catch((e) => console.error("ensureSchema failed", e));
       // Service-key-only routes (server-to-server, no Einbau ID session in the loop)
       if (url.pathname === "/intake/scout" && request.method === "POST") {
         if (!isServiceCaller(request, env)) return json({ error: "unauthorized" }, 401);
