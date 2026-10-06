@@ -145,8 +145,8 @@ export default function Dashboard() {
           <Tip label={isPipeline ? "Win rate (pipeline)" : "Win rate (decided)"}>
             {isPipeline ? (
               <>
-                Of everything that's actually been bid — decided {rangeInfo.phrase}, plus bids still active past the
-                qualification stage (Submitted through Watch List) — what share are wins, counted by {isValue ? "dollar value" : "number of bids"}.
+                Of everything that's actually been bid — bids decided {rangeInfo.phrase}, plus bids created {rangeInfo.phrase} that are
+                still active past the qualification stage (Submitted through Watch List) — what share are wins, counted by {isValue ? "dollar value" : "number of bids"}.
                 RFQ, Invitation and Estimating aren't counted (nothing's been bid yet); {archivedNote}.<br /><br />
                 <strong>{show(pipeline?.complete)} Awarded</strong> ÷ (<strong>{show(pipeline?.complete)}</strong> Awarded + <strong>{show(pipeline?.lost)}</strong> Lost + <strong>{show(pipeline?.midlate)}</strong> still active) = <strong>{fmtPct(pipelineRate)}</strong>
               </>
@@ -159,7 +159,6 @@ export default function Dashboard() {
             )}
             {valueNote && <><br /><br />{valueNote}</>}
             <br /><br />{statusNote}
-            {isPipeline && <> The "still active" bids are the ones open right now (created before the period ended).</>}
           </Tip>
           <div className="kv-value mono stat">{fmtPct(overallRate)}</div>
           <div className="tabs" style={{ marginTop: 8, marginBottom: 0 }}>
@@ -172,7 +171,7 @@ export default function Dashboard() {
         </div>
 
         <div className="card">
-          <Tip label="Won / Lost">
+          <Tip label="Won / Lost (decided in period)">
             Bids decided {rangeInfo.phrase} — Awarded and Lost ({archivedNote}), counted by {isValue ? "dollar value" : "number of bids"}.
             The same figures sit behind the win rate. Switch between "# Bids" and "$ Value" at the top right to see both.<br /><br />{statusNote}
           </Tip>
@@ -180,7 +179,7 @@ export default function Dashboard() {
         </div>
 
         <div className="card">
-          <Tip label="Total bids tracked">
+          <Tip label="Total bids tracked (created in period)">
             Every bid created {rangeInfo.phrase}, whatever stage it's in now — including ones still in RFQ or Estimating,
             and ones already Awarded, Lost or No Bid.<br /><br />
             <strong>{fmtNum(summary.total_bids)} bids</strong>, of which {fmtNum(summary.valued_count)} have an estimate, totalling <strong>{fmtMoney(summary.total_value)}</strong>.
@@ -255,11 +254,13 @@ export default function Dashboard() {
 
       <div style={{ marginBottom: 24 }}>
         <CustomerTable
+          key={range}
           rows={summary.by_company || []}
           basis={basis}
           mode={rateMode}
           overallRate={overallRate}
           periodPhrase={rangeInfo.phrase}
+          shortPeriod={["week", "last_week", "month"].includes(range)}
         />
       </div>
 

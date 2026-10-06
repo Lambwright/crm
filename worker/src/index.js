@@ -1216,40 +1216,41 @@ async function handleDashboardSummary(sql, range, { includeArchived = INCLUDE_AR
   // backfill stored as created_at. So for backfilled bids with no real
   // transition, created_at (the bid due date) stands in as the decision date.
   // Still-open bids (Submitted..Delayed) have no decision yet; they are the
-  // "pipeline" part of the pipeline win rate and count whenever they were
-  // created before the period ends.
+  // "pipeline" part of the pipeline win rate, and count when they were created
+  // in the period — the same bids the Open pipeline tile counts.
+  // Everything in the customer table is activity IN the period: bids created,
+  // bids won, bids lost (by decision date). Created counts every bid, like the
+  // Total bids tracked tile; won/lost/open follow the archived rule.
   const MIDLATE = ["bid_submitted", "accepted", "in_progress", "to_do", "delayed"];
   const popRows = await sql`
-    select b.id, b.company_id, b.stage, b.final_value, b.estimated_value, b.created_at,
+    select b.id, b.company_id, b.stage, b.final_value, b.estimated_value, b.created_at, b.source_archived,
       case when b.stage in ('complete', 'lost') then coalesce(
         (select max(h.changed_at) from bid_stage_history h
           where h.bid_id = b.id and h.to_stage = b.stage and h.changed_by != 'system'),
         b.created_at) end as decided_at
-    from bids b
-    where (${includeArchived} or b.source_archived = false)
-      and b.stage in ('complete', 'lost', 'bid_submitted', 'accepted', 'in_progress', 'to_do', 'delayed')`;
+    from bids b`;
   const startMs = bounds.start.getTime();
   const endMs = bounds.end.getTime();
+  const inRange = (d) => { const t = new Date(d).getTime(); return t >= startMs && t < endMs; };
   const num = (v) => (v == null ? null : Number(v));
-  const blank = () => ({ complete_count: 0, lost_count: 0, midlate_count: 0, complete_value: 0, lost_value: 0, midlate_value: 0, complete_valued_count: 0, lost_valued_count: 0 });
+  const blank = () => ({ created_count: 0, created_value: 0, complete_count: 0, lost_count: 0, midlate_count: 0, complete_value: 0, lost_value: 0, midlate_value: 0, complete_valued_count: 0, lost_valued_count: 0 });
   const pcRow = blank();
   const perCompany = new Map();
   for (const r of popRows) {
-    let kind = null;
-    if (r.stage === "complete" || r.stage === "lost") {
-      const t = new Date(r.decided_at).getTime();
-      if (t >= startMs && t < endMs) kind = r.stage;
-    } else if (new Date(r.created_at).getTime() < endMs) {
-      kind = "midlate";
-    }
-    if (!kind) continue;
-    const value = kind === "complete" ? num(r.final_value) ?? num(r.estimated_value) : num(r.estimated_value);
-    for (const agg of [pcRow, r.company_id ? (perCompany.get(r.company_id) || perCompany.set(r.company_id, blank()).get(r.company_id)) : null]) {
-      if (!agg) continue;
-      agg[kind + "_count"] += 1;
-      agg[kind + "_value"] += value || 0;
-      if (kind !== "midlate" && value != null) agg[kind + "_valued_count"] += 1;
-    }
+    const aggs = [pcRow];
+    if (r.company_id) aggs.push(perCompany.get(r.company_id) || perCompany.set(r.company_id, blank()).get(r.company_id));
+    const add = (kind, value, valued) => {
+      for (const agg of aggs) {
+        agg[kind + "_count"] += 1;
+        agg[kind + "_value"] += value || 0;
+        if (valued && value != null) agg[kind + "_valued_count"] += 1;
+      }
+    };
+    if (inRange(r.created_at)) add("created", num(r.estimated_value), false);
+    if (r.source_archived && !includeArchived) continue;
+    if (r.stage === "complete" && inRange(r.decided_at)) add("complete", num(r.final_value) ?? num(r.estimated_value), true);
+    else if (r.stage === "lost" && inRange(r.decided_at)) add("lost", num(r.estimated_value), true);
+    else if (MIDLATE.includes(r.stage) && inRange(r.created_at)) add("midlate", num(r.estimated_value), false);
   }
 
   // Pipeline win rate (Ben, 2026-09-29): Awarded / (Awarded + Lost + every
@@ -1301,6 +1302,8 @@ async function handleDashboardSummary(sql, range, { includeArchived = INCLUDE_AR
     .map(([id, a]) => ({
       id,
       name: nameById.get(id) || "(unknown)",
+      created_count: a.created_count,
+      created_value: a.created_value,
       submitted_count: a.complete_count + a.lost_count + a.midlate_count,
       submitted_value: a.complete_value + a.lost_value + a.midlate_value,
       won_count: a.complete_count,
@@ -1310,8 +1313,8 @@ async function handleDashboardSummary(sql, range, { includeArchived = INCLUDE_AR
       open_count: a.midlate_count,
       open_value: a.midlate_value,
     }))
-    .filter((r) => r.submitted_count > 0)
-    .sort((x, y) => y.submitted_value - x.submitted_value)
+    .filter((r) => r.created_count + r.won_count + r.lost_count > 0)
+    .sort((x, y) => y.created_count - x.created_count || y.won_count + y.lost_count - (x.won_count + x.lost_count))
     .slice(0, 500);
 
   // Region rollup — region lives on companies, not bids, hence the join.

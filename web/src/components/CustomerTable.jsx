@@ -17,7 +17,7 @@ function fmtPct(n) {
 
 const COLS = [
   { key: "name", label: "Customer", num: false, firstDir: "asc" },
-  { key: "submitted", label: "Bids submitted", num: true, firstDir: "desc" },
+  { key: "created", label: "Bids created", num: true, firstDir: "desc" },
   { key: "won", label: "Won", num: true, firstDir: "desc" },
   { key: "lost", label: "Lost", num: true, firstDir: "desc" },
   { key: "rate", label: "Win rate", num: true, firstDir: "desc" },
@@ -28,11 +28,13 @@ const COLS = [
 // and dollar value of all bids, bids actually submitted, and won / lost,
 // following the page's "# Bids | $ Value" toggle, plus each customer's win rate
 // against our overall one so the strong and weak accounts stand out.
-export default function CustomerTable({ rows, basis, mode, overallRate, periodPhrase }) {
+export default function CustomerTable({ rows, basis, mode, overallRate, periodPhrase, shortPeriod }) {
   const isPipeline = mode === "pipeline";
   const isValue = basis === "value";
-  const [sort, setSort] = useState({ key: "submitted", dir: "desc" });
-  const [minDecided, setMinDecided] = useState(3);
+  const [sort, setSort] = useState({ key: "created", dir: "desc" });
+  // A week or a month rarely has 3 decided bids for any one customer, so for
+  // short periods rate from the first decided bid; the selector changes it.
+  const [minDecided, setMinDecided] = useState(shortPeriod ? 1 : 3);
   const [limit, setLimit] = useState(15);
 
   const computed = useMemo(
@@ -50,7 +52,7 @@ export default function CustomerTable({ rows, basis, mode, overallRate, periodPh
         return {
           ...r,
           decidedCount,
-          submitted: isValue ? r.submitted_value : r.submitted_count,
+          created: isValue ? r.created_value : r.created_count,
           won,
           lost,
           rate,
@@ -86,16 +88,16 @@ export default function CustomerTable({ rows, basis, mode, overallRate, periodPh
   return (
     <div>
       <Tip label="Customers" className="card-title">
-        Every customer with a bid decided or still active {periodPhrase}, shown {isValue ? "by dollar value" : "by number of bids"} — switch with
-        the "# Bids | $ Value" buttons at the top.<br /><br />
-        <strong>Bids submitted</strong>: bids actually bid — decided {periodPhrase} (Awarded or Lost) plus ones still active past
-        qualification (Submitted through Watch List). <strong>Won / Lost</strong>: decided {periodPhrase}, judged by when the bid was
-        actually awarded or lost.<br /><br />
+        What happened with each customer {periodPhrase}, {isValue ? "by dollar value" : "by number of bids"} — switch with
+        the "# Bids | $ Value" buttons at the top. Only customers with a bid created, won or lost in the period are listed.<br /><br />
+        <strong>Bids created</strong>: bids that came in {periodPhrase}. <strong>Won / Lost</strong>: bids awarded or lost {periodPhrase},
+        judged by when they were actually decided — so a bid created earlier can show up here as won or lost, and a bid
+        created in the period but not yet decided shows only under Bids created.<br /><br />
         <strong>Win rate</strong> follows the Win rate card above ({isPipeline ? "pipeline" : "decided"}):{" "}
-        {isPipeline ? "Won ÷ (Won + Lost + still active)" : "Won ÷ (Won + Lost)"} for that customer. <strong>vs average</strong> compares it to
-        our overall rate on the same basis ({fmtPct(overallRate)}): <em>Over</em> is more than 5 points above, <em>Under</em> more than
-        5 points below, <em>At</em> is within 5. A customer needs at least {minDecided} decided bids to be rated — one win in one
-        bid isn't a 100% customer.
+        {isPipeline ? "Won ÷ (Won + Lost + bids created in the period that are still active past qualification)" : "Won ÷ (Won + Lost)"} for that customer.
+        <strong> vs average</strong> compares it to our overall rate on the same basis ({fmtPct(overallRate)}): <em>Over</em> is more than 5 points
+        above, <em>Under</em> more than 5 points below, <em>At</em> is within 5. A customer needs at least {minDecided} decided
+        bid{minDecided === 1 ? "" : "s"} to be rated (adjustable) — one win in one bid isn't a 100% customer.
       </Tip>
 
       <div style={{ display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap", margin: "6px 0 10px" }}>
@@ -130,7 +132,7 @@ export default function CustomerTable({ rows, basis, mode, overallRate, periodPh
           {shown.map((r) => (
             <tr key={r.id}>
               <td>{r.name}</td>
-              <td className="num">{money(r.submitted)}</td>
+              <td className="num">{money(r.created)}</td>
               <td className="num" style={{ color: r.won > 0 ? "var(--green)" : undefined }}>{money(r.won)}</td>
               <td className="num" style={{ color: r.lost > 0 ? "var(--text-tertiary)" : undefined }}>{money(r.lost)}</td>
               <td className="num">{r.enough ? fmtPct(r.rate) : <span title={`Fewer than ${minDecided} decided bids (${r.decidedCount})`} style={{ color: "var(--text-tertiary)" }}>—</span>}</td>
