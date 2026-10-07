@@ -4,10 +4,17 @@ import { STAGE_LABELS } from "../stages.js";
 import { buildFollowUpDraft } from "../followupTemplates.js";
 import BidDetail from "./BidDetail.jsx";
 
+// Whole days past the follow-up date, by calendar day. The API sends the date
+// as a full ISO timestamp ("2026-09-28T00:00:00.000Z"), so take just the
+// YYYY-MM-DD part — appending a time to the whole string made every date
+// invalid and every row read "due today".
 function daysOverdue(dateStr) {
   if (!dateStr) return null;
-  const days = Math.floor((Date.now() - new Date(dateStr + "T00:00:00Z").getTime()) / 86400000);
-  return days;
+  const due = new Date(String(dateStr).slice(0, 10) + "T00:00:00Z").getTime();
+  if (Number.isNaN(due)) return null;
+  const now = new Date();
+  const today = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+  return Math.round((today - due) / 86400000);
 }
 
 export default function Followups({ user, access, assignableUsers = [], onNotificationsChanged }) {
@@ -35,7 +42,7 @@ export default function Followups({ user, access, assignableUsers = [], onNotifi
     const draft = buildFollowUpDraft(bid, {
       contactFirstName: bid.contact_first_name,
       contactEmail: bid.contact_email,
-    });
+    }, Math.floor(Math.random() * 1000));
     setSelected({ id: bid.id, prefillEmail: draft });
   }
 
@@ -47,10 +54,14 @@ export default function Followups({ user, access, assignableUsers = [], onNotifi
   return (
     <>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text-secondary)" }}>
-          <input type="checkbox" checked={mineOnly} onChange={(e) => setMineOnly(e.target.checked)} />
-          My bids only
-        </label>
+        {access?.can?.all_bids === false ? (
+          <span className="field-help">Showing the follow-ups assigned to you.</span>
+        ) : (
+          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text-secondary)" }}>
+            <input type="checkbox" checked={mineOnly} onChange={(e) => setMineOnly(e.target.checked)} />
+            My bids only
+          </label>
+        )}
         <button className="btn btn-ghost btn-sm" onClick={load} disabled={loading}>{loading ? "↻ …" : "↻ Refresh"}</button>
       </div>
       {error && <div className="card" style={{ color: "var(--red)" }}>{error}</div>}
@@ -61,7 +72,7 @@ export default function Followups({ user, access, assignableUsers = [], onNotifi
         {bids.map((bid) => {
           const overdue = daysOverdue(bid.next_action_date);
           return (
-            <div className="row-item" key={bid.id} style={{ gridTemplateColumns: "1.6fr 130px 120px 90px 140px", cursor: "default" }}>
+            <div className="row-item" key={bid.id} style={{ gridTemplateColumns: "1.6fr 130px 120px 120px 140px", cursor: "default" }}>
               <div>
                 <div className="row-primary">
                   {bid.company_hot_lead && <span className="hot-lead-flame">🔥 </span>}
@@ -85,7 +96,7 @@ export default function Followups({ user, access, assignableUsers = [], onNotifi
               <div className="row-secondary">{STAGE_LABELS[bid.stage]}</div>
               <div className="row-secondary">{bid.owner_username || bid.estimator_username || "unassigned"}</div>
               <div className="row-secondary" style={{ color: overdue === null ? "var(--text-tertiary)" : overdue > 0 ? "var(--red)" : "var(--yellow, #c9a227)" }}>
-                {overdue === null ? "never set" : overdue > 0 ? `${overdue}d overdue` : "due today"}
+                {overdue === null ? "never set" : overdue > 0 ? `${overdue} day${overdue === 1 ? "" : "s"} overdue` : "due today"}
               </div>
               <button className="btn btn-accent btn-sm" onClick={() => openFollowUp(bid)}>Follow up →</button>
             </div>

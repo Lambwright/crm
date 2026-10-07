@@ -22,6 +22,7 @@ const RANGES = [
   { key: "month", label: "This Month", phrase: "this month" },
   { key: "week", label: "This Week", phrase: "this week" },
   { key: "last_week", label: "Last Week", phrase: "last week" },
+  { key: "custom", label: "Custom range…", phrase: "in the chosen dates" },
 ];
 
 // Count vs dollar-value view for every tile that has both (Ben, 2026-10-05).
@@ -60,6 +61,7 @@ function weekCaption(rangeKey) {
 // Exact dates for the periods that aren't obvious from their name. `period`
 // comes from the worker so the dates here can never disagree with what it ran.
 function periodCaption(range, period, rangeInfo) {
+  if (range === "custom") return `Custom range, ${rangeInfo.phrase} (both dates included). Win rates count bids decided in it; other figures count bids created in it.`;
   if (range === "week" || range === "last_week") return `${rangeInfo.label}: ${weekCaption(range)} (Monday to Sunday). Win rates count bids decided in it; other figures count bids created in it.`;
   if (range === "all") return "Showing every bid on record.";
   const f = (d) => d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
@@ -71,6 +73,47 @@ function periodCaption(range, period, rangeInfo) {
   return `Win rates count bids decided ${rangeInfo.phrase}; other figures count bids created ${rangeInfo.phrase}.`;
 }
 
+// How the RFQ prequalifier is doing (Ben, 2026-10-07): bids that went through
+// SCOUT against bids that didn't, and against bids from before SCOUT existed,
+// plus the result by the tier SCOUT gave them. Decided win rate throughout.
+function ScoutResults({ scout, phrase }) {
+  if (!scout || !scout.all || scout.all.created + scout.all.won + scout.all.lost === 0) return null;
+  const since = scout.since ? new Date(scout.since).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : null;
+  const tierOrder = ["A", "B", "C", "untiered"];
+  const tiers = Object.entries(scout.tiers || {}).sort((a, b) => (tierOrder.indexOf(a[0]) === -1 ? 9 : tierOrder.indexOf(a[0])) - (tierOrder.indexOf(b[0]) === -1 ? 9 : tierOrder.indexOf(b[0])));
+  const rows = [
+    ["Through SCOUT", scout.all],
+    ...tiers.map(([k, v]) => [`  Tier ${k === "untiered" ? "(none)" : k}`, v]),
+    [`Not through SCOUT (since ${since || "SCOUT began"})`, scout.others],
+    ["Before SCOUT", scout.before],
+  ].filter(([, v]) => v && (v.created || v.won || v.lost));
+  return (
+    <div style={{ marginBottom: 24 }}>
+      <Tip label="SCOUT prequalifier results" className="card-title">
+        Bids whose RFQ was run through SCOUT (it assigns each one a reference number and a tier), compared with bids that came
+        straight onto the Procore Bid Board without it{since ? ` since SCOUT's first bid on ${since}` : ""}, and with bids from before SCOUT existed.<br /><br />
+        <strong>Won / Lost</strong>: decided {phrase}. <strong>Win rate</strong> is Won ÷ (Won + Lost). <strong>Open</strong> is bids
+        created {phrase} still in play after qualification. A tier with only a handful of decided bids says very little yet.
+      </Tip>
+      <table className="data-table">
+        <thead><tr><th>Group</th><th className="num">Bids created</th><th className="num">Won</th><th className="num">Lost</th><th className="num">Open</th><th className="num">Win rate</th></tr></thead>
+        <tbody>
+          {rows.map(([label, v]) => (
+            <tr key={label}>
+              <td style={{ whiteSpace: "pre" }}>{label}</td>
+              <td className="num">{fmtNum(v.created)}</td>
+              <td className="num">{fmtNum(v.won)}</td>
+              <td className="num">{fmtNum(v.lost)}</td>
+              <td className="num">{fmtNum(v.open)}</td>
+              <td className="num">{fmtPct(v.decided_win_rate)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 export default function Dashboard() {
   const [range, setRange] = useState("all");
   const [basis, setBasis] = useState("count");
@@ -79,16 +122,26 @@ export default function Dashboard() {
   const [rateMode, setRateMode] = useState("pipeline");
   const [summary, setSummary] = useState(null);
   const [error, setError] = useState(null);
+  // Custom range: inclusive dates from the pickers (YYYY-MM-DD). Defaults to
+  // the current fiscal year so switching to Custom starts from something sensible.
+  const [from, setFrom] = useState(`${FY_NOW - 1}-10-01`);
+  const [to, setTo] = useState(() => new Date().toISOString().slice(0, 10));
 
   useEffect(() => {
-    setSummary(null);
-    api.getDashboardSummary(range).then(setSummary).catch((e) => setError(e.message));
-  }, [range]);
+    // Editing the dates keeps the current figures on screen until the new ones
+    // arrive, so the pickers don't vanish mid-edit.
+    setSummary((s) => (range === "custom" && s && s.period && s.period.key === "custom" ? s : null));
+    let live = true;
+    api.getDashboardSummary(range, from, to).then((d) => live && setSummary(d)).catch((e) => live && setError(e.message));
+    return () => { live = false; };
+  }, [range, from, to]);
 
   if (error) return <div className="card" style={{ color: "var(--red)" }}>{error}</div>;
   if (!summary || (summary.period && summary.period.key !== range)) return <div className="spinner-inline">Loading…</div>;
 
-  const rangeInfo = RANGES.find((r) => r.key === range);
+  const rangeInfo = range === "custom"
+    ? { key: "custom", label: "Custom range", phrase: `from ${from || "the beginning"} to ${to || "today"}` }
+    : RANGES.find((r) => r.key === range);
   const byStage = Object.fromEntries((summary.by_stage || []).map((r) => [r.stage, r]));
   const openRows = (summary.by_stage || []).filter((r) => !["complete", "lost", "no_bid"].includes(r.stage));
   const totalPipeline = openRows.reduce((sum, r) => sum + Number(r.pipeline_value || 0), 0);
@@ -121,6 +174,16 @@ export default function Dashboard() {
             {RANGES.map((r) => <option key={r.key} value={r.key}>{r.label}</option>)}
           </select>
         </label>
+        {range === "custom" && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "var(--text-secondary)" }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 6 }}>From
+              <input type="date" value={from} max={to || undefined} onChange={(e) => setFrom(e.target.value)} />
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6 }}>To
+              <input type="date" value={to} min={from || undefined} onChange={(e) => setTo(e.target.value)} />
+            </label>
+          </div>
+        )}
         <div className="tabs" style={{ marginBottom: 0 }} title="Switch the tiles that have both between a count of bids and their dollar value">
           {BASES.map((b) => (
             <button key={b.key} className={`tab ${basis === b.key ? "active" : ""}`} onClick={() => setBasis(b.key)}>
@@ -251,6 +314,8 @@ export default function Dashboard() {
           );
         })}
       </div>
+
+      <ScoutResults scout={summary.scout} phrase={rangeInfo.phrase} />
 
       <div style={{ marginBottom: 24 }}>
         <CustomerTable

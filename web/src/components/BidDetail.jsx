@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, buildMailto } from "../api.js";
+import { buildFollowUpDraft, variantCount } from "../followupTemplates.js";
 import { HANDOFF_STATUS_LABELS, STAGE_LABELS, STAGE_ORDER, STAGE_REQUIREMENTS } from "../stages.js";
 
 export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, assignableUsers = [], initialToStage, autoHandoffOnComplete, can }) {
@@ -18,13 +19,40 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
       : { direction: "outbound", subject: "", to_addresses: "", body: "" }
   );
   const [expandedEmailId, setExpandedEmailId] = useState(null);
+  // Which wording the follow-up draft is on (the "Different wording" button cycles it).
+  const [variant, setVariant] = useState(() => Math.floor(Math.random() * 1000));
   // Role matrix (GET /access). Cosmetic only — the worker enforces both of
   // these regardless. Undefined (legacy mode, or /access not loaded) = allowed.
   const canMove = can?.move_stages ?? true;
   const canAssign = can?.assign ?? true;
 
   function load() {
-    api.getBid(id).then(setData).catch((e) => setError(e.message));
+    api.getBid(id).then((d) => {
+      setData(d);
+      // The bid's own contact is the natural recipient: fill it in unless
+      // someone already typed one (or the Follow-ups page pre-filled it).
+      const email = d.bid.contact_email;
+      if (email) setEmailDraft((cur) => (cur.to_addresses ? cur : { ...cur, to_addresses: email }));
+    }).catch((e) => setError(e.message));
+  }
+
+  // A fresh wording for the follow-up (Ben, 2026-10-07: so they don't sound canned).
+  function randomizeDraft() {
+    const b = data.bid;
+    const next = variant + 1 + Math.floor(Math.random() * Math.max(1, variantCount(b) - 1));
+    setVariant(next);
+    const draft = buildFollowUpDraft(b, { contactFirstName: b.contact_first_name, contactEmail: "" }, next);
+    setEmailDraft((cur) => ({ ...cur, direction: "outbound", subject: draft.subject, body: draft.body }));
+  }
+
+  // Add a customer-directory contact to the recipient list.
+  function addRecipient(email) {
+    if (!email) return;
+    setEmailDraft((cur) => {
+      const have = (cur.to_addresses || "").split(/[,;]\s*/).filter(Boolean);
+      if (have.some((a) => a.toLowerCase() === email.toLowerCase())) return cur;
+      return { ...cur, to_addresses: [...have, email].join(", ") };
+    });
   }
 
   useEffect(() => {
@@ -43,6 +71,7 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
   if (!data) return null;
 
   const { bid, stage_history, emails } = data;
+  const directory = (data.company_contacts || []).filter((c) => c.email);
   const requirements = toStage ? STAGE_REQUIREMENTS[toStage] || [] : [];
 
   async function assignField(field, value) {
@@ -276,6 +305,16 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
           <div className="field" style={{ flex: 2 }}>
             <label>To / From</label>
             <input value={emailDraft.to_addresses} onChange={(e) => setEmailDraft((d) => ({ ...d, to_addresses: e.target.value }))} placeholder="client@example.com" />
+            {directory.length > 0 && (
+              <select value="" onChange={(e) => addRecipient(e.target.value)} style={{ marginTop: 4, fontSize: 12 }}>
+                <option value="">+ Add from {bid.company_name || "client"} directory…</option>
+                {directory.map((c) => (
+                  <option key={c.id} value={c.email}>
+                    {[c.first_name, c.last_name].filter(Boolean).join(" ") || c.email}{c.title ? ` — ${c.title}` : ""} ({c.email})
+                  </option>
+                ))}
+              </select>
+            )}
           </div>
         </div>
         <div className="field" style={{ marginBottom: 6 }}>
@@ -288,6 +327,7 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
         </div>
         <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
           <button className="btn btn-accent btn-sm" onClick={handleComposeAndLog} disabled={busy}>✉ Open in mail app &amp; log</button>
+          <button className="btn btn-ghost btn-sm" onClick={randomizeDraft} disabled={busy} title="Replace the subject and body with a differently-worded follow-up">🎲 Different wording</button>
         </div>
         <div className="field-help" style={{ marginTop: -10, marginBottom: 16 }}>
           Logs immediately, before you actually send — can't verify send from here (a mailto: link has no way to know).

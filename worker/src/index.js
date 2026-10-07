@@ -220,6 +220,43 @@ function isCrmAdmin(user) {
   return c.mode === "live" ? c.level === "admin" : user.role === "admin";
 }
 
+// Extra capabilities granted per person inside CRM (admin edits them under the
+// Access tab), on top of the Einbau ID level. admin implicitly has all; legacy
+// mode (matrix not switched) keeps today's no-restriction behaviour.
+//   followup_manager - sees every follow-up, bulk-assigns, runs auto-assign rules
+//   campaign_manager - the Campaigns tab (import, dashboard, copilot)
+const CRM_CAPS = ["followup_manager", "campaign_manager"];
+let grantsCache = { at: 0, grants: {} };
+async function loadGrants(sql) {
+  if (Date.now() - grantsCache.at < 15_000) return grantsCache.grants;
+  const [row] = await sql`select grants from crm_settings where singleton = 1`;
+  grantsCache = { at: Date.now(), grants: (row && row.grants) || {} };
+  return grantsCache.grants;
+}
+async function attachCaps(sql, user) {
+  const c = crmOf(user);
+  if (c.mode !== "live" || c.level === "admin") user._caps = [...CRM_CAPS];
+  else user._caps = ((await loadGrants(sql))[user.username] || []).filter((x) => CRM_CAPS.includes(x));
+}
+function hasCap(user, cap) {
+  return Array.isArray(user._caps) && user._caps.includes(cap);
+}
+// "own" scope = a PM: dashboard plus the follow-ups on bids assigned to them,
+// nothing else (Ben, 2026-10-07). Everyone else sees every bid.
+function canSeeAllBids(user) {
+  const c = crmOf(user);
+  return c.mode === "live" ? c.level === "admin" || c.level === "estimator" : true;
+}
+function ownsBid(user, bid) {
+  return Boolean(bid) && (bid.owner_username === user.username || bid.estimator_username === user.username);
+}
+function bidAccessDenied(user, bid) {
+  return canSeeAllBids(user) || ownsBid(user, bid) ? null : forbidden("This bid isn't assigned to you.");
+}
+function scopeDenied(user) {
+  return canSeeAllBids(user) ? null : forbidden("Your role can only see the dashboard and the follow-ups assigned to you.");
+}
+
 function forbidden(detail) {
   return json({ error: "forbidden", detail }, 403);
 }
@@ -726,7 +763,9 @@ async function handleContactPatch(id, request, sql) {
 // Bids
 // ---------------------------------------------------------------------------
 
-async function handleBidsList(url, sql) {
+async function handleBidsList(url, sql, user) {
+  const denied = scopeDenied(user);
+  if (denied) return denied;
   const stage = url.searchParams.get("stage");
   const owner = url.searchParams.get("owner");
   const companyId = url.searchParams.get("company_id");
@@ -757,15 +796,22 @@ async function handleBidsList(url, sql) {
   return json({ bids: filtered });
 }
 
-async function handleBidDetail(id, sql) {
+async function handleBidDetail(id, sql, user) {
   const rows = await sql`
     select b.*, c.name as company_name, ct.email as contact_email, ct.first_name as contact_first_name, ct.last_name as contact_last_name
     from bids b left join companies c on c.id = b.company_id left join contacts ct on ct.id = b.contact_id
     where b.id = ${id}`;
   if (!rows.length) return json({ error: "not_found" }, 404);
+  const denied = bidAccessDenied(user, rows[0]);
+  if (denied) return denied;
   const history = await sql`select * from bid_stage_history where bid_id = ${id} order by changed_at desc`;
   const emails = await sql`select * from bid_emails where bid_id = ${id} order by sent_at desc`;
-  return json({ bid: rows[0], stage_history: history, emails });
+  // The customer's directory contacts, so a follow-up's recipient can be picked
+  // without leaving the bid (a PM has no Companies tab).
+  const contacts = rows[0].company_id
+    ? await sql`select id, first_name, last_name, title, email from contacts where company_id = ${rows[0].company_id} order by first_name, last_name`
+    : [];
+  return json({ bid: rows[0], stage_history: history, emails, company_contacts: contacts });
 }
 
 const BID_PATCHABLE = [
@@ -778,7 +824,11 @@ async function handleBidPatch(id, request, sql, env, user) {
   const body = await parseBody(request);
   const existing = await sql`select * from bids where id = ${id}`;
   if (!existing.length) return json({ error: "not_found" }, 404);
-  const fields = Object.keys(body).filter((k) => BID_PATCHABLE.includes(k));
+  const accessDenied = bidAccessDenied(user, existing[0]);
+  if (accessDenied) return accessDenied;
+  // A PM works their own follow-ups: next action and who the contact is, nothing else.
+  const patchable = canSeeAllBids(user) ? BID_PATCHABLE : ["next_action", "next_action_date", "contact_id"];
+  const fields = Object.keys(body).filter((k) => patchable.includes(k));
   if (!fields.length) return json({ error: "no_valid_fields", detail: `Patchable fields: ${BID_PATCHABLE.join(", ")}` }, 400);
 
   if (body.handoff_status !== undefined && (body.handoff_status || null) !== (existing[0].handoff_status || null) && !canSetHandoffStatus(user)) {
@@ -875,7 +925,10 @@ async function handleBidStageChange(id, request, sql, env, user) {
 // Tender emails
 // ---------------------------------------------------------------------------
 
-async function handleEmailsList(bidId, sql) {
+async function handleEmailsList(bidId, sql, user) {
+  const [b] = await sql`select owner_username, estimator_username from bids where id = ${bidId}`;
+  const denied = b ? bidAccessDenied(user, b) : null;
+  if (denied) return denied;
   const rows = await sql`select * from bid_emails where bid_id = ${bidId} order by sent_at desc`;
   return json({ emails: rows });
 }
@@ -884,6 +937,8 @@ async function handleEmailCreate(bidId, request, sql, user) {
   const body = await parseBody(request);
   const bidRows = await sql`select * from bids where id = ${bidId}`;
   if (!bidRows.length) return json({ error: "bid_not_found" }, 404);
+  const accessDenied = bidAccessDenied(user, bidRows[0]);
+  if (accessDenied) return accessDenied;
   if (!body.direction || !["outbound", "inbound"].includes(body.direction)) {
     return json({ error: "direction must be 'outbound' or 'inbound'" }, 400);
   }
@@ -904,15 +959,16 @@ async function handleEmailCreate(bidId, request, sql, user) {
 // Notifications
 // ---------------------------------------------------------------------------
 
-async function handleNotificationsList(url, sql) {
+async function handleNotificationsList(url, sql, user) {
   const status = url.searchParams.get("status") || "pending";
-  const rows = await sql`
+  const all = await sql`
     select n.*, b.project_name, b.rfq_ref, b.owner_username, c.name as company_name
     from notifications n
     left join bids b on b.id = n.bid_id
     left join companies c on c.id = coalesce(n.company_id, b.company_id)
     where n.status = ${status}
     order by n.created_at desc limit 200`;
+  const rows = canSeeAllBids(user) ? all : all.filter((n) => n.owner_username === user.username);
   return json({ notifications: rows });
 }
 
@@ -933,7 +989,10 @@ async function handleNotificationAck(id, sql, user) {
 // ---------------------------------------------------------------------------
 
 async function handleFollowupsList(url, sql, user) {
-  const mine = url.searchParams.get("mine") === "1";
+  // A PM only ever gets their own; so does anyone without the follow-up
+  // manager capability who didn't ask for everything (estimators keep the
+  // "My bids only" toggle they had).
+  const mine = url.searchParams.get("mine") === "1" || !canSeeAllBids(user);
   const rows = await sql`
     select b.*, c.name as company_name, c.hot_lead as company_hot_lead, ct.email as contact_email,
       ct.first_name as contact_first_name, ct.last_name as contact_last_name
@@ -1061,14 +1120,38 @@ async function handleAccess(env, user) {
     segment: canChangeSegment(user),
     blacklist: canManageBlacklist(user),
     handoff_status: canSetHandoffStatus(user),
+    all_bids: canSeeAllBids(user),
+    followup_manager: hasCap(user, "followup_manager"),
+    campaign_manager: hasCap(user, "campaign_manager"),
   };
-  if (c.mode !== "live") return json({ mode: c.mode, level: c.level, can, people: null });
+  if (c.mode !== "live") return json({ mode: c.mode, level: c.level, can, caps: user._caps || [], people: null });
   try {
     const people = (await eligibleAssignees(env, user)).map((p) => ({ username: p.username, displayName: p.displayName, level: p.level }));
-    return json({ mode: c.mode, level: c.level, can, people });
+    return json({ mode: c.mode, level: c.level, can, caps: user._caps || [], people });
   } catch (e) {
-    return json({ mode: c.mode, level: c.level, can, people: [], people_error: e.message });
+    return json({ mode: c.mode, level: c.level, can, caps: user._caps || [], people: [], people_error: e.message });
   }
+}
+
+// Admin-only: who has which extra capability. GET also lists everyone with
+// CRM access (from auth-worker) so the Access tab can show a row per person.
+async function handleGrantsGet(env, sql, user) {
+  if (!isCrmAdmin(user)) return forbidden("Admin access required.");
+  let people = [];
+  try { people = (await getCrmPeople(env, user)).map((p) => ({ username: p.username, displayName: p.displayName, level: p.level })); } catch (e) { /* list stays empty */ }
+  grantsCache.at = 0;
+  return json({ caps: CRM_CAPS, grants: await loadGrants(sql), people });
+}
+async function handleGrantsPatch(request, sql, user) {
+  if (!isCrmAdmin(user)) return forbidden("Admin access required.");
+  const body = await parseBody(request);
+  if (!body.username || !Array.isArray(body.caps)) return json({ error: "username and caps[] are required" }, 400);
+  const caps = body.caps.filter((c) => CRM_CAPS.includes(c));
+  const grants = { ...(await loadGrants(sql)) };
+  if (caps.length) grants[body.username] = caps; else delete grants[body.username];
+  await sql`update crm_settings set grants = ${JSON.stringify(grants)}::jsonb, updated_at = now(), updated_by = ${user.username} where singleton = 1`;
+  grantsCache.at = 0;
+  return json({ grants });
 }
 
 async function handleSettingsGet(sql) {
@@ -1129,21 +1212,40 @@ async function handleAdminBackfillFollowupDates(sql, { offset = 0, limit = 2000 
   return json({ scanned: rows.length, updated, offset, nextOffset: offset + rows.length });
 }
 
-// Applies migration 009 (decided_at / archived_at) the first time a deployed
-// worker runs, so a deploy never needs a separate manual migrate step. Checks
-// information_schema first so every later cold start costs one cheap query.
+// Self-applied migrations (no separate manual migrate step after a deploy).
+// Each entry runs once; the ids it has run are recorded in crm_schema_applied,
+// so every later cold start costs one cheap query. Statements must be
+// idempotent — two isolates can race on the first run.
+const SELF_MIGRATIONS = [
+  {
+    id: "009_decided_at",
+    statements: [
+      `alter table bids add column if not exists decided_at timestamptz`,
+      `alter table bids add column if not exists archived_at timestamptz`,
+      `update bids b set decided_at = h.t
+         from (select bid_id, to_stage, max(changed_at) as t from bid_stage_history
+               where changed_by != 'system' group by bid_id, to_stage) h
+         where h.bid_id = b.id and h.to_stage = b.stage and b.stage in ('complete', 'lost') and b.decided_at is null`,
+    ],
+  },
+  {
+    // Extra CRM capabilities on top of the Einbau ID level (admin/estimator/pm):
+    // { "<username>": ["followup_manager", "campaign_manager"] }
+    id: "010_grants",
+    statements: [`alter table crm_settings add column if not exists grants jsonb not null default '{}'::jsonb`],
+  },
+];
 let schemaReady = null;
 function ensureSchema(sql) {
   if (!schemaReady) {
     schemaReady = (async () => {
-      const have = await sql`select 1 from information_schema.columns where table_name = 'bids' and column_name = 'archived_at'`;
-      if (have.length) return;
-      await sql.query(`alter table bids add column if not exists decided_at timestamptz`);
-      await sql.query(`alter table bids add column if not exists archived_at timestamptz`);
-      await sql.query(`update bids b set decided_at = h.t
-        from (select bid_id, to_stage, max(changed_at) as t from bid_stage_history
-              where changed_by != 'system' group by bid_id, to_stage) h
-        where h.bid_id = b.id and h.to_stage = b.stage and b.stage in ('complete', 'lost') and b.decided_at is null`);
+      await sql.query(`create table if not exists crm_schema_applied (id text primary key, applied_at timestamptz not null default now())`);
+      const done = new Set((await sql`select id from crm_schema_applied`).map((r) => r.id));
+      for (const m of SELF_MIGRATIONS) {
+        if (done.has(m.id)) continue;
+        for (const stmt of m.statements) await sql.query(stmt);
+        await sql`insert into crm_schema_applied (id) values (${m.id}) on conflict do nothing`;
+      }
     })().catch((e) => { schemaReady = null; throw e; });
   }
   return schemaReady;
@@ -1203,7 +1305,17 @@ function rangeCutoffDate(range) {
 // Monday-to-Sunday calendar week (Ben, 2026-10-05). Everything else is
 // "from the start of the current period until now", so its end is just a
 // far-future date that never excludes anything.
-function rangeBounds(range) {
+function rangeBounds(range, { from, to } = {}) {
+  // Custom range (Ben, 2026-10-07): inclusive calendar dates from the date
+  // pickers, YYYY-MM-DD. Falls back to all-time on a bad value rather than erroring.
+  if (range === "custom") {
+    const ok = (d) => /^\d{4}-\d{2}-\d{2}$/.test(d || "") && !Number.isNaN(new Date(d + "T00:00:00Z").getTime());
+    if (ok(from) || ok(to)) {
+      const start = ok(from) ? new Date(from + "T00:00:00Z") : new Date(0);
+      const end = ok(to) ? new Date(new Date(to + "T00:00:00Z").getTime() + 86400000) : new Date("9999-12-31T00:00:00Z");
+      return { start, end };
+    }
+  }
   if (range === "last_week") {
     const thisMonday = rangeCutoffDate("week");
     const lastMonday = new Date(thisMonday.getFullYear(), thisMonday.getMonth(), thisMonday.getDate() - 7);
@@ -1233,8 +1345,8 @@ function rangeBounds(range) {
 // passing includeArchived) switches every figure that uses it.
 const INCLUDE_ARCHIVED_IN_WIN_RATES = false;
 
-async function handleDashboardSummary(sql, range, { includeArchived = INCLUDE_ARCHIVED_IN_WIN_RATES } = {}) {
-  const bounds = rangeBounds(range);
+async function handleDashboardSummary(sql, range, { includeArchived = INCLUDE_ARCHIVED_IN_WIN_RATES, from, to } = {}) {
+  const bounds = rangeBounds(range, { from, to });
   const cutoffIso = bounds.start.toISOString();
   const endIso = bounds.end.toISOString();
 
@@ -1274,6 +1386,7 @@ async function handleDashboardSummary(sql, range, { includeArchived = INCLUDE_AR
   const MIDLATE = ["bid_submitted", "accepted", "in_progress", "to_do", "delayed"];
   const popRows = await sql`
     select b.id, b.company_id, b.stage, b.final_value, b.estimated_value, b.created_at, b.source_archived,
+      (b.rfq_ref not like 'PROCORE-%') as via_scout, b.scout_tier,
       (b.decided_at is not null) as decision_recorded,
       case when b.stage in ('complete', 'lost') then coalesce(b.decided_at,
         (select max(h.changed_at) from bid_stage_history h
@@ -1287,8 +1400,27 @@ async function handleDashboardSummary(sql, range, { includeArchived = INCLUDE_AR
   const blank = () => ({ created_count: 0, created_value: 0, complete_count: 0, lost_count: 0, midlate_count: 0, complete_value: 0, lost_value: 0, midlate_value: 0, complete_valued_count: 0, lost_valued_count: 0 });
   const pcRow = blank();
   const perCompany = new Map();
+  // SCOUT prequalifier results (Ben, 2026-10-07): bids whose RFQ ref was minted
+  // by SCOUT/CRM (everything else is a Procore-board original) against the rest,
+  // and by the tier SCOUT gave them — same decided/still-open rules as above.
+  const scoutAll = blank();
+  const scoutOthers = blank(); // not via SCOUT, created on/after the first SCOUT bid
+  const scoutBefore = blank(); // not via SCOUT, created before SCOUT started
+  const scoutTiers = new Map();
+  let scoutSince = null;
+  for (const r of popRows) {
+    if (r.via_scout) { const t = new Date(r.created_at).getTime(); if (scoutSince == null || t < scoutSince) scoutSince = t; }
+  }
   for (const r of popRows) {
     const aggs = [pcRow];
+    if (r.via_scout) {
+      aggs.push(scoutAll);
+      const tier = r.scout_tier || "untiered";
+      if (!scoutTiers.has(tier)) scoutTiers.set(tier, blank());
+      aggs.push(scoutTiers.get(tier));
+    } else {
+      aggs.push(scoutSince != null && new Date(r.created_at).getTime() < scoutSince ? scoutBefore : scoutOthers);
+    }
     if (r.company_id) aggs.push(perCompany.get(r.company_id) || perCompany.set(r.company_id, blank()).get(r.company_id));
     const add = (kind, value, valued) => {
       for (const agg of aggs) {
@@ -1329,6 +1461,25 @@ async function handleDashboardSummary(sql, range, { includeArchived = INCLUDE_AR
   const pipelineWinRateValue = pipelineValueTotal > 0 ? pcRow.complete_value / pipelineValueTotal : null;
   const decidedValueTotal = pcRow.complete_value + pcRow.lost_value;
   const decidedWinRateValue = decidedValueTotal > 0 ? pcRow.complete_value / decidedValueTotal : null;
+
+  const scoutStats = (a) => ({
+    created: a.created_count,
+    won: a.complete_count,
+    lost: a.lost_count,
+    open: a.midlate_count,
+    won_value: a.complete_value,
+    lost_value: a.lost_value,
+    decided_win_rate: a.complete_count + a.lost_count > 0 ? a.complete_count / (a.complete_count + a.lost_count) : null,
+    pipeline_win_rate: a.complete_count + a.lost_count + a.midlate_count > 0 ? a.complete_count / (a.complete_count + a.lost_count + a.midlate_count) : null,
+    decided_win_rate_value: a.complete_value + a.lost_value > 0 ? a.complete_value / (a.complete_value + a.lost_value) : null,
+  });
+  const scout = {
+    since: scoutSince ? new Date(scoutSince).toISOString() : null,
+    all: scoutStats(scoutAll),
+    others: scoutStats(scoutOthers),
+    before: scoutStats(scoutBefore),
+    tiers: Object.fromEntries([...scoutTiers.entries()].map(([k, v]) => [k, scoutStats(v)])),
+  };
 
   const wonInRange = [{ count: pcRow.complete_count, value: pcRow.complete_value }];
   const lostInRange = [{ count: pcRow.lost_count, value: pcRow.lost_value }];
@@ -1425,6 +1576,7 @@ async function handleDashboardSummary(sql, range, { includeArchived = INCLUDE_AR
     hot_leads: hotLeads[0]?.hot_lead_count || 0,
     by_company: byCompany,
     by_region: byRegion,
+    scout,
   });
 }
 
@@ -1710,6 +1862,7 @@ export default {
       const auth = await requireLogin(request, env);
       if (!auth.ok) return json({ error: "unauthorized", reason: auth.reason }, 401);
 
+      await attachCaps(sql, auth.user);
       const refresh = auth.refreshedToken ? { "X-Refreshed-Token": auth.refreshedToken } : {};
       const withRefresh = (res) => {
         for (const [k, v] of Object.entries(refresh)) res.headers.set(k, v);
@@ -1718,6 +1871,10 @@ export default {
 
       if (url.pathname === "/rfq-ids/mint" && request.method === "POST") return withRefresh(await handleMintRfqRef(sql, auth.user));
 
+      if (parts[0] === "companies" || parts[0] === "contacts") {
+        const denied = scopeDenied(auth.user);
+        if (denied) return withRefresh(denied);
+      }
       if (parts[0] === "companies") {
         if (parts.length === 1 && request.method === "GET") return withRefresh(await handleCompaniesList(url, sql));
         if (parts.length === 1 && request.method === "POST") return withRefresh(await handleCompanyCreate(request, sql));
@@ -1731,26 +1888,28 @@ export default {
       }
 
       if (parts[0] === "bids") {
-        if (parts.length === 1 && request.method === "GET") return withRefresh(await handleBidsList(url, sql));
-        if (isUuid(parts[1]) && !parts[2] && request.method === "GET") return withRefresh(await handleBidDetail(parts[1], sql));
+        if (parts.length === 1 && request.method === "GET") return withRefresh(await handleBidsList(url, sql, auth.user));
+        if (isUuid(parts[1]) && !parts[2] && request.method === "GET") return withRefresh(await handleBidDetail(parts[1], sql, auth.user));
         if (isUuid(parts[1]) && !parts[2] && request.method === "PATCH") return withRefresh(await handleBidPatch(parts[1], request, sql, env, auth.user));
         if (isUuid(parts[1]) && parts[2] === "stage" && request.method === "POST") return withRefresh(await handleBidStageChange(parts[1], request, sql, env, auth.user));
-        if (isUuid(parts[1]) && parts[2] === "emails" && request.method === "GET") return withRefresh(await handleEmailsList(parts[1], sql));
+        if (isUuid(parts[1]) && parts[2] === "emails" && request.method === "GET") return withRefresh(await handleEmailsList(parts[1], sql, auth.user));
         if (isUuid(parts[1]) && parts[2] === "emails" && request.method === "POST") return withRefresh(await handleEmailCreate(parts[1], request, sql, auth.user));
       }
 
       if (parts[0] === "notifications") {
-        if (parts.length === 1 && request.method === "GET") return withRefresh(await handleNotificationsList(url, sql));
+        if (parts.length === 1 && request.method === "GET") return withRefresh(await handleNotificationsList(url, sql, auth.user));
         if (isUuid(parts[1]) && parts[2] === "ack" && request.method === "POST") return withRefresh(await handleNotificationAck(parts[1], sql, auth.user));
       }
 
       if (url.pathname === "/followups" && request.method === "GET") return withRefresh(await handleFollowupsList(url, sql, auth.user));
 
       if (url.pathname === "/access" && request.method === "GET") return withRefresh(await handleAccess(env, auth.user));
+      if (url.pathname === "/grants" && request.method === "GET") return withRefresh(await handleGrantsGet(env, sql, auth.user));
+      if (url.pathname === "/grants" && request.method === "PATCH") return withRefresh(await handleGrantsPatch(request, sql, auth.user));
       if (url.pathname === "/settings" && request.method === "GET") return withRefresh(await handleSettingsGet(sql));
       if (url.pathname === "/settings" && request.method === "PATCH") return withRefresh(await handleSettingsPatch(request, sql, auth.user));
 
-      if (url.pathname === "/dashboard/summary" && request.method === "GET") return withRefresh(await handleDashboardSummary(sql, url.searchParams.get("range")));
+      if (url.pathname === "/dashboard/summary" && request.method === "GET") return withRefresh(await handleDashboardSummary(sql, url.searchParams.get("range"), { from: url.searchParams.get("from"), to: url.searchParams.get("to") }));
 
       return withRefresh(json({ error: "not_found" }, 404));
     } catch (e) {

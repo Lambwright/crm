@@ -122,6 +122,7 @@ export default function App() {
         {tab === "followups" && <Followups user={user} access={access} assignableUsers={assignableUsers} onNotificationsChanged={refreshNotificationCount} />}
         {tab === "companies" && <CompanyList access={access} />}
         {tab === "dashboard" && <Dashboard />}
+        {tab === "access" && <Access />}
       </div>
     </>
   );

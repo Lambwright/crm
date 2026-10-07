@@ -68,7 +68,16 @@ export const api = {
   listFollowups: (mine) => request(`/followups${mine ? "?mine=1" : ""}`),
 
   // Dashboard
-  getDashboardSummary: (range) => request(`/dashboard/summary${range ? `?range=${encodeURIComponent(range)}` : ""}`),
+  getDashboardSummary: (range, from, to) => {
+    const q = new URLSearchParams();
+    if (range) q.set("range", range);
+    if (range === "custom") { if (from) q.set("from", from); if (to) q.set("to", to); }
+    return request(`/dashboard/summary?${q}`);
+  },
+
+  // Extra CRM capabilities per person (admin only): follow-up manager, campaign manager
+  getGrants: () => request(`/grants`),
+  setGrants: (username, caps) => request(`/grants`, { method: "PATCH", body: { username, caps } }),
 
   // Settings — cadence + assignable-users list, edited from HELM's CRM Options tab
   getSettings: () => request(`/settings`),
