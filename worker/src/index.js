@@ -606,8 +606,20 @@ async function handleScoutIntake(request, sql) {
 // ---------------------------------------------------------------------------
 const REGION_TTL_MS = 24 * 60 * 60 * 1000; // regions almost never change; once a day is plenty
 
+// A failed or empty answer (HANDOFF down, or Procore refusing with a 429 —
+// HANDOFF reports that as "no regions") must not turn every page view into
+// another Procore call, so back off for 15 minutes after any non-success.
+// See PROCORE-RATE-LIMITS.md: 600 requests an hour per client id, shared by all.
+let regionRetryAfter = 0;
 async function refreshRegions(env, sql) {
   if (!env.HANDOFF_WORKER || !env.HANDOFF_SERVICE_KEY) return { skipped: "HANDOFF_WORKER binding / HANDOFF_SERVICE_KEY secret not set" };
+  if (Date.now() < regionRetryAfter) return { skipped: "backing off after a failed refresh" };
+  const out = await refreshRegionsNow(env, sql);
+  if (out.skipped) regionRetryAfter = Date.now() + 15 * 60 * 1000;
+  return out;
+}
+
+async function refreshRegionsNow(env, sql) {
   const res = await env.HANDOFF_WORKER.fetch("https://handoff-worker.ben-a90.workers.dev/regions", {
     headers: { "X-Handoff-Service-Key": env.HANDOFF_SERVICE_KEY },
   });
