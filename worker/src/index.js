@@ -601,10 +601,10 @@ async function handleScoutIntake(request, sql) {
 // one region vocabulary — read live by HANDOFF and copied here, never typed in
 // by hand. CRM has no Procore access of its own, so the copy comes from
 // HANDOFF's GET /regions over a service binding (HANDOFF_WORKER) with the
-// shared HANDOFF_SERVICE_KEY. Refreshed lazily when older than an hour and by
+// shared HANDOFF_SERVICE_KEY. Refreshed lazily when empty or older than a day and by
 // the daily cron; if HANDOFF can't be reached the last good copy keeps serving.
 // ---------------------------------------------------------------------------
-const REGION_TTL_MS = 60 * 60 * 1000;
+const REGION_TTL_MS = 24 * 60 * 60 * 1000; // regions almost never change; once a day is plenty
 
 async function refreshRegions(env, sql) {
   if (!env.HANDOFF_WORKER || !env.HANDOFF_SERVICE_KEY) return { skipped: "HANDOFF_WORKER binding / HANDOFF_SERVICE_KEY secret not set" };
