@@ -79,6 +79,9 @@ export const api = {
   getGrants: () => request(`/grants`),
   setGrants: (username, caps) => request(`/grants`, { method: "PATCH", body: { username, caps } }),
 
+  // Procore project regions (one list, used for every region pick)
+  listRegions: () => request(`/regions`),
+
   // Settings — cadence + assignable-users list, edited from HELM's CRM Options tab
   getSettings: () => request(`/settings`),
 

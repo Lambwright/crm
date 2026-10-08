@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api.js";
+import RegionSelect from "./RegionSelect.jsx";
 import { ACCOUNT_SEGMENT_LABELS, ACCOUNT_SEGMENTS, STAGE_LABELS } from "../stages.js";
 
 const BLACKLIST = ["do_not_pursue", "do_not_work_with"];
@@ -74,7 +75,7 @@ export default function CompanyDetail({ id, onClose, onChanged, canHotLead = tru
           </div>
           <div className="field">
             <label>Region</label>
-            <input defaultValue={company.region || ""} onBlur={(e) => patch({ region: e.target.value })} />
+            <RegionSelect value={company.region} disabled={saving} onChange={(v) => patch({ region: v })} />
           </div>
           <div className="field">
             <label>Vertical</label>

@@ -596,6 +596,71 @@ async function handleScoutIntake(request, sql) {
 // Companies
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Regions (Ben, 2026-10-07): Procore's project regions (Einbau branches) are the
+// one region vocabulary — read live by HANDOFF and copied here, never typed in
+// by hand. CRM has no Procore access of its own, so the copy comes from
+// HANDOFF's GET /regions over a service binding (HANDOFF_WORKER) with the
+// shared HANDOFF_SERVICE_KEY. Refreshed lazily when older than an hour and by
+// the daily cron; if HANDOFF can't be reached the last good copy keeps serving.
+// ---------------------------------------------------------------------------
+const REGION_TTL_MS = 60 * 60 * 1000;
+
+async function refreshRegions(env, sql) {
+  if (!env.HANDOFF_WORKER || !env.HANDOFF_SERVICE_KEY) return { skipped: "HANDOFF_WORKER binding / HANDOFF_SERVICE_KEY secret not set" };
+  const res = await env.HANDOFF_WORKER.fetch("https://handoff-worker.ben-a90.workers.dev/regions", {
+    headers: { "X-Handoff-Service-Key": env.HANDOFF_SERVICE_KEY },
+  });
+  if (!res.ok) return { skipped: `HANDOFF /regions returned HTTP ${res.status}` };
+  const data = await res.json();
+  const list = Array.isArray(data.regions) ? data.regions.filter((r) => r && r.id && r.name) : [];
+  // An empty answer is HANDOFF's "Procore didn't respond" shape — keep what we have.
+  if (!list.length) return { skipped: "HANDOFF returned no regions" };
+  for (const r of list) {
+    await sql`insert into regions (id, name, active, updated_at) values (${String(r.id)}, ${r.name}, true, now())
+      on conflict (id) do update set name = excluded.name, active = true, updated_at = now()`;
+  }
+  // Regions Procore no longer lists go inactive (kept, so history still resolves).
+  const keep = new Set(list.map((r) => String(r.id)));
+  for (const r of await sql`select id from regions where active`) {
+    if (!keep.has(r.id)) await sql`update regions set active = false where id = ${r.id}`;
+  }
+  return { refreshed: list.length };
+}
+
+async function handleRegionsList(env, sql) {
+  let rows = await sql`select id, name, active, updated_at from regions order by name`;
+  const newest = rows.reduce((m, r) => Math.max(m, new Date(r.updated_at).getTime()), 0);
+  let note = null;
+  if (!rows.length || Date.now() - newest > REGION_TTL_MS) {
+    try {
+      const out = await refreshRegions(env, sql);
+      if (out.skipped) note = out.skipped;
+      else rows = await sql`select id, name, active, updated_at from regions order by name`;
+    } catch (e) { note = e.message; }
+  }
+  const regions = rows.filter((r) => r.active).map((r) => ({ id: r.id, name: r.name }));
+  const names = new Set(regions.map((r) => r.name));
+  // Companies still carrying a region that isn't on the list, for clean-up.
+  const strays = await sql`select region, count(*)::int as count from companies where region is not null and region != '' group by region order by count desc`;
+  return json({
+    regions,
+    refreshed_at: newest ? new Date(newest).toISOString() : null,
+    note,
+    unmatched: strays.filter((r) => !names.has(r.region)),
+  });
+}
+
+// A region may only be set to a name on the list (or cleared). Unchanged
+// legacy text is left alone so unrelated edits to a company don't trip on it.
+async function regionRejection(sql, next, current) {
+  if (next == null || next === "" || next === current) return null;
+  const rows = await sql`select name from regions where active`;
+  if (!rows.length) return null; // list not connected yet — don't block saves
+  if (rows.some((r) => r.name === next)) return null;
+  return json({ error: "unknown_region", detail: `"${next}" isn't one of Procore's project regions. Pick one from the list.` }, 422);
+}
+
 async function handleCompanyLookup(url, sql) {
   const name = (url.searchParams.get("name") || "").trim();
   if (!name) return json({ error: "name query param is required" }, 400);
@@ -655,6 +720,8 @@ async function handleCompaniesList(url, sql) {
 async function handleCompanyCreate(request, sql) {
   const body = await parseBody(request);
   if (!body.name || !body.name.trim()) return json({ error: "name is required" }, 400);
+  const badRegion = await regionRejection(sql, body.region, null);
+  if (badRegion) return badRegion;
   const [company] = await sql`
     insert into companies (name, account_segment, region, vertical, tier, notes)
     values (${body.name.trim()}, ${body.account_segment || "unreviewed"}, ${body.region || null}, ${body.vertical || null}, ${body.tier || null}, ${body.notes || null})
@@ -682,6 +749,10 @@ async function handleCompanyPatch(id, request, sql, env, user) {
 
   const fields = Object.keys(body).filter((k) => COMPANY_PATCHABLE.includes(k));
   if (!fields.length) return json({ error: "no_valid_fields", detail: `Patchable fields: ${COMPANY_PATCHABLE.join(", ")}` }, 400);
+  if (body.region !== undefined) {
+    const badRegion = await regionRejection(sql, body.region, existing[0].region);
+    if (badRegion) return badRegion;
+  }
 
   // Only a real change counts. Adding OR removing a blacklist designation is
   // admin-only (an estimator un-blacklisting would defeat the point); any
@@ -1235,6 +1306,17 @@ const SELF_MIGRATIONS = [
     statements: [`alter table crm_settings add column if not exists grants jsonb not null default '{}'::jsonb`],
   },
 ];
+SELF_MIGRATIONS.push({
+  // The Procore project-region list (Einbau branches), copied from HANDOFF's
+  // live read so every region pick in CRM is a dropdown of the same names.
+  id: "011_regions",
+  statements: [`create table if not exists regions (
+    id text primary key,
+    name text not null,
+    active boolean not null default true,
+    updated_at timestamptz not null default now()
+  )`],
+});
 let schemaReady = null;
 function ensureSchema(sql) {
   if (!schemaReady) {
@@ -1904,6 +1986,7 @@ export default {
       if (url.pathname === "/followups" && request.method === "GET") return withRefresh(await handleFollowupsList(url, sql, auth.user));
 
       if (url.pathname === "/access" && request.method === "GET") return withRefresh(await handleAccess(env, auth.user));
+      if (url.pathname === "/regions" && request.method === "GET") return withRefresh(await handleRegionsList(env, sql));
       if (url.pathname === "/grants" && request.method === "GET") return withRefresh(await handleGrantsGet(env, sql, auth.user));
       if (url.pathname === "/grants" && request.method === "PATCH") return withRefresh(await handleGrantsPatch(request, sql, auth.user));
       if (url.pathname === "/settings" && request.method === "GET") return withRefresh(await handleSettingsGet(sql));
@@ -1919,5 +2002,6 @@ export default {
 
   async scheduled(_event, env, ctx) {
     ctx.waitUntil(runStalenessSweep(env));
+    ctx.waitUntil((async () => { try { await ensureSchema(sqlFor(env)); await refreshRegions(env, sqlFor(env)); } catch (e) { console.log("region refresh failed:", e.message); } })());
   },
 };

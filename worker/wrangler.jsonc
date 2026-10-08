@@ -47,7 +47,10 @@
 		// "netsuite" by analogy with "auth" above, not yet verified. Until
 		// confirmed, the hot-lead NetSuite mirror push will fail closed
 		// (logged as netsuite_sync_status='failed', never blocks the save).
-		{ "binding": "NETSUITE_WORKER", "service": "netsuite" }
+		{ "binding": "NETSUITE_WORKER", "service": "netsuite" },
+		// Procore project regions come from HANDOFF (it already reads them live);
+		// CRM has no Procore access of its own. Needs the HANDOFF_SERVICE_KEY secret.
+		{ "binding": "HANDOFF_WORKER", "service": "handoff-worker" }
 	]
 	/**
 	 * Secrets (set with `wrangler secret put <NAME>`):
@@ -55,6 +58,7 @@
 	 *   CRM_SERVICE_KEY       - shared secret SCOUT sends as X-CRM-Service-Key when pushing a qualified RFQ
 	 *   NETSUITE_SERVICE_KEY  - shared secret this worker sends to netsuite-worker as X-NetSuite-Service-Key
 	 *   CRM_SYNC_KEY          - shared secret handoff-worker sends as X-Crm-Sync-Key when pushing a Bid Board sync batch
+	 *   HANDOFF_SERVICE_KEY   - same value as handoff-worker's own secret; sent as X-Handoff-Service-Key to read the Procore region list
 	 *   CRM_ADMIN_KEY         - shared secret for the one-off /internal/admin/migrate runner (X-Crm-Admin-Key)
 	 */
 }
