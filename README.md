@@ -164,6 +164,8 @@ Rules to keep when this is built:
 - Only these derived numbers are ever shown in CRM, never dollar A/R.
 - The score is blank (not zero) when status is "Limited history" or "No history"; show the status text instead.
 - The SCOUT session will say when the on-demand endpoint URL and response shape exist. CRM should prefer reading those (live, through the NETSUITE_WORKER binding or that endpoint) over copying the values into its own tables.
+- **Endpoint now live (2026-10-15, per the SCOUT session).** `POST https://netsuite.ben-a90.workers.dev` with the usual netsuite-worker auth (Einbau ID bearer token with SCOUT or INTAKE access, or the `X-NetSuite-Service-Key` header for server callers). Body `{"action":"payscore","customer_id":"<NetSuite customer internal id>"}` returns `{ok, result:{customer_id, status ("Scored"|"Limited history"|"No history"), score (0-10 or null), score_18m, score_6m, judged_invoices, avg_days_past_terms_18m, avg_days_past_terms_6m, late_pct, credit_pct, credit_memos_per_invoice, overdue_days, calc_date}}`. It is computed live from NetSuite on every call, so no stored fields are needed. `{"action":"payscore_all"}` returns every customer with invoices (about 115 today). The same values will also be written monthly onto the `custentity_scout_pay*` fields; those writes are still switched off.
+- **Reading the score:** GOOD 7-10, AVERAGE 4-6, POOR 0-3, "Limited history" / "No history" = unknown. Same mapping SCOUT uses for its Payment record answer. CRM needs the company's `netsuite_customer_id` to call it.
 
 ## On hold: backlog / resource forecast
 
