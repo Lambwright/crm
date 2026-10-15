@@ -3,6 +3,7 @@ import { api } from "../api.js";
 import { ACCOUNT_SEGMENT_LABELS, ACCOUNT_SEGMENTS } from "../stages.js";
 import CompanyDetail from "./CompanyDetail.jsx";
 import NetSuiteSync from "./NetSuiteSync.jsx";
+import ContactsImport from "./ContactsImport.jsx";
 
 function fmtMoney(n) {
   return `$${Math.round(n || 0).toLocaleString()}`;
@@ -98,9 +99,9 @@ export default function CompanyList({ access }) {
       {isAdmin && (
         <div style={{ marginBottom: 12 }}>
           <button className="btn btn-ghost btn-sm" onClick={() => setShowImport((v) => !v)}>
-            {showImport ? "Close customer import" : "⬆ Import customers from NetSuite (CSV)"}
+            {showImport ? "Close imports" : "⬆ Import from NetSuite (CSV)"}
           </button>
-          {showImport && <div className="card" style={{ marginTop: 10 }}><NetSuiteSync /></div>}
+          {showImport && <div className="card" style={{ marginTop: 10 }}><NetSuiteSync /><ContactsImport /></div>}
         </div>
       )}
       <div className="field-row" style={{ marginBottom: 12 }}>

@@ -1,31 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api.js";
+import { parseCsv } from "../csv.js";
 
 // Admin tool (Companies tab): upload a NetSuite customer export (CSV) and link
 // or create a CRM company for each customer. Always preview first; nothing
 // changes until "Apply". Existing companies keep their segment, region and
 // flags; the import only adds the NetSuite id (and the Procore company id where
 // CRM lacks it).
-
-// --- tiny CSV reader (quotes, commas or tabs, Excel's BOM) ---------------------
-function parseCsv(text) {
-  const t = text.replace(/^﻿/, "");
-  const firstLine = t.split(/\r?\n/, 1)[0] || "";
-  const delim = (firstLine.match(/\t/g) || []).length > (firstLine.match(/,/g) || []).length ? "\t" : ",";
-  const rows = [];
-  let row = [], field = "", quoted = false;
-  for (let i = 0; i < t.length; i++) {
-    const c = t[i];
-    if (quoted) {
-      if (c === '"') { if (t[i + 1] === '"') { field += '"'; i++; } else quoted = false; } else field += c;
-    } else if (c === '"') quoted = true;
-    else if (c === delim) { row.push(field); field = ""; }
-    else if (c === "\n") { row.push(field.replace(/\r$/, "")); rows.push(row); row = []; field = ""; }
-    else field += c;
-  }
-  if (field !== "" || row.length) { row.push(field.replace(/\r$/, "")); rows.push(row); }
-  return rows.filter((r) => r.some((v) => v.trim() !== ""));
-}
 
 const squash = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 const GUESS = {

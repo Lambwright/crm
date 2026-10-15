@@ -90,6 +90,10 @@ export const api = {
   previewCompanyMerge: (keepId, mergeId) => request(`/admin/companies/merge-preview?keep=${keepId}&merge=${mergeId}`),
   mergeCompanies: (keepId, mergeId) => request(`/admin/companies/merge`, { method: "POST", body: { keep_id: keepId, merge_id: mergeId } }),
 
+  // Contacts + addresses from a NetSuite export (admin)
+  previewContactsImport: (rows) => request(`/admin/contacts-import/preview`, { method: "POST", body: { rows } }),
+  applyContactsImport: (rows) => request(`/admin/contacts-import/apply`, { method: "POST", body: { rows } }),
+
   // Procore project regions (one list, used for every region pick)
   listRegions: () => request(`/regions`),
 

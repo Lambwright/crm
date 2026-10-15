@@ -711,12 +711,40 @@ async function regionRejection(sql, next, current) {
   return json({ error: "unknown_region", detail: `"${next}" isn't one of Procore's project regions. Pick one from the list.` }, 422);
 }
 
+// Finds a company for SCOUT. Order: the NetSuite customer id (SCOUT knows it for the
+// selected client, and the customer import links every company to it), then the
+// exact name, then the same name ignoring case/punctuation/accents/spacing, then a
+// spelling that was merged away. `matched_by` says which one hit.
 async function handleCompanyLookup(url, sql) {
   const name = (url.searchParams.get("name") || "").trim();
-  if (!name) return json({ error: "name query param is required" }, 400);
-  const rows = await sql`select id, name, account_segment, hot_lead, hot_lead_weight, hot_lead_reason from companies where lower(name) = lower(${name}) limit 1`;
-  if (!rows.length) return json({ found: false });
-  return json({ found: true, company: rows[0], win_stats: await companyWinStats(sql, rows[0].id) });
+  const nsId = (url.searchParams.get("ns_id") || "").trim();
+  if (!name && !nsId) return json({ error: "name or ns_id query param is required" }, 400);
+  let company = null, matchedBy = null;
+  if (nsId) {
+    const r = await sql`select id, name, account_segment, hot_lead, hot_lead_weight, hot_lead_reason, netsuite_customer_id from companies where netsuite_customer_id = ${nsId} limit 2`;
+    if (r.length === 1) { company = r[0]; matchedBy = "netsuite_id"; }
+  }
+  if (!company && name) {
+    const r = await sql`select id, name, account_segment, hot_lead, hot_lead_weight, hot_lead_reason, netsuite_customer_id from companies where lower(name) = lower(${name}) limit 1`;
+    if (r.length) { company = r[0]; matchedBy = "name"; }
+  }
+  if (!company && name) {
+    const key = nsNorm(name);
+    if (key) {
+      const [alias] = await sql`select company_id from company_aliases where alias_norm = ${key}`;
+      if (alias) {
+        const [c] = await sql`select id, name, account_segment, hot_lead, hot_lead_weight, hot_lead_reason, netsuite_customer_id from companies where id = ${alias.company_id}`;
+        if (c) { company = c; matchedBy = "alias"; }
+      }
+      if (!company) {
+        const all = await sql`select id, name, account_segment, hot_lead, hot_lead_weight, hot_lead_reason, netsuite_customer_id from companies`;
+        const same = all.filter((c) => nsNorm(c.name) === key);
+        if (same.length === 1) { company = same[0]; matchedBy = "normalized_name"; }
+      }
+    }
+  }
+  if (!company) return json({ found: false });
+  return json({ found: true, matched_by: matchedBy, company, win_stats: await companyWinStats(sql, company.id) });
 }
 
 // All-time decided win rate for one company against the whole book, for SCOUT
@@ -1143,6 +1171,108 @@ async function handleCompanyMerge(request, url, sql, user) {
     return json({ ok: true, kept: { id: keep.id, name: keep.name }, moved: counts });
   }
   return json({ error: "not_found" }, 404);
+}
+
+// ---------------------------------------------------------------------------
+// Contacts + address import from a NetSuite export (Ben, 2026-10-16). Rows are
+// one per contact, carrying the company's NetSuite internal id and address. Each
+// company is found by netsuite_customer_id (the customer import must have run),
+// its blank address fields and vertical are filled (never overwritten), and its
+// contacts are added unless that company already has the same email (or, with
+// no email, the same first+last name). Re-running is safe.
+// ---------------------------------------------------------------------------
+const CONTACT_ADDR_FIELDS = [
+  ["address_line1", "address1"], ["address_line2", "address2"], ["city", "city"], ["province", "province"],
+  ["postal_code", "postal_code"], ["country", "country"], ["website", "website"],
+];
+const cleanStr = (v) => { const t = String(v ?? "").trim(); return t === "" || t === "0" ? null : t.slice(0, 500); };
+
+function planContactRows(rows, companiesByNs, existingByCompany) {
+  const summary = { rows: rows.length, companies_matched: 0, companies_unmatched: 0, address_updates: 0, contacts_to_add: 0, contacts_already_there: 0, rows_skipped_no_contact: 0 };
+  const unmatched = new Map();
+  const companyUpdates = new Map(); // company id -> fields
+  const newContacts = [];
+  const matchedIds = new Set();
+  const seenNew = new Set();
+  for (const r of rows) {
+    const nsId = String(r.ns_id ?? "").trim();
+    const company = companiesByNs.get(nsId);
+    if (!company) { if (nsId && !unmatched.has(nsId)) unmatched.set(nsId, r.company_name || nsId); continue; }
+    matchedIds.add(company.id);
+
+    if (!companyUpdates.has(company.id)) {
+      const upd = {};
+      for (const [col, key] of CONTACT_ADDR_FIELDS) { const v = cleanStr(r[key]); if (v && !company[col]) upd[col] = v; }
+      const cat = cleanStr(r.category);
+      if (cat && !company.vertical) upd.vertical = cat;
+      companyUpdates.set(company.id, upd);
+    }
+
+    let email = cleanStr(r.email);
+    const first = cleanStr(r.contact_first), last = cleanStr(r.contact_last);
+    let fn = first, ln = last;
+    if (!fn && !ln && cleanStr(r.contact_name)) { const parts = cleanStr(r.contact_name).split(/\s+/); fn = parts.shift(); ln = parts.join(" ") || null; }
+    if (!email && cleanStr(r.company_email) && !(fn || ln)) { email = cleanStr(r.company_email); fn = "Main contact"; }
+    email = email ? email.toLowerCase() : null;
+    if (!email && !fn && !ln) { summary.rows_skipped_no_contact++; continue; }
+
+    const have = existingByCompany.get(company.id) || { emails: new Set(), names: new Set() };
+    const nameKey = `${(fn || "").toLowerCase()}|${(ln || "").toLowerCase()}`;
+    const dedupe = `${company.id}|${email || nameKey}`;
+    if ((email && have.emails.has(email)) || (!email && have.names.has(nameKey)) || seenNew.has(dedupe)) { summary.contacts_already_there++; continue; }
+    seenNew.add(dedupe);
+    newContacts.push({ company_id: company.id, first_name: fn, last_name: ln, title: cleanStr(r.role), email, phone: cleanStr(r.phone) });
+  }
+  summary.companies_matched = matchedIds.size;
+  summary.companies_unmatched = unmatched.size;
+  summary.address_updates = [...companyUpdates.values()].filter((u) => Object.keys(u).length).length;
+  summary.contacts_to_add = newContacts.length;
+  return { summary, companyUpdates, newContacts, unmatched: [...unmatched.entries()].map(([ns_id, name]) => ({ ns_id, name })) };
+}
+
+async function loadContactContext(sql) {
+  const companies = await sql`select id, netsuite_customer_id, address_line1, address_line2, city, province, postal_code, country, website, vertical from companies where netsuite_customer_id is not null`;
+  const companiesByNs = new Map(companies.map((c) => [String(c.netsuite_customer_id), c]));
+  const contacts = await sql`select company_id, lower(email) as email, lower(coalesce(first_name,'')) as fn, lower(coalesce(last_name,'')) as ln from contacts`;
+  const existingByCompany = new Map();
+  for (const c of contacts) {
+    if (!existingByCompany.has(c.company_id)) existingByCompany.set(c.company_id, { emails: new Set(), names: new Set() });
+    const e = existingByCompany.get(c.company_id);
+    if (c.email) e.emails.add(c.email);
+    e.names.add(`${c.fn}|${c.ln}`);
+  }
+  return { companiesByNs, existingByCompany };
+}
+
+async function handleContactsImport(request, url, sql, user) {
+  if (!isCrmAdmin(user)) return forbidden("Admin access required.");
+  const body = await parseBody(request);
+  const rows = Array.isArray(body.rows) ? body.rows : null;
+  if (!rows) return json({ error: "rows[] is required" }, 400);
+  if (rows.length > 5000) return json({ error: "too_many_rows", detail: "Send at most 5000 rows per request." }, 413);
+  const { companiesByNs, existingByCompany } = await loadContactContext(sql);
+  const plan = planContactRows(rows, companiesByNs, existingByCompany);
+  if (url.pathname === "/admin/contacts-import/preview") {
+    return json({ summary: plan.summary, unmatched: plan.unmatched.slice(0, 200) });
+  }
+  // apply
+  for (const [companyId, upd] of plan.companyUpdates) {
+    const cols = Object.keys(upd);
+    if (!cols.length) continue;
+    const sets = cols.map((c, i) => `${c} = coalesce(nullif(${c}, ''), $${i + 2})`).join(", ");
+    await sql.query(`update companies set ${sets}, updated_at = now() where id = $1`, [companyId, ...cols.map((c) => upd[c])]);
+  }
+  for (let i = 0; i < plan.newContacts.length; i += 100) {
+    const chunk = plan.newContacts.slice(i, i + 100);
+    const params = [];
+    const tuples = chunk.map((c) => {
+      const base = params.length;
+      params.push(c.company_id, c.first_name, c.last_name, c.title, c.email, c.phone);
+      return `(${[1, 2, 3, 4, 5, 6].map((k) => "$" + (base + k)).join(", ")})`;
+    });
+    await sql.query(`insert into contacts (company_id, first_name, last_name, title, email, phone) values ${tuples.join(", ")}`, params);
+  }
+  return json({ summary: plan.summary, applied: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -1919,6 +2049,19 @@ SELF_MIGRATIONS.push({
     )`,
   ],
 });
+SELF_MIGRATIONS.push({
+  id: "017_company_address",
+  statements: [
+    `alter table companies add column if not exists address_line1 text`,
+    `alter table companies add column if not exists address_line2 text`,
+    `alter table companies add column if not exists city text`,
+    `alter table companies add column if not exists province text`,
+    `alter table companies add column if not exists postal_code text`,
+    `alter table companies add column if not exists country text`,
+    `alter table companies add column if not exists website text`,
+    `create index if not exists contacts_company_email_idx on contacts (company_id, lower(email))`,
+  ],
+});
 let schemaReady = null;
 function ensureSchema(sql) {
   if (!schemaReady) {
@@ -2592,6 +2735,7 @@ export default {
       if (url.pathname === "/followups" && request.method === "GET") return withRefresh(await handleFollowupsList(url, sql, auth.user));
 
       if (url.pathname === "/access" && request.method === "GET") return withRefresh(await handleAccess(env, auth.user));
+      if (url.pathname.startsWith("/admin/contacts-import") && request.method === "POST") return withRefresh(await handleContactsImport(request, url, sql, auth.user));
       if (url.pathname.startsWith("/admin/companies/merge")) return withRefresh(await handleCompanyMerge(request, url, sql, auth.user));
       if (url.pathname.startsWith("/admin/netsuite-sync")) return withRefresh(await handleNsSyncRoute(request, url, sql, env, auth.user));
       if (url.pathname === "/regions" && request.method === "GET") return withRefresh(await handleRegionsList(env, sql));
