@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api.js";
 import RegionSelect from "./RegionSelect.jsx";
+import PaymentHistory from "./PaymentHistory.jsx";
 import { ACCOUNT_SEGMENT_LABELS, ACCOUNT_SEGMENTS, STAGE_LABELS } from "../stages.js";
 
 const BLACKLIST = ["do_not_pursue", "do_not_work_with"];
@@ -112,6 +113,8 @@ export default function CompanyDetail({ id, onClose, onChanged, canHotLead = tru
             </div>
           )}
         </div>
+
+        <div style={{ marginTop: 12 }}><PaymentHistory payment={data.payment} /></div>
 
         <div className="card-title" style={{ marginTop: 16 }}>Contacts ({contacts.length})</div>
         <div className="row-list" style={{ marginBottom: 16 }}>

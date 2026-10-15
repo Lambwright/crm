@@ -750,12 +750,71 @@ async function handleCompanyCreate(request, sql) {
   return json({ company }, 201);
 }
 
+// ---------------------------------------------------------------------------
+// Customer payment scores — POST /internal/payment-scores (Ben, 2026-10-16).
+// netsuite-worker computes the score once and pushes the finished values here,
+// right after it writes the custentity_scout_pay* NetSuite fields. CRM stores
+// and displays them as received; null means "not enough history" and stays
+// null. Auth: X-CRM-Payscore-Key against the CRM_PAYSCORE_KEY secret — its own
+// key, deliberately not the SCOUT intake key (that one is visible in SCOUT's page).
+// Matching: companies.netsuite_customer_id = customer_id first; otherwise a
+// case-insensitive exact name match, only when exactly one company has that
+// name. Name matches are stored but never write netsuite_customer_id (that id
+// also drives the hot-lead mirror into NetSuite, so a wrong guess must not
+// stick). Unmatched items are reported, never created as companies.
+// ---------------------------------------------------------------------------
+function isPayscoreCaller(request, env) {
+  const key = request.headers.get("X-CRM-Payscore-Key");
+  return Boolean(key) && Boolean(env.CRM_PAYSCORE_KEY) && key === env.CRM_PAYSCORE_KEY;
+}
+
+async function handlePaymentScoresPush(request, sql) {
+  const body = await parseBody(request);
+  const items = Array.isArray(body.items) ? body.items : null;
+  if (!items) return json({ error: "items[] is required" }, 400);
+  if (items.length > 500) return json({ error: "too_many_items", detail: "Send at most 500 items per request." }, 413);
+  const numOrNull = (v) => (v === null || v === undefined || v === "" || Number.isNaN(Number(v)) ? null : Number(v));
+  const out = { received: items.length, matched: 0, matched_by_id: 0, matched_by_name: 0, unmatched: [], invalid: [], ambiguous: [] };
+  for (const it of items) {
+    if (!it || (it.customer_id == null && !it.name)) { out.invalid.push({ item: it, reason: "customer_id or name is required" }); continue; }
+    const customerId = it.customer_id != null ? String(it.customer_id) : null;
+    let companyId = null, how = null;
+    if (customerId) {
+      const byId = await sql`select id from companies where netsuite_customer_id = ${customerId}`;
+      if (byId.length === 1) { companyId = byId[0].id; how = "id"; }
+      else if (byId.length > 1) { out.ambiguous.push({ customer_id: customerId, name: it.name || null, reason: "more than one company has this NetSuite id" }); continue; }
+    }
+    if (!companyId && it.name) {
+      const byName = await sql`select id from companies where lower(trim(name)) = lower(trim(${String(it.name)}))`;
+      if (byName.length === 1) { companyId = byName[0].id; how = "name"; }
+      else if (byName.length > 1) { out.ambiguous.push({ customer_id: customerId, name: it.name, reason: "more than one company has this name" }); continue; }
+    }
+    if (!companyId) { out.unmatched.push({ customer_id: customerId, name: it.name || null }); continue; }
+    await sql`
+      insert into company_payment_scores (company_id, ns_customer_id, ns_name, status, score, score_18m, score_6m, judged_invoices,
+        avg_days_past_terms_18m, avg_days_past_terms_6m, late_pct, credit_pct, credit_memos_per_invoice, overdue_days, calc_date, received_at)
+      values (${companyId}, ${customerId}, ${it.name || null}, ${it.status || null}, ${numOrNull(it.score)}, ${numOrNull(it.score_18m)}, ${numOrNull(it.score_6m)},
+        ${numOrNull(it.judged_invoices)}, ${numOrNull(it.avg_days_past_terms_18m)}, ${numOrNull(it.avg_days_past_terms_6m)}, ${numOrNull(it.late_pct)},
+        ${numOrNull(it.credit_pct)}, ${numOrNull(it.credit_memos_per_invoice)}, ${numOrNull(it.overdue_days)}, ${it.calc_date ? String(it.calc_date) : null}, now())
+      on conflict (company_id) do update set
+        ns_customer_id = excluded.ns_customer_id, ns_name = excluded.ns_name, status = excluded.status, score = excluded.score,
+        score_18m = excluded.score_18m, score_6m = excluded.score_6m, judged_invoices = excluded.judged_invoices,
+        avg_days_past_terms_18m = excluded.avg_days_past_terms_18m, avg_days_past_terms_6m = excluded.avg_days_past_terms_6m,
+        late_pct = excluded.late_pct, credit_pct = excluded.credit_pct, credit_memos_per_invoice = excluded.credit_memos_per_invoice,
+        overdue_days = excluded.overdue_days, calc_date = excluded.calc_date, received_at = now()`;
+    out.matched++;
+    if (how === "id") out.matched_by_id++; else out.matched_by_name++;
+  }
+  return json(out);
+}
+
 async function handleCompanyDetail(id, sql) {
   const rows = await sql`select * from companies where id = ${id}`;
   if (!rows.length) return json({ error: "not_found" }, 404);
+  const payment = (await sql`select * from company_payment_scores where company_id = ${id}`)[0] || null;
   const contacts = await sql`select * from contacts where company_id = ${id} order by created_at`;
   const bids = await sql`select id, rfq_ref, project_name, stage, qualification_result, estimated_value, submitted_value, final_value, bid_due_date, created_at from bids where company_id = ${id} order by created_at desc`;
-  return json({ company: rows[0], contacts, bids });
+  return json({ company: rows[0], contacts, bids, payment });
 }
 
 const COMPANY_PATCHABLE = ["account_segment", "region", "vertical", "tier", "notes", "hot_lead", "hot_lead_weight", "hot_lead_reason", "netsuite_customer_id"];
@@ -1347,6 +1406,29 @@ SELF_MIGRATIONS.push({
     `alter table bids add column if not exists disqualifiers jsonb not null default '[]'::jsonb`,
   ],
 });
+SELF_MIGRATIONS.push({
+  // Customer payment scores pushed by netsuite-worker (computed there, once).
+  // CRM only stores and shows what it receives — it never recomputes a score.
+  id: "013_company_payment_scores",
+  statements: [`create table if not exists company_payment_scores (
+    company_id uuid primary key references companies(id) on delete cascade,
+    ns_customer_id text,
+    ns_name text,
+    status text,
+    score numeric,
+    score_18m numeric,
+    score_6m numeric,
+    judged_invoices integer,
+    avg_days_past_terms_18m numeric,
+    avg_days_past_terms_6m numeric,
+    late_pct numeric,
+    credit_pct numeric,
+    credit_memos_per_invoice numeric,
+    overdue_days numeric,
+    calc_date text,
+    received_at timestamptz not null default now()
+  )`],
+});
 let schemaReady = null;
 function ensureSchema(sql) {
   if (!schemaReady) {
@@ -1769,6 +1851,10 @@ export default {
           if (!auth.ok) return json({ error: "unauthorized", reason: auth.reason }, 401);
         }
         return await handleCompanyLookup(url, sql);
+      }
+      if (url.pathname === "/internal/payment-scores" && request.method === "POST") {
+        if (!isPayscoreCaller(request, env)) return json({ error: "unauthorized" }, 401);
+        return await handlePaymentScoresPush(request, sql);
       }
       if (url.pathname === "/internal/procore-sync" && request.method === "POST") {
         if (!isSyncCaller(request, env)) return json({ error: "unauthorized" }, 401);

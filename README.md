@@ -138,34 +138,20 @@ happen while the bid was still live. Migration 009 is applied by the worker itse
 (`ensureSchema`) on first run after deploy. If a Procore report with real status dates is
 ever produced, import it into `decided_at`.
 
-## Planned / on deck: customer payment scores (from SCOUT)
+## Customer payment scores (pushed from NetSuite, built 2026-10-16)
 
-Nothing to build yet. Noted 2026-10-15 at Ben's request, relayed by the SCOUT session.
+netsuite-worker computes each customer's payment score once, writes the
+`custentity_scout_pay*` NetSuite fields, and then POSTs the same finished values
+to CRM. **CRM never recomputes a score** — it stores what it receives and shows it
+in a collapsed "Payment history" group on the company record. Display only; nothing
+in CRM's scoring or follow-up logic reads it.
 
-SCOUT is getting an automatic customer payment score, and Ben wants those values
-shown in CRM later (most likely on the company page, and next to the client in
-SCOUT's own win-history line). A Cloudflare worker will compute the facts monthly
-and write them onto these NetSuite Customer fields:
-
-| Field | Meaning |
-|---|---|
-| `custentity_scout_payment_score` | 0-10 score; left blank when there is too little history |
-| `custentity_scout_pay_avg_days_18m` | average days to pay, last 18 months |
-| `custentity_scout_pay_avg_days_6m` | average days to pay, last 6 months |
-| `custentity_scout_pay_invoices` | number of invoices judged |
-| `custentity_scout_pay_late_pct` | share of invoices paid late |
-| `custentity_scout_pay_credit_pct` | share of invoices with credits |
-| `custentity_scout_pay_credit_freq` | how often credits occur |
-| `custentity_scout_pay_overdue_days` | days currently overdue |
-| `custentity_scout_pay_calc_date` | when it was last calculated |
-| `custentity_scout_pay_status` | "Limited history" or "No history" when fewer than 3 judged invoices |
-
-Rules to keep when this is built:
-- Only these derived numbers are ever shown in CRM, never dollar A/R.
-- The score is blank (not zero) when status is "Limited history" or "No history"; show the status text instead.
-- The SCOUT session will say when the on-demand endpoint URL and response shape exist. CRM should prefer reading those (live, through the NETSUITE_WORKER binding or that endpoint) over copying the values into its own tables.
-- **Endpoint now live (2026-10-15, per the SCOUT session).** `POST https://netsuite.ben-a90.workers.dev` with the usual netsuite-worker auth (Einbau ID bearer token with SCOUT or INTAKE access, or the `X-NetSuite-Service-Key` header for server callers). Body `{"action":"payscore","customer_id":"<NetSuite customer internal id>"}` returns `{ok, result:{customer_id, status ("Scored"|"Limited history"|"No history"), score (0-10 or null), score_18m, score_6m, judged_invoices, avg_days_past_terms_18m, avg_days_past_terms_6m, late_pct, credit_pct, credit_memos_per_invoice, overdue_days, calc_date}}`. It is computed live from NetSuite on every call, so no stored fields are needed. `{"action":"payscore_all"}` returns every customer with invoices (about 115 today). The same values will also be written monthly onto the `custentity_scout_pay*` fields; those writes are still switched off.
-- **Reading the score:** GOOD 7-10, AVERAGE 4-6, POOR 0-3, "Limited history" / "No history" = unknown. Same mapping SCOUT uses for its Payment record answer. CRM needs the company's `netsuite_customer_id` to call it.
+- **Endpoint:** `POST /internal/payment-scores`, header `X-CRM-Payscore-Key` = the `CRM_PAYSCORE_KEY` secret (its own key; not the SCOUT intake key, which is visible in SCOUT's page). Must be set on both crm-worker and netsuite-worker.
+- **Body:** `{"items":[{customer_id, name, status, score, score_18m, score_6m, judged_invoices, avg_days_past_terms_18m, avg_days_past_terms_6m, late_pct, credit_pct, credit_memos_per_invoice, overdue_days, calc_date}]}`, up to 500 items per request. `score` null = not enough history and is stored as null, never 0. Percentages are stored and shown as sent (send 0-100 numbers).
+- **Matching:** `companies.netsuite_customer_id = customer_id` first; otherwise a case-insensitive exact name match, only when exactly one company has that name. A name match never writes `netsuite_customer_id` (that id also drives the hot-lead mirror to NetSuite). Companies are never created from this feed.
+- **Response (200):** `{received, matched, matched_by_id, matched_by_name, unmatched:[{customer_id,name}], ambiguous:[...], invalid:[...]}`. 401 on a bad key, 400 without `items`, 413 over 500 items.
+- **Reading bands** (display helper only, same as SCOUT's Payment record answer): 7-10 Good, 4-6 Average, 0-3 Poor, null = unknown.
+- **Reading it live** instead (not needed now): `POST https://netsuite.ben-a90.workers.dev {"action":"payscore","customer_id":"<id>"}`, or `{"action":"payscore_all"}`.
 
 ## On hold: backlog / resource forecast
 
