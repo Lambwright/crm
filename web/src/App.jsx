@@ -7,6 +7,7 @@ import BidBoard from "./components/BidBoard.jsx";
 import CompanyList from "./components/CompanyList.jsx";
 import Dashboard from "./components/Dashboard.jsx";
 import Followups from "./components/Followups.jsx";
+import Access from "./components/Access.jsx";
 
 // "PM" here is CRM's assignable-users list (HELM → CRM Options), not a real
 // role — anyone on it gets Follow-ups first in the nav, since they're the
@@ -18,16 +19,30 @@ const BASE_TABS = [
   { key: "companies", label: "Companies" },
 ];
 
+// A PM sees the Dashboard and the follow-ups assigned to them, nothing else
+// (Ben, 2026-10-07). Admins also get the Access tab (extra permissions, and the
+// NetSuite customer sync), in either role mode. The server enforces all of
+// this; here it only decides which tabs to draw.
+function visibleTabs(access) {
+  let tabs = BASE_TABS;
+  if (access && access.can && access.can.all_bids === false) {
+    tabs = tabs.filter((t) => t.key === "dashboard" || t.key === "followups");
+  }
+  if (access && access.can && access.can.admin) tabs = [...tabs, { key: "access", label: "Access" }];
+  return tabs;
+}
+
 // Who gets Follow-ups first. Live (role matrix): the people who actually work
 // follow-ups — estimators and PMs; admins keep the default order. Legacy (CRM
 // not switched yet): unchanged — anyone on the HELM assignable-users list.
 function tabsFor(username, access, assignableUsernames) {
+  const base = visibleTabs(access);
   const leadsWithFollowups = access && access.mode === "live"
     ? access.level === "estimator" || access.level === "pm"
     : (assignableUsernames || []).some((u) => u.username === username);
-  if (!leadsWithFollowups) return BASE_TABS;
-  const followups = BASE_TABS.find((t) => t.key === "followups");
-  return [followups, ...BASE_TABS.filter((t) => t.key !== "followups")];
+  if (!leadsWithFollowups) return base;
+  const followups = base.find((t) => t.key === "followups");
+  return followups ? [followups, ...base.filter((t) => t.key !== "followups")] : base;
 }
 
 export default function App() {
@@ -122,6 +137,7 @@ export default function App() {
         {tab === "followups" && <Followups user={user} access={access} assignableUsers={assignableUsers} onNotificationsChanged={refreshNotificationCount} />}
         {tab === "companies" && <CompanyList access={access} />}
         {tab === "dashboard" && <Dashboard />}
+        {tab === "access" && <Access />}
         {tab === "access" && <Access />}
       </div>
     </>
