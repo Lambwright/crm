@@ -94,6 +94,16 @@ export const api = {
   previewContactsImport: (rows) => request(`/admin/contacts-import/preview`, { method: "POST", body: { rows } }),
   applyContactsImport: (rows) => request(`/admin/contacts-import/apply`, { method: "POST", body: { rows } }),
 
+  // SCOUT prequalification stats, and the admin history import
+  getScoutStats: (range, from, to) => {
+    const q = new URLSearchParams();
+    if (range) q.set("range", range);
+    if (range === "custom") { if (from) q.set("from", from); if (to) q.set("to", to); }
+    return request(`/scout/stats?${q}`);
+  },
+  previewScoutImport: (rows) => request(`/admin/scout-import/preview`, { method: "POST", body: { rows } }),
+  applyScoutImport: (rows) => request(`/admin/scout-import/apply`, { method: "POST", body: { rows } }),
+
   // Procore project regions (one list, used for every region pick)
   listRegions: () => request(`/regions`),
 

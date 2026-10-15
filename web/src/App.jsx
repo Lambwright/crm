@@ -7,6 +7,7 @@ import BidBoard from "./components/BidBoard.jsx";
 import CompanyList from "./components/CompanyList.jsx";
 import Dashboard from "./components/Dashboard.jsx";
 import Followups from "./components/Followups.jsx";
+import ScoutStats from "./components/ScoutStats.jsx";
 
 // "PM" here is CRM's assignable-users list (HELM → CRM Options), not a real
 // role — anyone on it gets Follow-ups first in the nav, since they're the
@@ -16,6 +17,7 @@ const BASE_TABS = [
   { key: "pipeline", label: "Pipeline" },
   { key: "followups", label: "Follow-ups" },
   { key: "companies", label: "Companies" },
+  { key: "scout", label: "SCOUT" },
 ];
 
 // A PM sees the Dashboard and the follow-ups assigned to them, nothing else
@@ -23,7 +25,7 @@ const BASE_TABS = [
 function visibleTabs(access) {
   let tabs = BASE_TABS;
   if (access && access.can && access.can.all_bids === false) {
-    tabs = tabs.filter((t) => t.key === "dashboard" || t.key === "followups");
+    tabs = tabs.filter((t) => t.key === "dashboard" || t.key === "followups" || t.key === "scout");
   }
   return tabs;
 }
@@ -133,6 +135,7 @@ export default function App() {
         {tab === "followups" && <Followups user={user} access={access} assignableUsers={assignableUsers} onNotificationsChanged={refreshNotificationCount} />}
         {tab === "companies" && <CompanyList access={access} />}
         {tab === "dashboard" && <Dashboard />}
+        {tab === "scout" && <ScoutStats access={access} />}
       </div>
     </>
   );

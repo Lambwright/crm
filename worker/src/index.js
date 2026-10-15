@@ -1276,6 +1276,210 @@ async function handleContactsImport(request, url, sql, user) {
 }
 
 // ---------------------------------------------------------------------------
+// SCOUT stats (Ben, 2026-10-16). The prequalification program started 2026-06-08
+// with a scoring spreadsheet; SCOUT's app took over in late July. Both are
+// "prequalified" and are not split in the numbers. Everything is computed from
+// scout_runs (every push, plus imported history) and bids. A "unique bid" is the
+// latest run per company+project (same name ignoring case/punctuation/accents),
+// so re-runs and test repeats count once.
+// ---------------------------------------------------------------------------
+const PREQUAL_START = "2026-06-08";
+const normTier = (t) => {
+  const v = String(t || "").trim().toLowerCase();
+  if (v === "a" || v === "tier a") return "A";
+  if (v === "b" || v === "tier b") return "B";
+  if (v === "c" || v === "tier c") return "C";
+  if (v === "no bid" || v === "no_bid" || v === "disqualified" || v === "nobid") return "No bid";
+  return null;
+};
+const runKey = (r) => `${nsNorm(r.client)}|${nsNorm(r.project_name)}`;
+const weekStart = (d) => {
+  const t = new Date(d);
+  const day = (t.getUTCDay() + 6) % 7; // Monday = 0
+  t.setUTCDate(t.getUTCDate() - day);
+  return t.toISOString().slice(0, 10);
+};
+
+async function handleScoutStats(url, sql) {
+  const range = url.searchParams.get("range") || "all";
+  const bounds = rangeBounds(range, { from: url.searchParams.get("from"), to: url.searchParams.get("to") });
+  const startMs = bounds.start.getTime(), endMs = bounds.end.getTime();
+
+  const runs = await sql`select id, bid_id, source, outcome, submitted_at, received_at, client, project_name, tier, total_score, disqualifiers, override_reason, override_approver, push_to_bid
+    from scout_runs where not excluded`;
+  const bids = await sql`select id, project_name, stage, created_at, final_value, estimated_value, procore_project_id, source_archived, (decided_at is not null) as decision_recorded from bids`;
+  const bidById = new Map(bids.map((b) => [b.id, b]));
+  const bidsByProject = new Map();
+  for (const b of bids.sort((x, y) => new Date(x.created_at) - new Date(y.created_at))) bidsByProject.set(nsNorm(b.project_name), b);
+
+  // Latest run per unique bid.
+  const latest = new Map();
+  for (const r of runs) {
+    const at = new Date(r.submitted_at || r.received_at).getTime();
+    const k = runKey(r);
+    if (!k.replace("|", "")) continue;
+    const cur = latest.get(k);
+    if (!cur || at >= cur.at) latest.set(k, { ...r, at });
+  }
+  const all = [...latest.values()];
+  const scoutBidIds = new Set();
+  for (const u of all) {
+    const b = (u.bid_id && bidById.get(u.bid_id)) || bidsByProject.get(nsNorm(u.project_name)) || null;
+    u.bid = b;
+    if (b) scoutBidIds.add(b.id);
+  }
+
+  // ---- Section A: activity in the period (by when SCOUT ran) -------------------
+  const inPeriod = all.filter((u) => u.at >= startMs && u.at < endMs);
+  const tiers = { A: 0, B: 0, C: 0, "No bid": 0, untiered: 0 };
+  let overrides = 0, declinedScore = 0, declinedDisq = 0, declinedPerson = 0, declinedOther = 0, submitted = 0;
+  const byTier = {}; // outcomes by tier for submitted bids that have a bid record
+  const monthly = new Map();
+  const weekly = new Map();
+  let won = 0, lost = 0, open = 0, becameProject = 0, wonValue = 0, wonEstimate = 0, noRecord = 0;
+  for (const u of inPeriod) {
+    const tier = normTier(u.tier) || "untiered";
+    tiers[tier] = (tiers[tier] || 0) + 1;
+    const disq = Array.isArray(u.disqualifiers) ? u.disqualifiers.length : 0;
+    const declined = String(u.outcome || "").toLowerCase() === "declined";
+    const unknownOutcome = String(u.outcome || "").toLowerCase() === "unknown"; // scored on the sheet, no decision recorded
+    const isOverride = !declined && !unknownOutcome && tier === "No bid";
+    const month = new Date(u.at).toISOString().slice(0, 7);
+    const m = monthly.get(month) || { month, bids: 0, overrides: 0, declined_score: 0, declined_disqualifier: 0, declined_person: 0 };
+    m.bids++;
+    const wk = weekStart(u.at);
+    const w = weekly.get(wk) || { week: wk, A: 0, B: 0, C: 0, "No bid": 0, untiered: 0 };
+    w[tier] = (w[tier] || 0) + 1;
+    weekly.set(wk, w);
+    if (isOverride) { overrides++; m.overrides++; }
+    if (declined) {
+      if (disq > 0) { declinedDisq++; m.declined_disqualifier++; }
+      else if (tier === "No bid") { declinedScore++; m.declined_score++; }
+      else if (tier === "untiered") declinedOther++;
+      else { declinedPerson++; m.declined_person++; }
+    } else if (!unknownOutcome) submitted++;
+    monthly.set(month, m);
+
+    if (!declined && !unknownOutcome) {
+      const b = u.bid;
+      const t = (byTier[tier] ||= { tier, submitted: 0, won: 0, lost: 0, open: 0, no_record: 0 });
+      t.submitted++;
+      if (!b) { t.no_record++; noRecord++; continue; }
+      if (b.stage === "complete") {
+        t.won++; won++;
+        wonEstimate += Number(b.estimated_value || 0);
+        wonValue += Number(b.final_value ?? b.estimated_value ?? 0);
+        if (b.procore_project_id) becameProject++;
+      } else if (b.stage === "lost") { t.lost++; lost++; }
+      else if (b.stage === "no_bid") { /* declined after the fact: not open, not decided */ }
+      else { t.open++; open++; }
+    }
+  }
+
+  // ---- Section B: cohorts by when the bid arrived (not period-filtered) ---------
+  const startCut = new Date(PREQUAL_START + "T00:00:00Z").getTime();
+  const MIDLATE = ["bid_submitted", "accepted", "in_progress", "to_do", "delayed"];
+  const blank = () => ({ created: 0, complete: 0, lost: 0, midlate: 0, complete_value: 0, lost_value: 0, midlate_value: 0, est_sum: 0, est_n: 0, won_sum: 0, won_n: 0 });
+  const cohorts = { before: blank(), after_all: blank(), after_scout: blank(), after_other: blank() };
+  const addTo = (c, b) => {
+    c.created++;
+    const est = b.estimated_value == null ? null : Number(b.estimated_value);
+    if (est != null) { c.est_sum += est; c.est_n++; }
+    if (b.stage === "complete") {
+      const v = b.final_value != null ? Number(b.final_value) : est;
+      c.complete++; c.complete_value += v || 0;
+      if (v != null) { c.won_sum += v; c.won_n++; }
+    } else if (b.stage === "lost") { c.lost++; c.lost_value += est || 0; }
+    else if (MIDLATE.includes(b.stage)) { c.midlate++; c.midlate_value += est || 0; }
+  };
+  for (const b of bids) {
+    if (b.source_archived && !b.decision_recorded) continue;
+    const t = new Date(b.created_at).getTime();
+    if (t < startCut) addTo(cohorts.before, b);
+    else {
+      addTo(cohorts.after_all, b);
+      addTo(scoutBidIds.has(b.id) ? cohorts.after_scout : cohorts.after_other, b);
+    }
+  }
+
+  const sinceDates = all.map((u) => u.at).sort((a, b) => a - b);
+  return json({
+    period: { key: range, start: bounds.start.toISOString(), end: bounds.end.getUTCFullYear() >= 9999 ? null : bounds.end.toISOString() },
+    prequal_start: PREQUAL_START,
+    first_run: sinceDates.length ? new Date(sinceDates[0]).toISOString() : null,
+    unique_bids: inPeriod.length,
+    total_runs: runs.length,
+    tiers,
+    submitted,
+    overrides,
+    declined: { total: declinedScore + declinedDisq + declinedPerson + declinedOther, by_score: declinedScore, by_disqualifier: declinedDisq, by_person: declinedPerson, other: declinedOther },
+    outcomes: { won, lost, open, no_record: noRecord, became_project: becameProject, won_value: wonValue, won_estimate: wonEstimate },
+    by_tier: ["A", "B", "C", "No bid", "untiered"].map((t) => byTier[t]).filter(Boolean),
+    weekly: [...weekly.values()].sort((a, b) => a.week.localeCompare(b.week)),
+    monthly: [...monthly.values()].sort((a, b) => a.month.localeCompare(b.month)),
+    cohorts,
+  });
+}
+
+// ---- history import (Excel log + the earlier scoring sheet) -------------------------------
+// Rows come from a normalized CSV: source, ext_id, run_at, client, project_name, tier,
+// total_score, outcome, push_to_bid, disqualifiers (semicolon list), override_reason,
+// override_approver, estimator, notes, risks, copilot_summary, bid_due_date.
+// Idempotent by source+ext_id; rows whose company isn't in CRM are still kept (the
+// numbers don't need a company), just reported.
+async function handleScoutImport(request, url, sql, user) {
+  if (!isCrmAdmin(user)) return forbidden("Admin access required.");
+  const body = await parseBody(request);
+  const rows = Array.isArray(body.rows) ? body.rows : null;
+  if (!rows) return json({ error: "rows[] is required" }, 400);
+  if (rows.length > 600) return json({ error: "too_many_rows", detail: "Send at most 600 rows per request." }, 413);
+  const companies = await sql`select id, name from companies`;
+  const aliases = await sql`select alias_norm, company_id from company_aliases`;
+  const byNorm = new Map();
+  for (const c of companies) { const k = nsNorm(c.name); byNorm.set(k, byNorm.has(k) ? null : c.id); }
+  for (const a of aliases) if (!byNorm.has(a.alias_norm)) byNorm.set(a.alias_norm, a.company_id);
+  const existing = new Set((await sql`select ext_key from scout_runs where ext_key is not null`).map((r) => r.ext_key));
+
+  const summary = { rows: rows.length, new: 0, already_imported: 0, company_in_crm: 0, company_not_in_crm: 0, invalid: 0 };
+  const toInsert = [];
+  const seen = new Set();
+  for (const r of rows) {
+    const source = String(r.source || "").trim();
+    const extId = String(r.ext_id || "").trim();
+    const runAt = r.run_at && !Number.isNaN(new Date(r.run_at).getTime()) ? new Date(r.run_at).toISOString() : null;
+    if (!source || !extId || !runAt || !String(r.client || "").trim()) { summary.invalid++; continue; }
+    const key = `${source}:${extId}`;
+    if (existing.has(key) || seen.has(key)) { summary.already_imported++; continue; }
+    seen.add(key);
+    summary.new++;
+    if (byNorm.get(nsNorm(r.client))) summary.company_in_crm++; else summary.company_not_in_crm++;
+    toInsert.push({ key, source, runAt, r });
+  }
+  if (url.pathname === "/admin/scout-import/preview") return json({ summary });
+
+  for (let i = 0; i < toInsert.length; i += 50) {
+    const chunk = toInsert.slice(i, i + 50);
+    const params = [];
+    const tuples = chunk.map(({ key, source, runAt, r }) => {
+      const base = params.length;
+      const disq = String(r.disqualifiers || "").split(/;/).map((x) => x.trim()).filter(Boolean);
+      const score = r.total_score === "" || r.total_score == null || Number.isNaN(Number(r.total_score)) ? null : Number(r.total_score);
+      const push = /^bid$/i.test(String(r.push_to_bid || "").trim()) ? true : /^no bid$/i.test(String(r.push_to_bid || "").trim()) ? false : null;
+      const outcome = /declin/i.test(String(r.outcome || "")) ? "declined" : /unknown/i.test(String(r.outcome || "")) ? "unknown" : "submitted";
+      params.push(key, "import:" + source, outcome, runAt, String(r.client).trim(), String(r.project_name || "").trim() || null, String(r.tier || "").trim() || null, score,
+        JSON.stringify(disq), String(r.override_reason || "").trim() || null, String(r.override_approver || "").trim() || null, String(r.estimator || "").trim() || null,
+        String(r.notes || "").trim() || null, String(r.risks || "").trim() || null, String(r.copilot_summary || "").trim() || null, push, JSON.stringify(r));
+      return "(" + Array.from({ length: 17 }, (_, k) => "$" + (base + k + 1)).join(", ") + ")";
+    });
+    await sql.query(
+      "insert into scout_runs (ext_key, source, outcome, submitted_at, client, project_name, tier, total_score, disqualifiers, override_reason, override_approver, estimator, notes, risks, copilot_summary, push_to_bid, payload) values " + tuples.join(", "),
+      params
+    );
+  }
+  return json({ summary, applied: true });
+}
+
+// ---------------------------------------------------------------------------
 // Customer payment scores — POST /internal/payment-scores (Ben, 2026-10-16).
 // netsuite-worker computes the score once and pushes the finished values here,
 // right after it writes the custentity_scout_pay* NetSuite fields. CRM stores
@@ -2062,6 +2266,14 @@ SELF_MIGRATIONS.push({
     `create index if not exists contacts_company_email_idx on contacts (company_id, lower(email))`,
   ],
 });
+SELF_MIGRATIONS.push({
+  id: "018_scout_runs_import",
+  statements: [
+    `alter table scout_runs add column if not exists ext_key text`,
+    `alter table scout_runs add column if not exists excluded boolean not null default false`,
+    `create unique index if not exists scout_runs_ext_key_idx on scout_runs (ext_key) where ext_key is not null`,
+  ],
+});
 let schemaReady = null;
 function ensureSchema(sql) {
   if (!schemaReady) {
@@ -2735,6 +2947,8 @@ export default {
       if (url.pathname === "/followups" && request.method === "GET") return withRefresh(await handleFollowupsList(url, sql, auth.user));
 
       if (url.pathname === "/access" && request.method === "GET") return withRefresh(await handleAccess(env, auth.user));
+      if (url.pathname === "/scout/stats" && request.method === "GET") return withRefresh(await handleScoutStats(url, sql));
+      if (url.pathname.startsWith("/admin/scout-import") && request.method === "POST") return withRefresh(await handleScoutImport(request, url, sql, auth.user));
       if (url.pathname.startsWith("/admin/contacts-import") && request.method === "POST") return withRefresh(await handleContactsImport(request, url, sql, auth.user));
       if (url.pathname.startsWith("/admin/companies/merge")) return withRefresh(await handleCompanyMerge(request, url, sql, auth.user));
       if (url.pathname.startsWith("/admin/netsuite-sync")) return withRefresh(await handleNsSyncRoute(request, url, sql, env, auth.user));
