@@ -483,6 +483,17 @@ async function findOrCreateCompany(sql, { name, procore_vendor_id }) {
   if (!name || !name.trim()) throw new Error("company name is required");
   const existing = await sql`select * from companies where lower(name) = lower(${name.trim()}) limit 1`;
   if (existing.length) return existing[0];
+  // The same name ignoring case, spacing, punctuation and accents ("Structure
+  // Corp." / "Structure Corp", "Hermès" / "Hermes"), or a spelling that was
+  // merged into a company earlier. Only when it points at exactly one company.
+  const key = nsNorm(name);
+  if (key) {
+    const [alias] = await sql`select company_id from company_aliases where alias_norm = ${key}`;
+    if (alias) { const [c] = await sql`select * from companies where id = ${alias.company_id}`; if (c) return c; }
+    const all = await sql`select * from companies`;
+    const same = all.filter((c) => nsNorm(c.name) === key);
+    if (same.length === 1) return same[0];
+  }
   const [created] = await sql`
     insert into companies (name, procore_vendor_id)
     values (${name.trim()}, ${procore_vendor_id || null})
@@ -1051,6 +1062,85 @@ async function handleNsSyncRoute(request, url, sql, env, user) {
   if (path === "/admin/netsuite-sync/auto" && request.method === "POST") {
     await kvSet(sql, "ns_sync_auto", Boolean(body.enabled));
     return json({ auto: Boolean(body.enabled) });
+  }
+  return json({ error: "not_found" }, 404);
+}
+
+// ---------------------------------------------------------------------------
+// Merge two companies (Ben, 2026-10-16): the duplicate's bids, contacts, emails,
+// notifications and payment score move to the company that is kept, blank
+// fields are filled from the duplicate, the duplicate's name is remembered as an
+// alias, and the duplicate is deleted. A blacklist designation on either one
+// survives. Refuses when the two are linked to different NetSuite customers.
+// ---------------------------------------------------------------------------
+async function mergeCounts(sql, mergeId) {
+  const [b] = await sql`select count(*)::int as n from bids where company_id = ${mergeId}`;
+  const [c] = await sql`select count(*)::int as n from contacts where company_id = ${mergeId}`;
+  const [e] = await sql`select count(*)::int as n from bid_emails where company_id = ${mergeId}`;
+  return { bids: b.n, contacts: c.n, emails: e.n };
+}
+
+async function companyMergePlan(sql, keepId, mergeId) {
+  if (!keepId || !mergeId) return { error: json({ error: "keep_id and merge_id are required" }, 400) };
+  if (keepId === mergeId) return { error: json({ error: "same_company", detail: "Pick two different companies." }, 400) };
+  const [keep] = await sql`select * from companies where id = ${keepId}`;
+  const [dupe] = await sql`select * from companies where id = ${mergeId}`;
+  if (!keep || !dupe) return { error: json({ error: "not_found" }, 404) };
+  if (keep.netsuite_customer_id && dupe.netsuite_customer_id && String(keep.netsuite_customer_id) !== String(dupe.netsuite_customer_id)) {
+    return { error: json({ error: "different_netsuite_customers", detail: `These are linked to different NetSuite customers (${keep.netsuite_customer_id} and ${dupe.netsuite_customer_id}), so they are separate companies.` }, 409) };
+  }
+  return { keep, dupe, counts: await mergeCounts(sql, mergeId) };
+}
+
+async function handleCompanyMerge(request, url, sql, user) {
+  if (!isCrmAdmin(user)) return forbidden("Admin access required.");
+  if (url.pathname === "/admin/companies/merge-preview" && request.method === "GET") {
+    const plan = await companyMergePlan(sql, url.searchParams.get("keep"), url.searchParams.get("merge"));
+    if (plan.error) return plan.error;
+    return json({ keep: { id: plan.keep.id, name: plan.keep.name }, merge: { id: plan.dupe.id, name: plan.dupe.name }, moves: plan.counts });
+  }
+  if (url.pathname === "/admin/companies/merge" && request.method === "POST") {
+    const body = await parseBody(request);
+    const plan = await companyMergePlan(sql, body.keep_id, body.merge_id);
+    if (plan.error) return plan.error;
+    const { keep, dupe, counts } = plan;
+
+    await sql`update bids set company_id = ${keep.id} where company_id = ${dupe.id}`;
+    await sql`update contacts set company_id = ${keep.id} where company_id = ${dupe.id}`;
+    await sql`update bid_emails set company_id = ${keep.id} where company_id = ${dupe.id}`;
+    await sql`update notifications set company_id = ${keep.id} where company_id = ${dupe.id}`;
+    // One payment score per company: the survivor's own wins; otherwise take the duplicate's.
+    const keepHasScore = (await sql`select 1 from company_payment_scores where company_id = ${keep.id}`).length > 0;
+    if (!keepHasScore) await sql`update company_payment_scores set company_id = ${keep.id} where company_id = ${dupe.id}`;
+
+    const blacklisted = [keep.account_segment, dupe.account_segment].find((x) => BLACKLIST_SEGMENTS.includes(x));
+    const segment = blacklisted || (keep.account_segment === "unreviewed" ? dupe.account_segment : keep.account_segment);
+    const takeHot = !keep.hot_lead && dupe.hot_lead;
+    const notes = keep.notes && dupe.notes && keep.notes !== dupe.notes ? `${keep.notes}\n\n(Merged from "${dupe.name}")\n${dupe.notes}` : keep.notes || dupe.notes || null;
+    await sql`
+      update companies set
+        netsuite_customer_id = ${keep.netsuite_customer_id || dupe.netsuite_customer_id || null},
+        procore_vendor_id = ${keep.procore_vendor_id ?? dupe.procore_vendor_id ?? null},
+        region = ${keep.region || dupe.region || null},
+        vertical = ${keep.vertical || dupe.vertical || null},
+        tier = ${keep.tier || dupe.tier || null},
+        account_segment = ${segment},
+        notes = ${notes},
+        hot_lead = ${takeHot ? true : keep.hot_lead},
+        hot_lead_weight = ${takeHot ? dupe.hot_lead_weight : keep.hot_lead_weight},
+        hot_lead_reason = ${takeHot ? dupe.hot_lead_reason : keep.hot_lead_reason},
+        hot_lead_set_by = ${takeHot ? dupe.hot_lead_set_by : keep.hot_lead_set_by},
+        hot_lead_set_at = ${takeHot ? dupe.hot_lead_set_at : keep.hot_lead_set_at},
+        updated_at = now()
+      where id = ${keep.id}`;
+    const aliasKey = nsNorm(dupe.name);
+    if (aliasKey && aliasKey !== nsNorm(keep.name)) {
+      await sql`insert into company_aliases (alias_norm, company_id, alias_name) values (${aliasKey}, ${keep.id}, ${dupe.name}) on conflict (alias_norm) do update set company_id = excluded.company_id, alias_name = excluded.alias_name`;
+    }
+    await sql`insert into company_merges (kept_id, kept_name, merged_id, merged_name, merged_snapshot, moved, merged_by)
+      values (${keep.id}, ${keep.name}, ${dupe.id}, ${dupe.name}, ${JSON.stringify(dupe)}::jsonb, ${JSON.stringify(counts)}::jsonb, ${user.username})`;
+    await sql`delete from companies where id = ${dupe.id}`;
+    return json({ ok: true, kept: { id: keep.id, name: keep.name }, moved: counts });
   }
   return json({ error: "not_found" }, 404);
 }
@@ -1804,6 +1894,31 @@ SELF_MIGRATIONS.push({
     `create index if not exists companies_netsuite_id_idx on companies (netsuite_customer_id)`,
   ],
 });
+SELF_MIGRATIONS.push({
+  id: "016_company_merge",
+  statements: [
+    // Other spellings of a company that was merged away, so the same typed name on a
+    // later SCOUT/Procore bid resolves to the survivor instead of recreating it.
+    `create table if not exists company_aliases (
+      alias_norm text primary key,
+      company_id uuid not null references companies(id) on delete cascade,
+      alias_name text,
+      created_at timestamptz not null default now()
+    )`,
+    // Audit trail of every merge, with a snapshot of the removed company.
+    `create table if not exists company_merges (
+      id uuid primary key default gen_random_uuid(),
+      kept_id uuid,
+      kept_name text,
+      merged_id uuid,
+      merged_name text,
+      merged_snapshot jsonb,
+      moved jsonb,
+      merged_by text,
+      merged_at timestamptz not null default now()
+    )`,
+  ],
+});
 let schemaReady = null;
 function ensureSchema(sql) {
   if (!schemaReady) {
@@ -2477,6 +2592,7 @@ export default {
       if (url.pathname === "/followups" && request.method === "GET") return withRefresh(await handleFollowupsList(url, sql, auth.user));
 
       if (url.pathname === "/access" && request.method === "GET") return withRefresh(await handleAccess(env, auth.user));
+      if (url.pathname.startsWith("/admin/companies/merge")) return withRefresh(await handleCompanyMerge(request, url, sql, auth.user));
       if (url.pathname.startsWith("/admin/netsuite-sync")) return withRefresh(await handleNsSyncRoute(request, url, sql, env, auth.user));
       if (url.pathname === "/regions" && request.method === "GET") return withRefresh(await handleRegionsList(env, sql));
       if (url.pathname === "/grants" && request.method === "GET") return withRefresh(await handleGrantsGet(env, sql, auth.user));

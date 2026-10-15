@@ -86,6 +86,10 @@ export const api = {
   reviewNsSync: (opId, decision) => request(`/admin/netsuite-sync/review`, { method: "POST", body: { op_id: opId, decision } }),
   setNsSyncAuto: (enabled) => request(`/admin/netsuite-sync/auto`, { method: "POST", body: { enabled } }),
 
+  // Merge a duplicate company into another (admin)
+  previewCompanyMerge: (keepId, mergeId) => request(`/admin/companies/merge-preview?keep=${keepId}&merge=${mergeId}`),
+  mergeCompanies: (keepId, mergeId) => request(`/admin/companies/merge`, { method: "POST", body: { keep_id: keepId, merge_id: mergeId } }),
+
   // Procore project regions (one list, used for every region pick)
   listRegions: () => request(`/regions`),
 
