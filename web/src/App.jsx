@@ -138,7 +138,6 @@ export default function App() {
         {tab === "companies" && <CompanyList access={access} />}
         {tab === "dashboard" && <Dashboard />}
         {tab === "access" && <Access />}
-        {tab === "access" && <Access />}
       </div>
     </>
   );
