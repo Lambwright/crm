@@ -50,7 +50,10 @@
 		{ "binding": "NETSUITE_WORKER", "service": "netsuite" },
 		// Procore project regions come from HANDOFF (it already reads them live);
 		// CRM has no Procore access of its own. Needs the HANDOFF_SERVICE_KEY secret.
-		{ "binding": "HANDOFF_WORKER", "service": "handoff-worker" }
+		{ "binding": "HANDOFF_WORKER", "service": "handoff-worker" },
+		// LEDGER pushes project financials to crm-worker and CRM asks it to refresh one project;
+		// a Worker can't call another over its public URL (error 1042), so both go through bindings.
+		{ "binding": "LEDGER_WORKER", "service": "ledger" }
 	]
 	/**
 	 * Secrets (set with `wrangler secret put <NAME>`):
