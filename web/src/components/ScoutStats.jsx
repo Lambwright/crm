@@ -90,15 +90,18 @@ export default function ScoutStats({ access }) {
   }));
   const tierRates = TIERS.map((t) => {
     const r = data.by_tier.find((x) => x.tier === t.key);
-    const decided = r ? r.won + r.lost : 0;
-    return { label: t.label, values: { rate: decided ? r.won / decided : null }, notes: { rate: r ? `${r.won} won of ${decided} decided, ${r.open} still open` : "no bids" } };
+    if (!r) return { label: t.label, values: { rate: null }, notes: { rate: "no bids" } };
+    const won = isValue ? r.won_value : r.won;
+    const lost = isValue ? r.lost_value : r.lost;
+    const open = isValue ? r.open_value : r.open;
+    const denom = won + lost + (mode === "pipeline" ? open : 0);
+    return { label: t.label, values: { rate: denom ? won / denom : null }, notes: { rate: `${r.won} won, ${r.lost} lost, ${r.open} still open` } };
   });
   const COHORT_SERIES = [
     { key: "before", label: `Before ${since}`, color: SERIES[1] },
     { key: "scout", label: "After: through SCOUT", color: SERIES[2] },
-    { key: "other", label: "After: not through SCOUT", color: SERIES[3] },
   ];
-  const cohortFor = { before: c.before, scout: c.after_scout, other: c.after_other };
+  const cohortFor = { before: c.before, scout: c.after_scout };
   const rateGroup = [{
     label: `${mode === "pipeline" ? "Pipeline" : "Decided"} win rate, ${isValue ? "by dollars" : "by bids"}`,
     values: Object.fromEntries(COHORT_SERIES.map((s) => [s.key, cohortRates(cohortFor[s.key], basis, mode)])),
@@ -177,7 +180,7 @@ export default function ScoutStats({ access }) {
         />
         <GroupedBars
           title="Win rate by tier"
-          subtitle="Submitted bids only: won ÷ (won + lost), bids still open not counted"
+          subtitle={`Submitted bids only. ${mode === "pipeline" ? "Won ÷ (won + lost + still open)" : "Won ÷ (won + lost)"}, by ${isValue ? "dollars" : "number of bids"}`}
           groups={tierRates}
           series={[{ key: "rate", label: "Win rate", color: SERIES[1] }]}
           format={(v) => `${Math.round(v * 100)}%`}
@@ -187,10 +190,9 @@ export default function ScoutStats({ access }) {
 
       <div className="card-title" style={{ marginBottom: 6 }}>
         <Tip label="Does prequalification help?" className="card-title">
-          Bids are grouped by when they <strong>arrived</strong> (the bid's creation date; for older bids the due date), and judged by what happened to them since. Before {since} is the starting point.
-          After {since} is split into bids that went through SCOUT and bids that didn't. <strong>That last comparison isn't like for like:</strong> bids sent outside SCOUT are usually ones
-          we already knew we wanted, so they should win more. Use the before and after comparison as the real test. Archived bids are left out unless CRM recorded the decision.
-          This section ignores the period filter.
+          Bids are grouped by when they were <strong>created</strong> in CRM (for older bids, their due date), and judged by what happened to them since. Before {since} is the starting point.
+          "After: through SCOUT" counts only bids we can tie to a SCOUT run by project name, so it can undercount (early scoring-sheet entries rarely match a Bid Board name).
+          Archived bids are left out unless CRM recorded the decision. This section ignores the period filter.
         </Tip>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(420px, 1fr))", gap: 16, marginBottom: 20 }}>
@@ -208,11 +210,11 @@ export default function ScoutStats({ access }) {
       <div className="card" style={{ marginBottom: 20 }}>
         <div className="card-title">Cohort numbers</div>
         <table className="data-table">
-          <thead><tr><th>Group</th><th className="num">Bids arrived</th><th className="num">Won</th><th className="num">Lost</th><th className="num">Open</th><th className="num">Decided rate</th><th className="num">Pipeline rate</th></tr></thead>
+          <thead><tr><th>Group</th><th className="num">Bids created</th><th className="num">Submitted</th><th className="num">Won</th><th className="num">Lost</th><th className="num">Open</th><th className="num">Decided rate</th><th className="num">Pipeline rate</th></tr></thead>
           <tbody>
-            {[["Before " + since, c.before], ["After: all bids", c.after_all], ["After: through SCOUT", c.after_scout], ["After: not through SCOUT", c.after_other]].map(([label, x]) => (
+            {[["Before " + since, c.before], ["After: all bids", c.after_all], ["After: through SCOUT", c.after_scout]].map(([label, x]) => (
               <tr key={label}>
-                <td>{label}</td><td className="num">{num(x.created)}</td><td className="num">{num(isValue ? Math.round(x.complete_value) : x.complete)}</td><td className="num">{num(isValue ? Math.round(x.lost_value) : x.lost)}</td>
+                <td>{label}</td><td className="num">{num(x.created)}</td><td className="num">{num(x.complete + x.lost + x.midlate)}</td><td className="num">{num(isValue ? Math.round(x.complete_value) : x.complete)}</td><td className="num">{num(isValue ? Math.round(x.lost_value) : x.lost)}</td>
                 <td className="num">{num(isValue ? Math.round(x.midlate_value) : x.midlate)}</td><td className="num">{pct(cohortRates(x, basis, "decided"))}</td><td className="num">{pct(cohortRates(x, basis, "pipeline"))}</td>
               </tr>
             ))}

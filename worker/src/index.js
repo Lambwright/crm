@@ -1362,17 +1362,18 @@ async function handleScoutStats(url, sql) {
 
     if (!declined && !unknownOutcome) {
       const b = u.bid;
-      const t = (byTier[tier] ||= { tier, submitted: 0, won: 0, lost: 0, open: 0, no_record: 0 });
+      const t = (byTier[tier] ||= { tier, submitted: 0, won: 0, lost: 0, open: 0, no_record: 0, won_value: 0, lost_value: 0, open_value: 0 });
       t.submitted++;
       if (!b) { t.no_record++; noRecord++; continue; }
       if (b.stage === "complete") {
         t.won++; won++;
+        t.won_value += Number(b.final_value ?? b.estimated_value ?? 0);
         wonEstimate += Number(b.estimated_value || 0);
         wonValue += Number(b.final_value ?? b.estimated_value ?? 0);
         if (b.procore_project_id) becameProject++;
-      } else if (b.stage === "lost") { t.lost++; lost++; }
+      } else if (b.stage === "lost") { t.lost++; lost++; t.lost_value += Number(b.estimated_value || 0); }
       else if (b.stage === "no_bid") { /* declined after the fact: not open, not decided */ }
-      else { t.open++; open++; }
+      else { t.open++; open++; t.open_value += Number(b.estimated_value || 0); }
     }
   }
 
