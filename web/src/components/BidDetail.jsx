@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, buildMailto } from "../api.js";
+import ScoutRecord from "./ScoutRecord.jsx";
 import { buildFollowUpDraft, variantCount } from "../followupTemplates.js";
 import { HANDOFF_STATUS_LABELS, STAGE_LABELS, STAGE_ORDER, STAGE_REQUIREMENTS } from "../stages.js";
 
@@ -190,6 +191,8 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
           <div className="kv"><span className="kv-label">Bid Due</span><span className="kv-value">{bid.bid_due_date || "—"}</span></div>
           <div className="kv"><span className="kv-label">Next Action</span><span className="kv-value">{bid.next_action ? `${bid.next_action} (${bid.next_action_date || "no date"})` : "—"}</span></div>
         </div>
+
+        <ScoutRecord run={data.scout_latest} count={data.scout_run_count} />
 
         {bid.stage === "complete" && (
           <div className="card" style={{ background: "var(--bg-page)", marginBottom: 16 }}>

@@ -598,6 +598,24 @@ async function handleScoutIntake(request, sql) {
       values (${bid.id}, null, ${initialStage}, 'system', 'Created from SCOUT intake')`;
   }
 
+  // SCOUT's complete record for this push, kept as its own permanent row.
+  // `scout_record` is the same object SCOUT already sends to Excel/NetSuite;
+  // the few fields around it say how the push ended. Absent = an older SCOUT.
+  const rec = body.scout_record && typeof body.scout_record === "object" ? body.scout_record : null;
+  if (rec) {
+    const str = (v) => (v == null || v === "" ? null : String(v));
+    const js = (v) => (v == null ? null : JSON.stringify(v));
+    const submittedAt = rec.submitted_at && !Number.isNaN(new Date(rec.submitted_at).getTime()) ? new Date(rec.submitted_at).toISOString() : null;
+    await sql`
+      insert into scout_runs (bid_id, rfq_ref, source, outcome, submitted_at, client, project_name, tier, total_score, section_scores, scoring, scoring_labels,
+        disqualifiers, override_reason, override_approver, estimator, notes, risks, copilot_summary, push_to_bid, ns_opportunity_id, procore_bid_id, thresholds, payload)
+      values (${bid.id}, ${rfq_ref}, 'push', ${str(body.scout_outcome)}, ${submittedAt}, ${str(rec.client)}, ${str(rec.projname)}, ${str(rec.tier)},
+        ${rec.total_score == null || Number.isNaN(Number(rec.total_score)) ? null : Number(rec.total_score)}, ${js(rec.section_scores)}::jsonb, ${js(rec.scoring)}::jsonb, ${js(rec.scoring_labels)}::jsonb,
+        ${JSON.stringify(Array.isArray(rec.disqualifiers) ? rec.disqualifiers.slice(0, 50) : [])}::jsonb, ${str(body.override_reason ?? rec.override)}, ${str(body.override_approver ?? rec.approver)},
+        ${str(rec.estimator)}, ${str(rec.notes)}, ${str(rec.risks)}, ${str(rec.copilot_summary)}, ${typeof rec.push_to_bid === "boolean" ? rec.push_to_bid : null},
+        ${str(body.ns_opportunity_id)}, ${str(body.procore_bid_id ?? procore_bid_board_id)}, ${js(body.scout_thresholds)}::jsonb, ${JSON.stringify(rec)}::jsonb)`;
+  }
+
   return json({ company, contact: contactRow, bid }, existingBid.length ? 200 : 201);
 }
 
@@ -962,7 +980,10 @@ async function handleBidDetail(id, sql, user) {
   const contacts = rows[0].company_id
     ? await sql`select id, first_name, last_name, title, email from contacts where company_id = ${rows[0].company_id} order by first_name, last_name`
     : [];
-  return json({ bid: rows[0], stage_history: history, emails, company_contacts: contacts });
+  // SCOUT's latest complete record for this bid, plus how many pushes there were.
+  const runs = await sql`select * from scout_runs where bid_id = ${id} order by coalesce(submitted_at, received_at) desc limit 1`;
+  const [{ n: runCount }] = await sql`select count(*)::int as n from scout_runs where bid_id = ${id}`;
+  return json({ bid: rows[0], stage_history: history, emails, company_contacts: contacts, scout_latest: runs[0] || null, scout_run_count: runCount });
 }
 
 const BID_PATCHABLE = [
@@ -1428,6 +1449,45 @@ SELF_MIGRATIONS.push({
     calc_date text,
     received_at timestamptz not null default now()
   )`],
+});
+SELF_MIGRATIONS.push({
+  // One row per SCOUT push (or imported SCOUT/manual-sheet row), never
+  // overwritten, with SCOUT's complete record kept verbatim in `payload` so
+  // nothing SCOUT knew is lost (Ben, 2026-10-16: "all fields"). The columns are
+  // just the commonly used parts pulled out for queries and the stats tab.
+  id: "014_scout_runs",
+  statements: [
+    `create table if not exists scout_runs (
+      id uuid primary key default gen_random_uuid(),
+      bid_id uuid references bids(id) on delete set null,
+      rfq_ref text,
+      source text not null default 'push',      -- push | import:excel_log | import:manual_sheet
+      outcome text,                             -- submitted | declined
+      submitted_at timestamptz,
+      received_at timestamptz not null default now(),
+      client text,
+      project_name text,
+      tier text,
+      total_score numeric,
+      section_scores jsonb,
+      scoring jsonb,
+      scoring_labels jsonb,
+      disqualifiers jsonb not null default '[]'::jsonb,
+      override_reason text,
+      override_approver text,
+      estimator text,
+      notes text,
+      risks text,
+      copilot_summary text,
+      push_to_bid boolean,
+      ns_opportunity_id text,
+      procore_bid_id text,
+      thresholds jsonb,
+      payload jsonb not null
+    )`,
+    `create index if not exists scout_runs_bid_idx on scout_runs (bid_id)`,
+    `create index if not exists scout_runs_rfq_idx on scout_runs (rfq_ref)`,
+  ],
 });
 let schemaReady = null;
 function ensureSchema(sql) {
