@@ -618,9 +618,9 @@ async function handleScoutIntake(request, sql) {
     const js = (v) => (v == null ? null : JSON.stringify(v));
     const submittedAt = rec.submitted_at && !Number.isNaN(new Date(rec.submitted_at).getTime()) ? new Date(rec.submitted_at).toISOString() : null;
     await sql`
-      insert into scout_runs (bid_id, rfq_ref, source, outcome, submitted_at, client, project_name, tier, total_score, section_scores, scoring, scoring_labels,
+      insert into scout_runs (company_id, bid_id, rfq_ref, source, outcome, submitted_at, client, project_name, tier, total_score, section_scores, scoring, scoring_labels,
         disqualifiers, override_reason, override_approver, estimator, notes, risks, copilot_summary, push_to_bid, ns_opportunity_id, procore_bid_id, thresholds, payload)
-      values (${bid.id}, ${rfq_ref}, 'push', ${str(body.scout_outcome)}, ${submittedAt}, ${str(rec.client)}, ${str(rec.projname)}, ${str(rec.tier)},
+      values (${company.id}, ${bid.id}, ${rfq_ref}, 'push', ${str(body.scout_outcome)}, ${submittedAt}, ${str(rec.client)}, ${str(rec.projname)}, ${str(rec.tier)},
         ${rec.total_score == null || Number.isNaN(Number(rec.total_score)) ? null : Number(rec.total_score)}, ${js(rec.section_scores)}::jsonb, ${js(rec.scoring)}::jsonb, ${js(rec.scoring_labels)}::jsonb,
         ${JSON.stringify(Array.isArray(rec.disqualifiers) ? rec.disqualifiers.slice(0, 50) : [])}::jsonb, ${str(body.override_reason ?? rec.override)}, ${str(body.override_approver ?? rec.approver)},
         ${str(rec.estimator)}, ${str(rec.notes)}, ${str(rec.risks)}, ${str(rec.copilot_summary)}, ${typeof rec.push_to_bid === "boolean" ? rec.push_to_bid : null},
@@ -1292,7 +1292,7 @@ const normTier = (t) => {
   if (v === "no bid" || v === "no_bid" || v === "disqualified" || v === "nobid") return "No bid";
   return null;
 };
-const runKey = (r) => `${nsNorm(r.client)}|${nsNorm(r.project_name)}`;
+const runKey = (r) => `${r.company_id || nsNorm(r.client)}|${nsNorm(r.project_name)}`;
 const weekStart = (d) => {
   const t = new Date(d);
   const day = (t.getUTCDay() + 6) % 7; // Monday = 0
@@ -1305,7 +1305,7 @@ async function handleScoutStats(url, sql) {
   const bounds = rangeBounds(range, { from: url.searchParams.get("from"), to: url.searchParams.get("to") });
   const startMs = bounds.start.getTime(), endMs = bounds.end.getTime();
 
-  const runs = await sql`select id, bid_id, source, outcome, submitted_at, received_at, client, project_name, tier, total_score, disqualifiers, override_reason, override_approver, push_to_bid
+  const runs = await sql`select id, company_id, bid_id, source, outcome, submitted_at, received_at, client, project_name, tier, total_score, disqualifiers, override_reason, override_approver, push_to_bid
     from scout_runs where not excluded`;
   const bids = await sql`select id, project_name, stage, created_at, final_value, estimated_value, procore_project_id, source_archived, (decided_at is not null) as decision_recorded from bids`;
   const bidById = new Map(bids.map((b) => [b.id, b]));
@@ -1466,17 +1466,80 @@ async function handleScoutImport(request, url, sql, user) {
       const score = r.total_score === "" || r.total_score == null || Number.isNaN(Number(r.total_score)) ? null : Number(r.total_score);
       const push = /^bid$/i.test(String(r.push_to_bid || "").trim()) ? true : /^no bid$/i.test(String(r.push_to_bid || "").trim()) ? false : null;
       const outcome = /declin/i.test(String(r.outcome || "")) ? "declined" : /unknown/i.test(String(r.outcome || "")) ? "unknown" : "submitted";
-      params.push(key, "import:" + source, outcome, runAt, String(r.client).trim(), String(r.project_name || "").trim() || null, String(r.tier || "").trim() || null, score,
+      params.push(byNorm.get(nsNorm(r.client)) || null, key, "import:" + source, outcome, runAt, String(r.client).trim(), String(r.project_name || "").trim() || null, String(r.tier || "").trim() || null, score,
         JSON.stringify(disq), String(r.override_reason || "").trim() || null, String(r.override_approver || "").trim() || null, String(r.estimator || "").trim() || null,
         String(r.notes || "").trim() || null, String(r.risks || "").trim() || null, String(r.copilot_summary || "").trim() || null, push, JSON.stringify(r));
-      return "(" + Array.from({ length: 17 }, (_, k) => "$" + (base + k + 1)).join(", ") + ")";
+      return "(" + Array.from({ length: 18 }, (_, k) => "$" + (base + k + 1)).join(", ") + ")";
     });
     await sql.query(
-      "insert into scout_runs (ext_key, source, outcome, submitted_at, client, project_name, tier, total_score, disqualifiers, override_reason, override_approver, estimator, notes, risks, copilot_summary, push_to_bid, payload) values " + tuples.join(", "),
+      "insert into scout_runs (company_id, ext_key, source, outcome, submitted_at, client, project_name, tier, total_score, disqualifiers, override_reason, override_approver, estimator, notes, risks, copilot_summary, push_to_bid, payload) values " + tuples.join(", "),
       params
     );
   }
   return json({ summary, applied: true });
+}
+
+// Match the client names on SCOUT history to real companies (Ben, 2026-10-16).
+// Lists each distinct client name on a run that has no company yet, with a few
+// likely candidates, and lets an admin link it (which also remembers the spelling
+// as an alias, so later pushes resolve) or mark it as not a real client.
+async function resolveRunCompanies(sql) {
+  const companies = await sql`select id, name from companies`;
+  const aliases = await sql`select alias_norm, company_id from company_aliases`;
+  const byNorm = new Map();
+  for (const c of companies) { const k = nsNorm(c.name); byNorm.set(k, byNorm.has(k) ? null : c.id); }
+  for (const a of aliases) if (!byNorm.has(a.alias_norm)) byNorm.set(a.alias_norm, a.company_id);
+  const names = await sql`select client, count(*)::int as n from scout_runs where company_id is null and not excluded and client is not null group by client`;
+  for (const r of names) {
+    const id = byNorm.get(nsNorm(r.client));
+    if (id) await sql`update scout_runs set company_id = ${id} where company_id is null and client = ${r.client}`;
+  }
+  return companies;
+}
+
+async function handleScoutUnlinked(request, url, sql, user) {
+  if (!isCrmAdmin(user)) return forbidden("Admin access required.");
+  if (url.pathname === "/admin/scout-unlinked" && request.method === "GET") {
+    const companies = await resolveRunCompanies(sql);
+    const rows = await sql`select client, count(*)::int as runs, min(project_name) as example from scout_runs where company_id is null and not excluded and client is not null group by client order by count(*) desc, client`;
+    const tokens = (v) => new Set(nsLoose(v).split(" ").filter((w) => w.length > 1));
+    const index = companies.map((c) => ({ id: c.id, name: c.name, t: tokens(c.name), first: nsLoose(c.name).split(" ")[0] }));
+    const out = rows.map((r) => {
+      const t = tokens(r.client);
+      const first = nsLoose(r.client).split(" ")[0];
+      const cand = index
+        .map((c) => {
+          let overlap = 0;
+          for (const w of t) if (c.t.has(w)) overlap++;
+          const score = t.size ? overlap / Math.max(t.size, 1) : 0;
+          return { id: c.id, name: c.name, score: score + (c.first && c.first === first ? 0.4 : 0) };
+        })
+        .filter((c) => c.score >= 0.5)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 4)
+        .map((c) => ({ id: c.id, name: c.name }));
+      return { client: r.client, runs: r.runs, example: r.example, suggestions: cand };
+    });
+    return json({ clients: out });
+  }
+  const body = await parseBody(request);
+  if (url.pathname === "/admin/scout-unlinked/link" && request.method === "POST") {
+    if (!body.client || !body.company_id) return json({ error: "client and company_id are required" }, 400);
+    const [company] = await sql`select id, name from companies where id = ${body.company_id}`;
+    if (!company) return json({ error: "not_found" }, 404);
+    const upd = await sql`update scout_runs set company_id = ${company.id} where client = ${body.client} returning id`;
+    const key = nsNorm(body.client);
+    if (key && key !== nsNorm(company.name)) {
+      await sql`insert into company_aliases (alias_norm, company_id, alias_name) values (${key}, ${company.id}, ${body.client}) on conflict (alias_norm) do update set company_id = excluded.company_id, alias_name = excluded.alias_name`;
+    }
+    return json({ ok: true, linked_runs: upd.length, company: company.name });
+  }
+  if (url.pathname === "/admin/scout-unlinked/exclude" && request.method === "POST") {
+    if (!body.client) return json({ error: "client is required" }, 400);
+    const upd = await sql`update scout_runs set excluded = true where client = ${body.client} and company_id is null returning id`;
+    return json({ ok: true, excluded_runs: upd.length });
+  }
+  return json({ error: "not_found" }, 404);
 }
 
 // ---------------------------------------------------------------------------
@@ -2274,6 +2337,13 @@ SELF_MIGRATIONS.push({
     `create unique index if not exists scout_runs_ext_key_idx on scout_runs (ext_key) where ext_key is not null`,
   ],
 });
+SELF_MIGRATIONS.push({
+  id: "019_scout_runs_company",
+  statements: [
+    `alter table scout_runs add column if not exists company_id uuid references companies(id) on delete set null`,
+    `create index if not exists scout_runs_company_idx on scout_runs (company_id)`,
+  ],
+});
 let schemaReady = null;
 function ensureSchema(sql) {
   if (!schemaReady) {
@@ -2948,6 +3018,7 @@ export default {
 
       if (url.pathname === "/access" && request.method === "GET") return withRefresh(await handleAccess(env, auth.user));
       if (url.pathname === "/scout/stats" && request.method === "GET") return withRefresh(await handleScoutStats(url, sql));
+      if (url.pathname.startsWith("/admin/scout-unlinked")) return withRefresh(await handleScoutUnlinked(request, url, sql, auth.user));
       if (url.pathname.startsWith("/admin/scout-import") && request.method === "POST") return withRefresh(await handleScoutImport(request, url, sql, auth.user));
       if (url.pathname.startsWith("/admin/contacts-import") && request.method === "POST") return withRefresh(await handleContactsImport(request, url, sql, auth.user));
       if (url.pathname.startsWith("/admin/companies/merge")) return withRefresh(await handleCompanyMerge(request, url, sql, auth.user));

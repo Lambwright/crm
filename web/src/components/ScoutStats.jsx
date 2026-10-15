@@ -3,6 +3,7 @@ import { api } from "../api.js";
 import Tip from "./Tip.jsx";
 import { SERIES, StackedColumns, GroupedBars } from "./charts.jsx";
 import ScoutImport from "./ScoutImport.jsx";
+import ScoutLinkClients from "./ScoutLinkClients.jsx";
 
 // SCOUT prequalification stats (Ben, 2026-10-16). Prequalification began June 8
 // 2026 with the scoring spreadsheet; SCOUT's app took over in late July; both are
@@ -219,7 +220,12 @@ export default function ScoutStats({ access }) {
         </table>
       </div>
 
-      {access?.can?.admin === true && <ScoutImport onImported={() => setReload((n) => n + 1)} />}
+      {access?.can?.admin === true && (
+        <>
+          <ScoutImport onImported={() => setReload((n) => n + 1)} />
+          <ScoutLinkClients onChanged={() => setReload((n) => n + 1)} />
+        </>
+      )}
     </>
   );
 }

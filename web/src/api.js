@@ -104,6 +104,11 @@ export const api = {
   previewScoutImport: (rows) => request(`/admin/scout-import/preview`, { method: "POST", body: { rows } }),
   applyScoutImport: (rows) => request(`/admin/scout-import/apply`, { method: "POST", body: { rows } }),
 
+  // Match SCOUT history client names to companies (admin)
+  getScoutUnlinked: () => request(`/admin/scout-unlinked`),
+  linkScoutClient: (client, companyId) => request(`/admin/scout-unlinked/link`, { method: "POST", body: { client, company_id: companyId } }),
+  excludeScoutClient: (client) => request(`/admin/scout-unlinked/exclude`, { method: "POST", body: { client } }),
+
   // Procore project regions (one list, used for every region pick)
   listRegions: () => request(`/regions`),
 
