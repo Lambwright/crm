@@ -60,6 +60,7 @@
 	 *   CRM_SYNC_KEY          - shared secret handoff-worker sends as X-Crm-Sync-Key when pushing a Bid Board sync batch
 	 *   HANDOFF_SERVICE_KEY   - same value as handoff-worker's own secret; sent as X-Handoff-Service-Key to read the Procore region list
 	 *   CRM_PAYSCORE_KEY      - shared secret netsuite-worker sends as X-CRM-Payscore-Key when pushing customer payment scores to /internal/payment-scores
+	 *   CRM_FINANCE_KEY       - shared secret with ledger-worker: X-CRM-Finance-Key on /internal/project-financials (and when CRM asks LEDGER to refresh a project)
 	 *   CRM_ADMIN_KEY         - shared secret for the one-off /internal/admin/migrate runner (X-Crm-Admin-Key)
 	 */
 }

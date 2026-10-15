@@ -1337,6 +1337,7 @@ async function handleScoutStats(url, sql) {
   const monthly = new Map();
   const weekly = new Map();
   let won = 0, lost = 0, open = 0, becameProject = 0, wonValue = 0, wonEstimate = 0, noRecord = 0;
+  const wonProjects = [];
   for (const u of inPeriod) {
     const tier = normTier(u.tier) || "untiered";
     tiers[tier] = (tiers[tier] || 0) + 1;
@@ -1371,6 +1372,7 @@ async function handleScoutStats(url, sql) {
         wonEstimate += Number(b.estimated_value || 0);
         wonValue += Number(b.final_value ?? b.estimated_value ?? 0);
         if (b.procore_project_id) becameProject++;
+        wonProjects.push({ bid_id: b.id, project_name: b.project_name, procore_project_id: b.procore_project_id ? String(b.procore_project_id) : null, estimate: b.estimated_value == null ? null : Number(b.estimated_value), final_value: b.final_value == null ? null : Number(b.final_value), tier });
       } else if (b.stage === "lost") { t.lost++; lost++; t.lost_value += Number(b.estimated_value || 0); }
       else if (b.stage === "no_bid") { /* declined after the fact: not open, not decided */ }
       else { t.open++; open++; t.open_value += Number(b.estimated_value || 0); }
@@ -1403,6 +1405,39 @@ async function handleScoutStats(url, sql) {
     }
   }
 
+  // LEDGER's contract / change-order / invoiced figures for the won projects.
+  const finRows = await sql`select procore_project_id, contract_value, approved_change_orders, revised_contract, invoiced_to_date, paid_to_date, currency, as_of from project_financials`;
+  const finById = new Map(finRows.map((r) => [String(r.procore_project_id), r]));
+  const sum = (key) => {
+    let total = 0, n = 0;
+    for (const w of wonProjects) { const f = w.procore_project_id && finById.get(w.procore_project_id); if (f && f[key] != null) { total += Number(f[key]); n++; } }
+    return n ? total : null;
+  };
+  let withFigures = 0, oldest = null;
+  for (const w of wonProjects) {
+    const f = w.procore_project_id && finById.get(w.procore_project_id);
+    w.contract_value = f && f.contract_value != null ? Number(f.contract_value) : null;
+    w.approved_change_orders = f && f.approved_change_orders != null ? Number(f.approved_change_orders) : null;
+    w.revised_contract = f && f.revised_contract != null ? Number(f.revised_contract) : null;
+    w.invoiced_to_date = f && f.invoiced_to_date != null ? Number(f.invoiced_to_date) : null;
+    w.paid_to_date = f && f.paid_to_date != null ? Number(f.paid_to_date) : null;
+    w.as_of = f && f.as_of ? new Date(f.as_of).toISOString() : null;
+    if (f && (f.revised_contract != null || f.contract_value != null)) withFigures++;
+    if (w.as_of && (!oldest || w.as_of < oldest)) oldest = w.as_of;
+  }
+  const financials = {
+    won_projects: wonProjects.length,
+    with_project_id: wonProjects.filter((w) => w.procore_project_id).length,
+    with_figures: withFigures,
+    contract_value: sum("contract_value"),
+    approved_change_orders: sum("approved_change_orders"),
+    revised_contract: sum("revised_contract"),
+    invoiced_to_date: sum("invoiced_to_date"),
+    paid_to_date: sum("paid_to_date"),
+    oldest_as_of: oldest,
+    projects: wonProjects.sort((a, b) => (b.revised_contract ?? b.estimate ?? 0) - (a.revised_contract ?? a.estimate ?? 0)).slice(0, 60),
+  };
+
   const sinceDates = all.map((u) => u.at).sort((a, b) => a - b);
   return json({
     period: { key: range, start: bounds.start.toISOString(), end: bounds.end.getUTCFullYear() >= 9999 ? null : bounds.end.toISOString() },
@@ -1419,6 +1454,7 @@ async function handleScoutStats(url, sql) {
     weekly: [...weekly.values()].sort((a, b) => a.week.localeCompare(b.week)),
     monthly: [...monthly.values()].sort((a, b) => a.month.localeCompare(b.month)),
     cohorts,
+    financials,
   });
 }
 
@@ -1578,6 +1614,82 @@ async function handleScoutUnlinked(request, url, sql, user) {
     return json({ ok: true, excluded_runs: upd.length });
   }
   return json({ error: "not_found" }, 404);
+}
+
+// ---------------------------------------------------------------------------
+// Project financials pushed by LEDGER (Ben, 2026-10-16): POST /internal/project-financials,
+// header X-CRM-Finance-Key (CRM_FINANCE_KEY secret, same value as on LEDGER). LEDGER pushes
+// the projects it refreshed every 15 minutes. null = unknown and stays null (never 0);
+// as_of is when LEDGER last read the project from Procore. All rows are kept; the SCOUT
+// stats join them to won bids by procore_project_id.
+// ---------------------------------------------------------------------------
+function isFinanceCaller(request, env) {
+  const key = request.headers.get("X-CRM-Finance-Key");
+  return Boolean(key) && Boolean(env.CRM_FINANCE_KEY) && key === env.CRM_FINANCE_KEY;
+}
+const finNum = (v) => (v === null || v === undefined || v === "" || Number.isNaN(Number(v)) ? null : Number(v));
+
+async function upsertFinancials(sql, items) {
+  let stored = 0;
+  const bad = [];
+  const good = [];
+  for (const it of items) {
+    const id = it && it.procore_project_id != null ? String(it.procore_project_id).trim() : "";
+    if (!/^\d{5,}$/.test(id)) { bad.push(it && it.procore_project_id); continue; }
+    const asOf = it.as_of && !Number.isNaN(new Date(it.as_of).getTime()) ? new Date(it.as_of).toISOString() : null;
+    good.push([id, it.project_name ? String(it.project_name).slice(0, 300) : null, finNum(it.contract_value), finNum(it.approved_change_orders), finNum(it.revised_contract), finNum(it.invoiced_to_date), finNum(it.paid_to_date), it.currency ? String(it.currency).slice(0, 8) : null, asOf]);
+  }
+  for (let i = 0; i < good.length; i += 100) {
+    const chunk = good.slice(i, i + 100);
+    const params = [];
+    const tuples = chunk.map((row) => {
+      const base = params.length;
+      params.push(...row);
+      return "(" + row.map((_, k) => "$" + (base + k + 1)).join(", ") + ")";
+    });
+    await sql.query(
+      "insert into project_financials (procore_project_id, project_name, contract_value, approved_change_orders, revised_contract, invoiced_to_date, paid_to_date, currency, as_of) values " + tuples.join(", ") +
+      " on conflict (procore_project_id) do update set project_name = excluded.project_name, contract_value = excluded.contract_value, approved_change_orders = excluded.approved_change_orders, revised_contract = excluded.revised_contract, invoiced_to_date = excluded.invoiced_to_date, paid_to_date = excluded.paid_to_date, currency = excluded.currency, as_of = excluded.as_of, received_at = now()",
+      params
+    );
+    stored += chunk.length;
+  }
+  return { stored, bad };
+}
+
+async function handleFinancialsPush(request, sql) {
+  const body = await parseBody(request);
+  const items = Array.isArray(body.items) ? body.items : null;
+  if (!items) return json({ error: "items[] is required" }, 400);
+  if (items.length > 500) return json({ error: "too_many_items", detail: "Send at most 500 items per request." }, 413);
+  const { stored, bad } = await upsertFinancials(sql, items);
+  return json({ received: items.length, stored, invalid: bad.length, invalid_ids: bad.slice(0, 20) });
+}
+
+// Ask LEDGER to refresh one project right now (counts against LEDGER's people allowance, not its
+// background cap). Needs the LEDGER_WORKER service binding and the finance key; until both exist
+// it says so instead of failing.
+async function handleFinancialsRefresh(request, env, sql, user) {
+  if (!canSeeAllBids(user)) return forbidden("Not available to your role.");
+  const body = await parseBody(request);
+  const id = body.procore_project_id ? String(body.procore_project_id).trim() : "";
+  if (!/^\d{5,}$/.test(id)) return json({ error: "procore_project_id is required" }, 400);
+  if (!env.LEDGER_WORKER || !env.CRM_FINANCE_KEY) return json({ error: "not_connected", detail: "LEDGER isn't connected to CRM yet (service binding or key missing)." }, 503);
+  let res;
+  try {
+    res = await env.LEDGER_WORKER.fetch("https://ledger.ben-a90.workers.dev/crm/project-financials/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CRM-Finance-Key": env.CRM_FINANCE_KEY },
+      body: JSON.stringify({ procore_project_id: id }),
+    });
+  } catch (e) {
+    return json({ error: "ledger_unreachable", detail: e.message }, 502);
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return json({ error: data.error || "ledger_error", detail: data.error || `LEDGER answered HTTP ${res.status}`, retry_after_seconds: data.retry_after_seconds || null }, res.status === 503 ? 503 : 502);
+  const item = data.item || data;
+  await upsertFinancials(sql, [{ ...item, procore_project_id: item.procore_project_id || id }]);
+  return json({ ok: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -2382,6 +2494,23 @@ SELF_MIGRATIONS.push({
     `create index if not exists scout_runs_company_idx on scout_runs (company_id)`,
   ],
 });
+SELF_MIGRATIONS.push({
+  // Project money from LEDGER (pushed): contract, approved change orders, invoiced, paid.
+  // Keyed on the Procore project id as TEXT (15 digits, never a JS number).
+  id: "020_project_financials",
+  statements: [`create table if not exists project_financials (
+    procore_project_id text primary key,
+    project_name text,
+    contract_value numeric,
+    approved_change_orders numeric,
+    revised_contract numeric,
+    invoiced_to_date numeric,
+    paid_to_date numeric,
+    currency text,
+    as_of timestamptz,
+    received_at timestamptz not null default now()
+  )`],
+});
 let schemaReady = null;
 function ensureSchema(sql) {
   if (!schemaReady) {
@@ -2805,6 +2934,10 @@ export default {
         }
         return await handleCompanyLookup(url, sql);
       }
+      if (url.pathname === "/internal/project-financials" && request.method === "POST") {
+        if (!isFinanceCaller(request, env)) return json({ error: "unauthorized" }, 401);
+        return await handleFinancialsPush(request, sql);
+      }
       if (url.pathname === "/internal/payment-scores" && request.method === "POST") {
         if (!isPayscoreCaller(request, env)) return json({ error: "unauthorized" }, 401);
         return await handlePaymentScoresPush(request, sql);
@@ -3055,6 +3188,7 @@ export default {
       if (url.pathname === "/followups" && request.method === "GET") return withRefresh(await handleFollowupsList(url, sql, auth.user));
 
       if (url.pathname === "/access" && request.method === "GET") return withRefresh(await handleAccess(env, auth.user));
+      if (url.pathname === "/scout/financials/refresh" && request.method === "POST") return withRefresh(await handleFinancialsRefresh(request, env, sql, auth.user));
       if (url.pathname === "/scout/stats" && request.method === "GET") return withRefresh(await handleScoutStats(url, sql));
       if (url.pathname.startsWith("/admin/scout-unlinked")) return withRefresh(await handleScoutUnlinked(request, url, sql, auth.user));
       if (url.pathname.startsWith("/admin/scout-import") && request.method === "POST") return withRefresh(await handleScoutImport(request, url, sql, auth.user));

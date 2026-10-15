@@ -41,6 +41,45 @@ function cohortRates(c, basis, mode) {
   return denom > 0 ? won / denom : null;
 }
 
+function WonProjects({ projects, onRefreshed }) {
+  const [busy, setBusy] = useState(null);
+  const [msg, setMsg] = useState(null);
+  if (!projects || projects.length === 0) return null;
+  async function refresh(id) {
+    setBusy(id); setMsg(null);
+    try { await api.refreshProjectFinancials(id); onRefreshed(); }
+    catch (e) { setMsg(e.data?.retry_after_seconds ? `${e.data.detail} Try again in about ${Math.ceil(e.data.retry_after_seconds / 60)} min.` : e.data?.detail || e.message); }
+    finally { setBusy(null); }
+  }
+  const cell = (v) => (v == null ? "—" : money(v));
+  return (
+    <details style={{ marginBottom: 20 }}>
+      <summary style={{ cursor: "pointer", fontSize: 13, fontWeight: 600 }}>Won projects ({projects.length})</summary>
+      {msg && <div className="login-error" style={{ marginTop: 6 }}>{msg}</div>}
+      <div style={{ overflowX: "auto", marginTop: 6 }}>
+        <table className="data-table">
+          <thead><tr><th>Project</th><th>Tier</th><th className="num">Estimate</th><th className="num">Contract</th><th className="num">Change orders</th><th className="num">Revised</th><th className="num">Invoiced</th><th>As of</th><th /></tr></thead>
+          <tbody>
+            {projects.map((p) => (
+              <tr key={p.bid_id}>
+                <td>{p.project_name}</td>
+                <td>{p.tier}</td>
+                <td className="num">{cell(p.final_value ?? p.estimate)}</td>
+                <td className="num">{cell(p.contract_value)}</td>
+                <td className="num">{cell(p.approved_change_orders)}</td>
+                <td className="num">{cell(p.revised_contract)}</td>
+                <td className="num">{cell(p.invoiced_to_date)}</td>
+                <td>{p.as_of ? new Date(p.as_of).toLocaleDateString() : "—"}</td>
+                <td>{p.procore_project_id ? <button className="btn btn-ghost btn-sm" disabled={busy === p.procore_project_id} onClick={() => refresh(p.procore_project_id)}>{busy === p.procore_project_id ? "…" : "↻ Refresh"}</button> : <span className="row-secondary">no project yet</span>}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </details>
+  );
+}
+
 function Tile({ label, tip, value, color }) {
   return (
     <div className="card">
@@ -120,6 +159,7 @@ export default function ScoutStats({ access }) {
 
   const dec = data.declined;
   const o = data.outcomes;
+  const fin = data.financials || { won_projects: 0, with_project_id: 0, with_figures: 0, projects: [] };
 
   return (
     <>
@@ -166,8 +206,28 @@ export default function ScoutStats({ access }) {
         <Tile label="Declined by disqualifier" value={num(dec.by_disqualifier)} tip="At least one automatic disqualifier was triggered. Only recorded since SCOUT began sending the list; older log rows carry it too where it was filled in." />
         <Tile label="Won (Awarded)" color="var(--green)" value={num(o.won)} tip={<>Prequalified, submitted bids that are now Awarded in CRM. {num(o.lost)} lost, {num(o.open)} still open, {num(o.no_record)} with no matching bid record (for example not pushed to Procore).</>} />
         <Tile label="Became a project" value={num(o.became_project)} tip="Won bids that now have a Procore project (HANDOFF created the project)." />
-        <Tile label="Value of won bids" value={money(o.won_value)} tip={<>The confirmed final value where one is entered, otherwise the bid's estimate, summed over the won bids above. Contract value plus change orders, and payments received, will come from LEDGER; until then this is the best CRM has.</>} />
+        <Tile label="Value of won bids (estimate)" value={money(o.won_value)} tip={<>The confirmed final value where one is entered, otherwise the bid's estimate, summed over the won bids above. The real contract figures from LEDGER are in the tiles that follow.</>} />
       </div>
+
+      <div className="card-title" style={{ marginBottom: 6 }}>
+        <Tip label="Won projects: money from LEDGER" className="card-title">
+          For the won bids above that became a Procore project, LEDGER sends its contract figures to CRM whenever it refreshes a project (mostly overnight).
+          Only projects LEDGER has read are summed, so the totals can be lower than the number of won projects until each has been refreshed.
+          Contract value and approved change orders appear after a project's next LEDGER refresh. Payments received aren't available yet (LEDGER doesn't hold them).
+        </Tip>
+      </div>
+      <div className="kv-grid" style={{ marginBottom: 8 }}>
+        <Tile label="Contract value" value={fin.contract_value == null ? "—" : money(fin.contract_value)} tip="The original contract amounts on the won projects' approved prime contracts, pass-through contracts included." />
+        <Tile label="Approved change orders" value={fin.approved_change_orders == null ? "—" : money(fin.approved_change_orders)} tip="Revised contract minus the original contract amounts." />
+        <Tile label="Revised contract" value={fin.revised_contract == null ? "—" : money(fin.revised_contract)} tip="Contract value plus approved change orders: the real value of the work." />
+        <Tile label="Invoiced to date" value={fin.invoiced_to_date == null ? "—" : money(fin.invoiced_to_date)} tip="Owner invoices to date, before retainage, drafts excluded." />
+        <Tile label="Payments received" value={fin.paid_to_date == null ? "—" : money(fin.paid_to_date)} tip="Not available yet: LEDGER doesn't hold payments." />
+      </div>
+      <div className="field-help" style={{ marginBottom: 20 }}>
+        {fin.with_figures} of {fin.won_projects} won projects have LEDGER figures{fin.won_projects > fin.with_project_id ? ` (${fin.won_projects - fin.with_project_id} haven't become a Procore project yet)` : ""}
+        {fin.oldest_as_of ? `. Oldest reading: ${new Date(fin.oldest_as_of).toLocaleDateString()}.` : "."}
+      </div>
+      <WonProjects projects={fin.projects} onRefreshed={() => setReload((n) => n + 1)} />
 
       <div className="stat-chart-grid" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(420px, 1fr))", gap: 16, marginBottom: 20 }}>
         <StackedColumns title="Bids prequalified per week, by tier" subtitle="Unique bids by the week they were scored" data={weekly} series={TIERS} />

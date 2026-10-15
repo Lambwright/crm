@@ -111,6 +111,9 @@ export const api = {
   excludeScoutClient: (client) => request(`/admin/scout-unlinked/exclude`, { method: "POST", body: { client } }),
   excludeScoutRuns: (runIds) => request(`/admin/scout-unlinked/exclude`, { method: "POST", body: { run_ids: runIds } }),
 
+  // Ask LEDGER to refresh one project's contract / change-order figures now
+  refreshProjectFinancials: (procoreProjectId) => request(`/scout/financials/refresh`, { method: "POST", body: { procore_project_id: procoreProjectId } }),
+
   // Procore project regions (one list, used for every region pick)
   listRegions: () => request(`/regions`),
 
