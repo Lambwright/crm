@@ -856,27 +856,21 @@ async function buildNsPlan(env, sql, rows) {
     }
   }
 
-  // The "Procore ID" NetSuite keeps per customer turned out to be Procore PROJECT
-  // ids (Ben, 2026-10-16: 174 of 332 matched project ids on CRM bids; customers
-  // like KPS Global carry 20 of them), not company ids. So they are used only as
-  // evidence: a NetSuite customer owning a project that one of CRM's bids points
-  // at identifies that bid's company. They are never written to a company's
-  // procore_vendor_id.
-  const projectRows = await sql`select distinct procore_project_id, company_id from bids where procore_project_id is not null and company_id is not null`;
+  // The NetSuite "Procore ID" is only trusted as a Procore COMPANY id when it
+  // isn't also a Procore project or bid id that CRM already knows: an earlier
+  // export (2026-10-16) held per-project ids, and writing one of those into a
+  // company would corrupt it. If any id in the file is a known project/bid id,
+  // the plan still matches by name but writes no Procore id, and says so.
+  const knownProjects = new Set();
+  for (const r of await sql`select procore_project_id as pid from bids where procore_project_id is not null union select procore_bid_board_id from bids where procore_bid_board_id is not null`) knownProjects.add(String(r.pid));
+  const allPc = new Set([...pcByCustomer.values()].flatMap((set) => [...set]));
+  const suspectProjectIds = [...allPc].filter((x) => knownProjects.has(x)).length;
   const companies = await sql`select id, name, procore_vendor_id, netsuite_customer_id from companies`;
-  const companyById = new Map(companies.map((c) => [c.id, c]));
-  const companiesByProject = new Map();
-  for (const r of projectRows) {
-    const c = companyById.get(r.company_id);
-    if (!c) continue;
-    const k = String(r.procore_project_id);
-    if (!companiesByProject.has(k)) companiesByProject.set(k, new Map());
-    companiesByProject.get(k).set(c.id, c);
-  }
   const push = (m, k, v) => { if (!k) return; if (!m.has(k)) m.set(k, []); m.get(k).push(v); };
-  const byNs = new Map(), byNorm = new Map(), byLoose = new Map();
+  const byNs = new Map(), byPc = new Map(), byNorm = new Map(), byLoose = new Map();
   for (const c of companies) {
     if (c.netsuite_customer_id) byNs.set(String(c.netsuite_customer_id), c);
+    if (c.procore_vendor_id != null) push(byPc, String(c.procore_vendor_id), c);
     push(byNorm, nsNorm(c.name), c);
     push(byLoose, nsLoose(c.name), c);
   }
@@ -890,14 +884,14 @@ async function buildNsPlan(env, sql, rows) {
     if (!name) continue;
     if (byNs.has(id)) { alreadyLinked++; continue; }
     const pcs = [...(pcByCustomer.get(id) || [])];
-    const base = { ns_id: id, ns_name: name, procore_id: null };
+    const base = { ns_id: id, ns_name: name, procore_id: suspectProjectIds === 0 && pcs.length === 1 ? pcs[0] : null };
     const free = (list) => [...new Map((list || []).filter((x) => !x.netsuite_customer_id).map((x) => [x.id, x])).values()];
 
     let matched = null, reason = null;
-    const pcCand = free(pcs.flatMap((pid) => [...(companiesByProject.get(pid)?.values() || [])]));
-    if (pcCand.length === 1) { matched = pcCand[0]; reason = "Procore project on a bid"; }
+    const pcCand = suspectProjectIds === 0 ? free(pcs.flatMap((pid) => byPc.get(pid) || [])) : [];
+    if (pcCand.length === 1) { matched = pcCand[0]; reason = "Procore company id"; }
     else if (pcCand.length > 1) {
-      ops.push({ ...base, op: "ambiguous", detail: `Its Procore projects point at ${pcCand.length} CRM companies: ${pcCand.map((x) => x.name).join("; ")}` });
+      ops.push({ ...base, op: "ambiguous", detail: `Procore id fits ${pcCand.length} CRM companies: ${pcCand.map((x) => x.name).join("; ")}` });
       continue;
     }
     if (!matched) {
@@ -932,7 +926,8 @@ async function buildNsPlan(env, sql, rows) {
   const summary = {
     netsuite_customers: customers.length,
     already_linked: alreadyLinked,
-    link_by_procore_id: ops.filter((o) => o.op === "link" && o.detail === "Procore project on a bid").length,
+    link_by_procore_id: ops.filter((o) => o.op === "link" && o.detail === "Procore company id").length,
+    procore_ids_that_look_like_projects: suspectProjectIds,
     link_by_name: ops.filter((o) => o.op === "link" && o.detail === "same name").length,
     create: count("create"),
     create_individuals: ops.filter((o) => o.op === "create" && o.detail === "individual").length,
@@ -978,7 +973,7 @@ async function nsApplyOne(sql, o) {
   const done = (status, detail) => sql`update ns_sync_ops set status = ${status}, detail = coalesce(${detail}, detail) where id = ${o.id}`;
   if (o.op === "link") {
     const r = await sql`
-      update companies set netsuite_customer_id = ${o.ns_id}, updated_at = now()
+      update companies set netsuite_customer_id = ${o.ns_id}, procore_vendor_id = coalesce(procore_vendor_id, nullif(${o.procore_id || ""}, '')::bigint), updated_at = now()
       where id = ${o.company_id} and netsuite_customer_id is null returning id`;
     return done(r.length ? "applied" : "skipped", r.length ? null : "company was already linked or removed");
   }
@@ -986,8 +981,8 @@ async function nsApplyOne(sql, o) {
     const exists = await sql`select id from companies where lower(trim(name)) = lower(trim(${o.ns_name})) or netsuite_customer_id = ${o.ns_id} limit 1`;
     if (exists.length) return done("skipped", "a company with this name or NetSuite id already exists");
     await sql`
-      insert into companies (name, netsuite_customer_id, account_segment, notes)
-      values (${o.ns_name}, ${o.ns_id}, 'customer', ${o.notes || null})`;
+      insert into companies (name, netsuite_customer_id, procore_vendor_id, account_segment, notes)
+      values (${o.ns_name}, ${o.ns_id}, nullif(${o.procore_id || ""}, '')::bigint, 'customer', ${o.notes || null})`;
     return done("applied");
   }
 }

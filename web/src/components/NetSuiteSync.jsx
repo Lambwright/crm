@@ -51,7 +51,7 @@ const FIELD_LABELS = {
   companyname: "Company name",
   name: "Name (used if there's no company name)",
   entityid: "Entity ID (for individuals)",
-  procore: "Procore ID (project IDs are fine; used as evidence only)",
+  procore: "Procore company ID",
   stage: "Stage (optional; only 'Customer' rows are used)",
   inactive: "Inactive (optional; inactive rows are skipped)",
 };
@@ -149,8 +149,8 @@ export default function NetSuiteSync() {
     <div style={{ marginBottom: 24 }}>
       <div className="card-title">Import customers from NetSuite (CSV)</div>
       <p className="field-help" style={{ marginBottom: 10, maxWidth: 720 }}>
-        Export your NetSuite customers to a CSV with the internal ID, company name and (optionally) Procore IDs, and drop it here. Each
-        customer is lined up with a CRM company (first by a Procore project that one of its bids points at, then by the same name); missing ones are created with the
+        Export your NetSuite customers to a CSV with the internal ID, company name and (optionally) Procore company ID, and drop it here. Each
+        customer is lined up with a CRM company (first by Procore company ID, then by the same name); missing ones are created with the
         segment "Customer". Close-but-not-identical names are never linked automatically; they wait for you. Nothing changes until
         you press Apply.
       </p>
@@ -207,10 +207,16 @@ export default function NetSuiteSync() {
           <div className="field-help" style={{ marginBottom: 8 }}>
             Latest preview from {new Date(data.run.created_at).toLocaleString()}{data.run.created_by ? ` by ${data.run.created_by}` : ""}.
           </div>
+          {s.procore_ids_that_look_like_projects > 0 && (
+            <div className="login-error" style={{ marginBottom: 10 }}>
+              {s.procore_ids_that_look_like_projects} of the Procore IDs in this file are Procore project or bid IDs that CRM already knows, not company IDs.
+              Procore IDs were left out of this preview (matching used names only). Check the Procore ID column before applying.
+            </div>
+          )}
           <div className="kv-grid" style={{ marginBottom: 12 }}>
             <div className="kv"><span className="kv-label">Customers in file</span><span className="kv-value">{s.netsuite_customers}</span></div>
             <div className="kv"><span className="kv-label">Already linked</span><span className="kv-value">{s.already_linked}</span></div>
-            <div className="kv"><span className="kv-label">Link by Procore project</span><span className="kv-value">{s.link_by_procore_id}</span></div>
+            <div className="kv"><span className="kv-label">Link by Procore company id</span><span className="kv-value">{s.link_by_procore_id}</span></div>
             <div className="kv"><span className="kv-label">Link by same name</span><span className="kv-value">{s.link_by_name}</span></div>
             <div className="kv"><span className="kv-label">New companies</span><span className="kv-value">{s.create}{s.create_individuals ? ` (${s.create_individuals} individuals)` : ""}</span></div>
             <div className="kv"><span className="kv-label">Needs your review</span><span className="kv-value">{s.review}</span></div>
