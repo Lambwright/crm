@@ -79,6 +79,13 @@ export const api = {
   getGrants: () => request(`/grants`),
   setGrants: (username, caps) => request(`/grants`, { method: "PATCH", body: { username, caps } }),
 
+  // NetSuite -> CRM company sync (admin): preview first, then apply
+  getNsSync: () => request(`/admin/netsuite-sync`),
+  previewNsSync: () => request(`/admin/netsuite-sync/preview`, { method: "POST", body: {} }),
+  applyNsSync: (runId) => request(`/admin/netsuite-sync/apply`, { method: "POST", body: { run_id: runId } }),
+  reviewNsSync: (opId, decision) => request(`/admin/netsuite-sync/review`, { method: "POST", body: { op_id: opId, decision } }),
+  setNsSyncAuto: (enabled) => request(`/admin/netsuite-sync/auto`, { method: "POST", body: { enabled } }),
+
   // Procore project regions (one list, used for every region pick)
   listRegions: () => request(`/regions`),
 

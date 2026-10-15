@@ -769,6 +769,257 @@ async function handleCompanyCreate(request, sql) {
 }
 
 // ---------------------------------------------------------------------------
+// NetSuite -> CRM company sync (Ben, 2026-10-16). CRM companies used to come
+// only from bids and never carried a NetSuite id, so any customer that had
+// never bid through SCOUT/Procore was simply missing. This reads every active
+// NetSuite customer (stage CUSTOMER) through netsuite-worker, plus the Procore
+// company ids NetSuite keeps in customrecord_r_it_entity_pc_ids, and plans:
+//   link   - an existing CRM company gets its netsuite_customer_id. Matched by
+//            Procore company id first, then by the same name ignoring case,
+//            spacing and punctuation.
+//   create - no match at all: a new company, account segment "customer".
+//   review - no exact match but a close name (suffix/parenthetical differences);
+//            never auto-linked, an admin decides.
+//   ambiguous - two CRM companies fit, or one is already linked elsewhere.
+// A run is first stored as a PREVIEW; nothing changes until an admin applies it.
+// Existing companies' segment, region, hot-lead flag etc. are never touched.
+// ---------------------------------------------------------------------------
+const NS_SKIP_IDS = [2907, 12515]; // "Einbau Internal" and a dummy test customer
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// SuiteQL through netsuite-worker. NetSuite's hasMore flag is wrong after the
+// first 1000 rows, so page by hand until a page comes back short; and it sometimes
+// answers "Invalid login attempt" (HTTP 200) before doing anything, so that is
+// safe to retry with a growing pause.
+async function nsSuiteQL(env, q) {
+  if (!env.NETSUITE_WORKER || !env.NETSUITE_SERVICE_KEY) throw new Error("NETSUITE_WORKER binding / NETSUITE_SERVICE_KEY not configured");
+  const rows = [];
+  for (let offset = 0; offset < 20000; offset += 1000) {
+    let page = null;
+    for (let attempt = 0; attempt < 5 && !page; attempt++) {
+      const res = await env.NETSUITE_WORKER.fetch("https://netsuite.ben-a90.workers.dev/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-NetSuite-Service-Key": env.NETSUITE_SERVICE_KEY },
+        body: JSON.stringify({ method: "POST", path: `/query/v1/suiteql?limit=1000&offset=${offset}`, data: { q } }),
+      });
+      const text = await res.text();
+      if (/Invalid login attempt/i.test(text)) { await sleep(1500 * (attempt + 1)); continue; }
+      if (!res.ok) throw new Error(`netsuite-worker HTTP ${res.status}: ${text.slice(0, 200)}`);
+      let j;
+      try { j = JSON.parse(text); } catch { throw new Error("netsuite-worker returned something that isn't JSON"); }
+      if (!Array.isArray(j.items)) throw new Error(`Unexpected NetSuite answer: ${text.slice(0, 200)}`);
+      page = j.items;
+    }
+    if (!page) throw new Error("NetSuite kept answering 'Invalid login attempt'");
+    rows.push(...page);
+    if (page.length < 1000) break;
+  }
+  return rows;
+}
+
+const nsNorm = (v) => String(v || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/&/g, " and ").replace(/[^a-z0-9]+/g, " ").trim();
+const NS_LOOSE_DROP = new Set(["inc", "incorporated", "ltd", "limited", "corp", "corporation", "co", "company", "llc", "lp", "the"]);
+const nsLoose = (v) => nsNorm(String(v || "").replace(/\([^)]*\)/g, " ")).split(" ").filter((w) => w && !NS_LOOSE_DROP.has(w)).join(" ");
+
+async function buildNsPlan(env, sql) {
+  const customers = await nsSuiteQL(env, `SELECT id, companyname, COALESCE(companyname, entityid) AS name, entityid, TO_CHAR(datecreated,'YYYY-MM-DD') AS created FROM customer WHERE stage = 'CUSTOMER' AND isinactive = 'F' AND id NOT IN (${NS_SKIP_IDS.join(",")}) ORDER BY id`);
+  const pcRows = await nsSuiteQL(env, `SELECT custrecord_r_it_entity_record AS customer_id, custrecord_r_it_entity_pc_id AS procore_id FROM customrecord_r_it_entity_pc_ids`);
+  const pcByCustomer = new Map();
+  for (const r of pcRows) {
+    if (r.customer_id == null || r.procore_id == null || String(r.procore_id).trim() === "") continue;
+    const k = String(r.customer_id);
+    if (!pcByCustomer.has(k)) pcByCustomer.set(k, new Set());
+    pcByCustomer.get(k).add(String(r.procore_id).trim());
+  }
+
+  const companies = await sql`select id, name, procore_vendor_id, netsuite_customer_id from companies`;
+  const push = (m, k, v) => { if (!k) return; if (!m.has(k)) m.set(k, []); m.get(k).push(v); };
+  const byNs = new Map(), byPc = new Map(), byNorm = new Map(), byLoose = new Map();
+  for (const c of companies) {
+    if (c.netsuite_customer_id) byNs.set(String(c.netsuite_customer_id), c);
+    if (c.procore_vendor_id != null) push(byPc, String(c.procore_vendor_id), c);
+    push(byNorm, nsNorm(c.name), c);
+    push(byLoose, nsLoose(c.name), c);
+  }
+
+  const claimed = new Set();
+  const ops = [];
+  let alreadyLinked = 0;
+  for (const c of customers) {
+    const id = String(c.id);
+    const name = String(c.name || "").trim();
+    if (!name) continue;
+    if (byNs.has(id)) { alreadyLinked++; continue; }
+    const pcs = [...(pcByCustomer.get(id) || [])];
+    const base = { ns_id: id, ns_name: name, procore_id: pcs.length === 1 ? pcs[0] : null };
+    const free = (list) => [...new Map((list || []).filter((x) => !x.netsuite_customer_id).map((x) => [x.id, x])).values()];
+
+    let matched = null, reason = null;
+    const pcCand = free(pcs.flatMap((pid) => byPc.get(pid) || []));
+    if (pcCand.length === 1) { matched = pcCand[0]; reason = "Procore company id"; }
+    else if (pcCand.length > 1) {
+      ops.push({ ...base, op: "ambiguous", detail: `Procore id fits ${pcCand.length} CRM companies: ${pcCand.map((x) => x.name).join("; ")}` });
+      continue;
+    }
+    if (!matched) {
+      const all = byNorm.get(nsNorm(name)) || [];
+      const nameCand = free(all);
+      if (nameCand.length === 1) { matched = nameCand[0]; reason = "same name"; }
+      else if (nameCand.length > 1) {
+        ops.push({ ...base, op: "ambiguous", detail: `Same name appears ${nameCand.length} times in CRM: ${nameCand.map((x) => x.name).join("; ")}` });
+        continue;
+      } else if (all.length) {
+        ops.push({ ...base, op: "ambiguous", detail: `CRM company "${all[0].name}" is already linked to NetSuite customer ${all[0].netsuite_customer_id}` });
+        continue;
+      }
+    }
+    if (matched) {
+      if (claimed.has(matched.id)) { ops.push({ ...base, op: "ambiguous", detail: `"${matched.name}" also matches another NetSuite customer` }); continue; }
+      claimed.add(matched.id);
+      ops.push({ ...base, op: "link", company_id: matched.id, company_name: matched.name, detail: reason });
+      continue;
+    }
+    const loose = free(byLoose.get(nsLoose(name)));
+    if (loose.length) {
+      ops.push({ ...base, op: "review", company_id: loose[0].id, company_name: loose[0].name, detail: loose.length > 1 ? `${loose.length} similar CRM companies` : "similar name" });
+      continue;
+    }
+    const individual = !String(c.companyname || "").trim();
+    const notes = individual ? `NetSuite individual record (no company name)${pcs.length ? `; Procore company id ${pcs.join(", ")}` : ""}` : null;
+    ops.push({ ...base, op: "create", notes, detail: individual ? "individual" : null });
+  }
+
+  const count = (op) => ops.filter((o) => o.op === op).length;
+  const summary = {
+    netsuite_customers: customers.length,
+    already_linked: alreadyLinked,
+    link_by_procore_id: ops.filter((o) => o.op === "link" && o.detail === "Procore company id").length,
+    link_by_name: ops.filter((o) => o.op === "link" && o.detail === "same name").length,
+    create: count("create"),
+    create_individuals: ops.filter((o) => o.op === "create" && o.detail === "individual").length,
+    review: count("review"),
+    ambiguous: count("ambiguous"),
+    crm_companies: companies.length,
+    with_procore_id: pcByCustomer.size,
+  };
+  return { ops, summary };
+}
+
+async function insertNsOps(sql, runId, ops) {
+  for (let i = 0; i < ops.length; i += 100) {
+    const chunk = ops.slice(i, i + 100);
+    const params = [];
+    const tuples = chunk.map((o) => {
+      const base = params.length;
+      params.push(runId, o.op, o.ns_id, o.ns_name, o.company_id || null, o.company_name || null, o.procore_id || null, o.notes || null, o.detail || null);
+      return `(${Array.from({ length: 9 }, (_, k) => `${base + k + 1}`).join(", ")})`;
+    });
+    await sql.query(`insert into ns_sync_ops (run_id, op, ns_id, ns_name, company_id, company_name, procore_id, notes, detail) values ${tuples.join(", ")}`, params);
+  }
+}
+
+async function nsSyncPreview(env, sql, { createdBy, auto = false } = {}) {
+  const { ops, summary } = await buildNsPlan(env, sql);
+  const [run] = await sql`insert into ns_sync_runs (created_by, auto, summary) values (${createdBy || null}, ${auto}, ${JSON.stringify(summary)}::jsonb) returning id, created_at`;
+  await insertNsOps(sql, run.id, ops);
+  return { run_id: run.id, summary };
+}
+
+// Applies up to `limit` pending link/create ops, each re-checked against the
+// live row so a stale preview can't overwrite anything. Idempotent: call until
+// remaining is 0.
+async function nsSyncApply(sql, runId, limit = 100) {
+  const pending = await sql`select * from ns_sync_ops where run_id = ${runId} and status = 'pending' and op in ('link', 'create') order by op, ns_id limit ${limit}`;
+  for (const o of pending) await nsApplyOne(sql, o);
+  const [{ n }] = await sql`select count(*)::int as n from ns_sync_ops where run_id = ${runId} and status = 'pending' and op in ('link', 'create')`;
+  return { applied_now: pending.length, remaining: n };
+}
+
+async function nsApplyOne(sql, o) {
+  const done = (status, detail) => sql`update ns_sync_ops set status = ${status}, detail = coalesce(${detail}, detail) where id = ${o.id}`;
+  if (o.op === "link") {
+    const r = await sql`
+      update companies set netsuite_customer_id = ${o.ns_id}, procore_vendor_id = coalesce(procore_vendor_id, nullif(${o.procore_id || ""}, '')::bigint), updated_at = now()
+      where id = ${o.company_id} and netsuite_customer_id is null returning id`;
+    return done(r.length ? "applied" : "skipped", r.length ? null : "company was already linked or removed");
+  }
+  if (o.op === "create") {
+    const exists = await sql`select id from companies where lower(trim(name)) = lower(trim(${o.ns_name})) or netsuite_customer_id = ${o.ns_id} limit 1`;
+    if (exists.length) return done("skipped", "a company with this name or NetSuite id already exists");
+    await sql`
+      insert into companies (name, netsuite_customer_id, procore_vendor_id, account_segment, notes)
+      values (${o.ns_name}, ${o.ns_id}, nullif(${o.procore_id || ""}, '')::bigint, 'customer', ${o.notes || null})`;
+    return done("applied");
+  }
+}
+
+async function kvGet(sql, key) {
+  const [r] = await sql`select value from crm_kv where key = ${key}`;
+  return r ? r.value : null;
+}
+async function kvSet(sql, key, value) {
+  await sql`insert into crm_kv (key, value, updated_at) values (${key}, ${JSON.stringify(value)}::jsonb, now()) on conflict (key) do update set value = excluded.value, updated_at = now()`;
+}
+
+// Nightly run, only once an admin has switched it on after the first backfill:
+// plans afresh and applies the safe link/create ops; near-name matches and
+// ambiguous ones stay on the review list.
+async function nsSyncNightly(env, sql) {
+  if (!(await kvGet(sql, "ns_sync_auto"))) return;
+  const out = await nsSyncPreview(env, sql, { createdBy: "nightly", auto: true });
+  for (let i = 0; i < 6; i++) {
+    const r = await nsSyncApply(sql, out.run_id, 100);
+    if (!r.remaining) break;
+  }
+}
+
+async function handleNsSyncGet(sql) {
+  const [run] = await sql`select * from ns_sync_runs order by created_at desc limit 1`;
+  const auto = Boolean(await kvGet(sql, "ns_sync_auto"));
+  if (!run) return json({ run: null, auto });
+  const counts = await sql`select op, status, count(*)::int as n from ns_sync_ops where run_id = ${run.id} group by op, status`;
+  const list = (op, status) => sql`select id, ns_id, ns_name, company_id, company_name, procore_id, detail, status from ns_sync_ops where run_id = ${run.id} and op = ${op} and status = ${status} order by ns_name limit 400`;
+  return json({
+    run: { id: run.id, created_at: run.created_at, created_by: run.created_by, auto: run.auto, summary: run.summary },
+    auto,
+    counts,
+    create: await list("create", "pending"),
+    review: await list("review", "pending"),
+    ambiguous: await list("ambiguous", "pending"),
+    link: await list("link", "pending"),
+  });
+}
+
+async function handleNsSyncRoute(request, url, sql, env, user) {
+  if (!isCrmAdmin(user)) return forbidden("Admin access required.");
+  const path = url.pathname;
+  if (path === "/admin/netsuite-sync" && request.method === "GET") return handleNsSyncGet(sql);
+  if (path === "/admin/netsuite-sync/preview" && request.method === "POST") {
+    try { return json(await nsSyncPreview(env, sql, { createdBy: user.username })); }
+    catch (e) { return json({ error: "netsuite_unreachable", detail: e.message }, 502); }
+  }
+  const body = await parseBody(request);
+  if (path === "/admin/netsuite-sync/apply" && request.method === "POST") {
+    if (!body.run_id) return json({ error: "run_id is required" }, 400);
+    return json(await nsSyncApply(sql, body.run_id, 100));
+  }
+  if (path === "/admin/netsuite-sync/review" && request.method === "POST") {
+    const [o] = await sql`select * from ns_sync_ops where id = ${body.op_id} and op = 'review' and status = 'pending'`;
+    if (!o) return json({ error: "not_found" }, 404);
+    if (body.decision === "skip") { await sql`update ns_sync_ops set status = 'skipped', detail = 'left alone by an admin' where id = ${o.id}`; return json({ ok: true }); }
+    if (body.decision === "link") await nsApplyOne(sql, { ...o, op: "link" });
+    else if (body.decision === "create") await nsApplyOne(sql, { ...o, op: "create", ns_name: o.ns_name });
+    else return json({ error: "decision must be link, create or skip" }, 400);
+    return json({ ok: true });
+  }
+  if (path === "/admin/netsuite-sync/auto" && request.method === "POST") {
+    await kvSet(sql, "ns_sync_auto", Boolean(body.enabled));
+    return json({ auto: Boolean(body.enabled) });
+  }
+  return json({ error: "not_found" }, 404);
+}
+
+// ---------------------------------------------------------------------------
 // Customer payment scores — POST /internal/payment-scores (Ben, 2026-10-16).
 // netsuite-worker computes the score once and pushes the finished values here,
 // right after it writes the custentity_scout_pay* NetSuite fields. CRM stores
@@ -1489,6 +1740,34 @@ SELF_MIGRATIONS.push({
     `create index if not exists scout_runs_rfq_idx on scout_runs (rfq_ref)`,
   ],
 });
+SELF_MIGRATIONS.push({
+  id: "015_netsuite_company_sync",
+  statements: [
+    `create table if not exists crm_kv (key text primary key, value jsonb not null, updated_at timestamptz not null default now())`,
+    `create table if not exists ns_sync_runs (
+      id uuid primary key default gen_random_uuid(),
+      created_at timestamptz not null default now(),
+      created_by text,
+      auto boolean not null default false,
+      summary jsonb
+    )`,
+    `create table if not exists ns_sync_ops (
+      id uuid primary key default gen_random_uuid(),
+      run_id uuid not null references ns_sync_runs(id) on delete cascade,
+      op text not null,                 -- link | create | review | ambiguous
+      ns_id text,
+      ns_name text,
+      company_id uuid,
+      company_name text,
+      procore_id text,
+      notes text,
+      status text not null default 'pending',   -- pending | applied | skipped
+      detail text
+    )`,
+    `create index if not exists ns_sync_ops_run_idx on ns_sync_ops (run_id, op, status)`,
+    `create index if not exists companies_netsuite_id_idx on companies (netsuite_customer_id)`,
+  ],
+});
 let schemaReady = null;
 function ensureSchema(sql) {
   if (!schemaReady) {
@@ -2162,6 +2441,7 @@ export default {
       if (url.pathname === "/followups" && request.method === "GET") return withRefresh(await handleFollowupsList(url, sql, auth.user));
 
       if (url.pathname === "/access" && request.method === "GET") return withRefresh(await handleAccess(env, auth.user));
+      if (url.pathname.startsWith("/admin/netsuite-sync")) return withRefresh(await handleNsSyncRoute(request, url, sql, env, auth.user));
       if (url.pathname === "/regions" && request.method === "GET") return withRefresh(await handleRegionsList(env, sql));
       if (url.pathname === "/grants" && request.method === "GET") return withRefresh(await handleGrantsGet(env, sql, auth.user));
       if (url.pathname === "/grants" && request.method === "PATCH") return withRefresh(await handleGrantsPatch(request, sql, auth.user));
@@ -2178,6 +2458,7 @@ export default {
 
   async scheduled(_event, env, ctx) {
     ctx.waitUntil(runStalenessSweep(env));
+    ctx.waitUntil((async () => { try { await nsSyncNightly(env, sqlFor(env)); } catch (e) { console.log("netsuite sync failed:", e.message); } })());
     ctx.waitUntil((async () => { try { await ensureSchema(sqlFor(env)); await refreshRegions(env, sqlFor(env)); } catch (e) { console.log("region refresh failed:", e.message); } })());
   },
 };

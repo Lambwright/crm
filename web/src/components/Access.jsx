@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api.js";
+import NetSuiteSync from "./NetSuiteSync.jsx";
 
 // Admin-only. The Einbau ID level (admin / estimator / PM) is set in HELM and
 // decides the base of what someone can do; this tab adds the two extra
@@ -98,6 +99,7 @@ export default function Access() {
           <div key={k} className="field-help"><strong>{c.label}</strong> — {c.help}</div>
         ))}
       </div>
+      <NetSuiteSync />
     </>
   );
 }
