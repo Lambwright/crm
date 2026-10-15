@@ -51,7 +51,7 @@ const FIELD_LABELS = {
   companyname: "Company name",
   name: "Name (used if there's no company name)",
   entityid: "Entity ID (for individuals)",
-  procore: "Procore company ID",
+  procore: "Procore ID (project IDs are fine; used as evidence only)",
   stage: "Stage (optional; only 'Customer' rows are used)",
   inactive: "Inactive (optional; inactive rows are skipped)",
 };
@@ -149,8 +149,8 @@ export default function NetSuiteSync() {
     <div style={{ marginBottom: 24 }}>
       <div className="card-title">Import customers from NetSuite (CSV)</div>
       <p className="field-help" style={{ marginBottom: 10, maxWidth: 720 }}>
-        Export your NetSuite customers to a CSV with the internal ID, company name and Procore company ID, and drop it here. Each
-        customer is lined up with a CRM company (by Procore company ID, then by the same name); missing ones are created with the
+        Export your NetSuite customers to a CSV with the internal ID, company name and (optionally) Procore IDs, and drop it here. Each
+        customer is lined up with a CRM company (first by a Procore project that one of its bids points at, then by the same name); missing ones are created with the
         segment "Customer". Close-but-not-identical names are never linked automatically; they wait for you. Nothing changes until
         you press Apply.
       </p>
@@ -210,7 +210,7 @@ export default function NetSuiteSync() {
           <div className="kv-grid" style={{ marginBottom: 12 }}>
             <div className="kv"><span className="kv-label">Customers in file</span><span className="kv-value">{s.netsuite_customers}</span></div>
             <div className="kv"><span className="kv-label">Already linked</span><span className="kv-value">{s.already_linked}</span></div>
-            <div className="kv"><span className="kv-label">Link by Procore id</span><span className="kv-value">{s.link_by_procore_id}</span></div>
+            <div className="kv"><span className="kv-label">Link by Procore project</span><span className="kv-value">{s.link_by_procore_id}</span></div>
             <div className="kv"><span className="kv-label">Link by same name</span><span className="kv-value">{s.link_by_name}</span></div>
             <div className="kv"><span className="kv-label">New companies</span><span className="kv-value">{s.create}{s.create_individuals ? ` (${s.create_individuals} individuals)` : ""}</span></div>
             <div className="kv"><span className="kv-label">Needs your review</span><span className="kv-value">{s.review}</span></div>
