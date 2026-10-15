@@ -138,6 +138,33 @@ happen while the bid was still live. Migration 009 is applied by the worker itse
 (`ensureSchema`) on first run after deploy. If a Procore report with real status dates is
 ever produced, import it into `decided_at`.
 
+## Planned / on deck: customer payment scores (from SCOUT)
+
+Nothing to build yet. Noted 2026-10-15 at Ben's request, relayed by the SCOUT session.
+
+SCOUT is getting an automatic customer payment score, and Ben wants those values
+shown in CRM later (most likely on the company page, and next to the client in
+SCOUT's own win-history line). A Cloudflare worker will compute the facts monthly
+and write them onto these NetSuite Customer fields:
+
+| Field | Meaning |
+|---|---|
+| `custentity_scout_payment_score` | 0-10 score; left blank when there is too little history |
+| `custentity_scout_pay_avg_days_18m` | average days to pay, last 18 months |
+| `custentity_scout_pay_avg_days_6m` | average days to pay, last 6 months |
+| `custentity_scout_pay_invoices` | number of invoices judged |
+| `custentity_scout_pay_late_pct` | share of invoices paid late |
+| `custentity_scout_pay_credit_pct` | share of invoices with credits |
+| `custentity_scout_pay_credit_freq` | how often credits occur |
+| `custentity_scout_pay_overdue_days` | days currently overdue |
+| `custentity_scout_pay_calc_date` | when it was last calculated |
+| `custentity_scout_pay_status` | "Limited history" or "No history" when fewer than 3 judged invoices |
+
+Rules to keep when this is built:
+- Only these derived numbers are ever shown in CRM, never dollar A/R.
+- The score is blank (not zero) when status is "Limited history" or "No history"; show the status text instead.
+- The SCOUT session will say when the on-demand endpoint URL and response shape exist. CRM should prefer reading those (live, through the NETSUITE_WORKER binding or that endpoint) over copying the values into its own tables.
+
 ## On hold: backlog / resource forecast
 
 Decisions from Ben, 2026-10-05. **Nothing here is built, and nothing gets
