@@ -821,15 +821,36 @@ const nsNorm = (v) => String(v || "").normalize("NFKD").replace(/[\u0300-\u036f]
 const NS_LOOSE_DROP = new Set(["inc", "incorporated", "ltd", "limited", "corp", "corporation", "co", "company", "llc", "lp", "the"]);
 const nsLoose = (v) => nsNorm(String(v || "").replace(/\([^)]*\)/g, " ")).split(" ").filter((w) => w && !NS_LOOSE_DROP.has(w)).join(" ");
 
-async function buildNsPlan(env, sql) {
-  const customers = await nsSuiteQL(env, `SELECT id, companyname, COALESCE(companyname, entityid) AS name, entityid, TO_CHAR(datecreated,'YYYY-MM-DD') AS created FROM customer WHERE stage = 'CUSTOMER' AND isinactive = 'F' AND id NOT IN (${NS_SKIP_IDS.join(",")}) ORDER BY id`);
-  const pcRows = await nsSuiteQL(env, `SELECT custrecord_r_it_entity_record AS customer_id, custrecord_r_it_entity_pc_id AS procore_id FROM customrecord_r_it_entity_pc_ids`);
+// `rows` is the customer list from an uploaded NetSuite CSV, already read by
+// the browser: [{ ns_id, companyname, name, entityid, procore_ids: [] }]. Without
+// rows it reads NetSuite directly (needs the NETSUITE_SERVICE_KEY secret; not
+// used while the CSV route is the way Ben imports).
+async function buildNsPlan(env, sql, rows) {
+  let customers;
   const pcByCustomer = new Map();
-  for (const r of pcRows) {
-    if (r.customer_id == null || r.procore_id == null || String(r.procore_id).trim() === "") continue;
-    const k = String(r.customer_id);
-    if (!pcByCustomer.has(k)) pcByCustomer.set(k, new Set());
-    pcByCustomer.get(k).add(String(r.procore_id).trim());
+  if (Array.isArray(rows)) {
+    const byId = new Map();
+    for (const r of rows) {
+      const id = String(r.ns_id ?? "").trim();
+      if (!id || NS_SKIP_IDS.includes(Number(id))) continue;
+      if (!byId.has(id)) byId.set(id, { id, companyname: String(r.companyname || "").trim() || null, name: String(r.name || r.companyname || r.entityid || "").trim(), entityid: r.entityid || null });
+      for (const pid of Array.isArray(r.procore_ids) ? r.procore_ids : []) {
+        const v = String(pid || "").trim();
+        if (!v) continue;
+        if (!pcByCustomer.has(id)) pcByCustomer.set(id, new Set());
+        pcByCustomer.get(id).add(v);
+      }
+    }
+    customers = [...byId.values()];
+  } else {
+    customers = await nsSuiteQL(env, `SELECT id, companyname, COALESCE(companyname, entityid) AS name, entityid, TO_CHAR(datecreated,'YYYY-MM-DD') AS created FROM customer WHERE stage = 'CUSTOMER' AND isinactive = 'F' AND id NOT IN (${NS_SKIP_IDS.join(",")}) ORDER BY id`);
+    const pcRows = await nsSuiteQL(env, `SELECT custrecord_r_it_entity_record AS customer_id, custrecord_r_it_entity_pc_id AS procore_id FROM customrecord_r_it_entity_pc_ids`);
+    for (const r of pcRows) {
+      if (r.customer_id == null || r.procore_id == null || String(r.procore_id).trim() === "") continue;
+      const k = String(r.customer_id);
+      if (!pcByCustomer.has(k)) pcByCustomer.set(k, new Set());
+      pcByCustomer.get(k).add(String(r.procore_id).trim());
+    }
   }
 
   const companies = await sql`select id, name, procore_vendor_id, netsuite_customer_id from companies`;
@@ -918,8 +939,8 @@ async function insertNsOps(sql, runId, ops) {
   }
 }
 
-async function nsSyncPreview(env, sql, { createdBy, auto = false } = {}) {
-  const { ops, summary } = await buildNsPlan(env, sql);
+async function nsSyncPreview(env, sql, { createdBy, auto = false, rows } = {}) {
+  const { ops, summary } = await buildNsPlan(env, sql, rows);
   const [run] = await sql`insert into ns_sync_runs (created_by, auto, summary) values (${createdBy || null}, ${auto}, ${JSON.stringify(summary)}::jsonb) returning id, created_at`;
   await insertNsOps(sql, run.id, ops);
   return { run_id: run.id, summary };
@@ -995,7 +1016,9 @@ async function handleNsSyncRoute(request, url, sql, env, user) {
   const path = url.pathname;
   if (path === "/admin/netsuite-sync" && request.method === "GET") return handleNsSyncGet(sql);
   if (path === "/admin/netsuite-sync/preview" && request.method === "POST") {
-    try { return json(await nsSyncPreview(env, sql, { createdBy: user.username })); }
+    const b = await parseBody(request);
+    if (Array.isArray(b.rows) && b.rows.length > 20000) return json({ error: "too_many_rows" }, 413);
+    try { return json(await nsSyncPreview(env, sql, { createdBy: user.username, rows: Array.isArray(b.rows) ? b.rows : undefined })); }
     catch (e) { return json({ error: "netsuite_unreachable", detail: e.message }, 502); }
   }
   const body = await parseBody(request);

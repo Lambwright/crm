@@ -1,10 +1,83 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api.js";
 
-// Admin tool (Access tab): link or create a CRM company for every active NetSuite
-// customer. Always preview first; nothing changes until "Apply". Existing
-// companies keep their segment, region and flags; the sync only adds the
-// NetSuite id (and the Procore company id where CRM lacks it).
+// Admin tool (Companies tab): upload a NetSuite customer export (CSV) and link
+// or create a CRM company for each customer. Always preview first; nothing
+// changes until "Apply". Existing companies keep their segment, region and
+// flags; the import only adds the NetSuite id (and the Procore company id where
+// CRM lacks it).
+
+// --- tiny CSV reader (quotes, commas or tabs, Excel's BOM) ---------------------
+function parseCsv(text) {
+  const t = text.replace(/^﻿/, "");
+  const firstLine = t.split(/\r?\n/, 1)[0] || "";
+  const delim = (firstLine.match(/\t/g) || []).length > (firstLine.match(/,/g) || []).length ? "\t" : ",";
+  const rows = [];
+  let row = [], field = "", quoted = false;
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i];
+    if (quoted) {
+      if (c === '"') { if (t[i + 1] === '"') { field += '"'; i++; } else quoted = false; } else field += c;
+    } else if (c === '"') quoted = true;
+    else if (c === delim) { row.push(field); field = ""; }
+    else if (c === "\n") { row.push(field.replace(/\r$/, "")); rows.push(row); row = []; field = ""; }
+    else field += c;
+  }
+  if (field !== "" || row.length) { row.push(field.replace(/\r$/, "")); rows.push(row); }
+  return rows.filter((r) => r.some((v) => v.trim() !== ""));
+}
+
+const squash = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+const GUESS = {
+  ns_id: ["internalid", "netsuiteid", "nsid", "internalidnumber", "customerinternalid", "nscustomerid"],
+  companyname: ["companyname", "company"],
+  name: ["name", "customer", "customername"],
+  entityid: ["entityid", "customerid", "id"],
+  procore: ["procoreid", "procorecompanyid", "procorevendorid", "procore", "pcid", "procorecompany", "procorecompanyidnumber"],
+  stage: ["stage", "entitystage", "status"],
+  inactive: ["inactive", "isinactive"],
+};
+function guessColumns(header) {
+  const h = header.map(squash);
+  const out = {};
+  for (const [field, names] of Object.entries(GUESS)) {
+    const i = h.findIndex((x) => names.includes(x));
+    out[field] = i === -1 ? "" : String(i);
+  }
+  return out;
+}
+const FIELD_LABELS = {
+  ns_id: "NetSuite internal ID (required)",
+  companyname: "Company name",
+  name: "Name (used if there's no company name)",
+  entityid: "Entity ID (for individuals)",
+  procore: "Procore company ID",
+  stage: "Stage (optional; only 'Customer' rows are used)",
+  inactive: "Inactive (optional; inactive rows are skipped)",
+};
+
+function buildRows(table, map) {
+  const get = (r, f) => (map[f] === "" ? "" : (r[Number(map[f])] ?? "").trim());
+  const rows = [];
+  let skippedStage = 0, skippedInactive = 0;
+  for (const r of table.slice(1)) {
+    const stage = get(r, "stage");
+    if (map.stage !== "" && stage && !/^customer/i.test(stage)) { skippedStage++; continue; }
+    const inactive = get(r, "inactive");
+    if (map.inactive !== "" && /^(t|true|yes|y|1)$/i.test(inactive)) { skippedInactive++; continue; }
+    const ns_id = get(r, "ns_id");
+    if (!ns_id) continue;
+    rows.push({
+      ns_id,
+      companyname: get(r, "companyname"),
+      name: get(r, "name"),
+      entityid: get(r, "entityid"),
+      procore_ids: get(r, "procore").split(/[,;|\s]+/).filter(Boolean),
+    });
+  }
+  return { rows, skippedStage, skippedInactive };
+}
+
 function Section({ title, count, children, open }) {
   if (!count) return null;
   return (
@@ -20,6 +93,10 @@ export default function NetSuiteSync() {
   const [busy, setBusy] = useState(null);
   const [error, setError] = useState(null);
   const [progress, setProgress] = useState(null);
+  const [table, setTable] = useState(null); // parsed CSV, header row first
+  const [fileName, setFileName] = useState("");
+  const [map, setMap] = useState(null);
+  const fileRef = useRef(null);
 
   const load = useCallback(() => api.getNsSync().then(setData).catch((e) => setError(e.message)), []);
   useEffect(() => { load(); }, [load]);
@@ -36,6 +113,20 @@ export default function NetSuiteSync() {
       setBusy(null);
     }
   }
+
+  async function onFile(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setError(null);
+    const text = await file.text();
+    const t = parseCsv(text);
+    if (t.length < 2) { setError("That file has no data rows."); return; }
+    setFileName(file.name);
+    setTable(t);
+    setMap(guessColumns(t[0]));
+  }
+
+  const built = table && map ? buildRows(table, map) : null;
 
   const pendingCount = (op) => (data?.counts || []).filter((c) => c.op === op && c.status === "pending").reduce((s, c) => s + c.n, 0);
   const toApply = pendingCount("link") + pendingCount("create");
@@ -55,39 +146,69 @@ export default function NetSuiteSync() {
 
   const s = data?.run?.summary;
   return (
-    <div style={{ marginTop: 28 }}>
-      <div className="card-title">NetSuite customer sync</div>
+    <div style={{ marginBottom: 24 }}>
+      <div className="card-title">Import customers from NetSuite (CSV)</div>
       <p className="field-help" style={{ marginBottom: 10, maxWidth: 720 }}>
-        Reads every active NetSuite customer and lines it up with CRM: existing companies are linked (by Procore company id, then by
-        the same name), missing ones are created with the segment "Customer". Close-but-not-identical names are never linked
-        automatically; they wait here for you. Nothing is changed until you press Apply.
+        Export your NetSuite customers to a CSV with the internal ID, company name and Procore company ID, and drop it here. Each
+        customer is lined up with a CRM company (by Procore company ID, then by the same name); missing ones are created with the
+        segment "Customer". Close-but-not-identical names are never linked automatically; they wait for you. Nothing changes until
+        you press Apply.
       </p>
-      <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", marginBottom: 12 }}>
-        <button className="btn btn-accent btn-sm" disabled={!!busy} onClick={() => run("preview", () => api.previewNsSync())}>
-          {busy === "preview" ? "Reading NetSuite…" : data?.run ? "↻ Preview again" : "Preview sync"}
-        </button>
+
+      <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", marginBottom: 10 }}>
+        <input ref={fileRef} type="file" accept=".csv,.tsv,.txt,text/csv" onChange={onFile} />
+        {built && (
+          <button
+            className="btn btn-accent btn-sm"
+            disabled={!!busy || !built.rows.length || map.ns_id === ""}
+            onClick={() => run("preview", () => api.previewNsSync(built.rows))}
+          >
+            {busy === "preview" ? "Matching…" : `Preview ${built.rows.length} customers`}
+          </button>
+        )}
         {data?.run && toApply > 0 && (
           <button className="btn btn-accent btn-sm" disabled={!!busy} onClick={applyAll}>
             {busy === "apply" ? `Applying… ${progress || ""}` : `Apply ${toApply} change${toApply === 1 ? "" : "s"}`}
           </button>
         )}
-        {data?.run && (
-          <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text-secondary)" }}>
-            <input type="checkbox" checked={!!data.auto} disabled={!!busy} onChange={(e) => run("auto", () => api.setNsSyncAuto(e.target.checked))} />
-            Keep syncing automatically every night (new matches are linked or created; unusual ones wait here)
-          </label>
-        )}
       </div>
+
+      {table && map && (
+        <details open style={{ marginBottom: 12 }}>
+          <summary style={{ cursor: "pointer", fontSize: 13, fontWeight: 600 }}>
+            {fileName}: {table.length - 1} rows. Check the columns I picked
+          </summary>
+          <div className="field-row" style={{ flexWrap: "wrap", marginTop: 8 }}>
+            {Object.entries(FIELD_LABELS).map(([f, label]) => (
+              <div className="field" key={f} style={{ minWidth: 240 }}>
+                <label>{label}</label>
+                <select value={map[f]} onChange={(e) => setMap((m) => ({ ...m, [f]: e.target.value }))}>
+                  <option value="">— none —</option>
+                  {table[0].map((h, i) => <option key={i} value={String(i)}>{h || `(column ${i + 1})`}</option>)}
+                </select>
+              </div>
+            ))}
+          </div>
+          {built && (
+            <div className="field-help">
+              Using {built.rows.length} rows
+              {built.skippedStage ? `, skipping ${built.skippedStage} that aren't customers` : ""}
+              {built.skippedInactive ? `, ${built.skippedInactive} inactive` : ""}.
+              {map.ns_id === "" ? " Pick the NetSuite internal ID column to continue." : ""}
+            </div>
+          )}
+        </details>
+      )}
+
       {error && <div className="login-error" style={{ marginBottom: 8 }}>{error}</div>}
       {!data && !error && <div className="spinner-inline">Loading…</div>}
-      {data && !data.run && <div className="field-help">No preview yet.</div>}
       {s && (
         <>
           <div className="field-help" style={{ marginBottom: 8 }}>
-            Preview from {new Date(data.run.created_at).toLocaleString()}{data.run.created_by ? ` by ${data.run.created_by}` : ""}.
+            Latest preview from {new Date(data.run.created_at).toLocaleString()}{data.run.created_by ? ` by ${data.run.created_by}` : ""}.
           </div>
           <div className="kv-grid" style={{ marginBottom: 12 }}>
-            <div className="kv"><span className="kv-label">NetSuite customers</span><span className="kv-value">{s.netsuite_customers}</span></div>
+            <div className="kv"><span className="kv-label">Customers in file</span><span className="kv-value">{s.netsuite_customers}</span></div>
             <div className="kv"><span className="kv-label">Already linked</span><span className="kv-value">{s.already_linked}</span></div>
             <div className="kv"><span className="kv-label">Link by Procore id</span><span className="kv-value">{s.link_by_procore_id}</span></div>
             <div className="kv"><span className="kv-label">Link by same name</span><span className="kv-value">{s.link_by_name}</span></div>

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../api.js";
 import { ACCOUNT_SEGMENT_LABELS, ACCOUNT_SEGMENTS } from "../stages.js";
 import CompanyDetail from "./CompanyDetail.jsx";
+import NetSuiteSync from "./NetSuiteSync.jsx";
 
 function fmtMoney(n) {
   return `$${Math.round(n || 0).toLocaleString()}`;
@@ -30,6 +31,8 @@ export default function CompanyList({ access }) {
   const [expiringHotLeads, setExpiringHotLeads] = useState([]);
   const [sortKey, setSortKey] = useState("name");
   const [sortDir, setSortDir] = useState("asc");
+  const [showImport, setShowImport] = useState(false);
+  const isAdmin = access?.can?.admin === true;
 
   function toggleSort(key) {
     if (key === sortKey) {
@@ -92,6 +95,14 @@ export default function CompanyList({ access }) {
           </div>
         </div>
       ))}
+      {isAdmin && (
+        <div style={{ marginBottom: 12 }}>
+          <button className="btn btn-ghost btn-sm" onClick={() => setShowImport((v) => !v)}>
+            {showImport ? "Close customer import" : "⬆ Import customers from NetSuite (CSV)"}
+          </button>
+          {showImport && <div className="card" style={{ marginTop: 10 }}><NetSuiteSync /></div>}
+        </div>
+      )}
       <div className="field-row" style={{ marginBottom: 12 }}>
         <div className="field" style={{ flex: 2 }}>
           <input placeholder="Search companies…" value={q} onChange={(e) => setQ(e.target.value)} />

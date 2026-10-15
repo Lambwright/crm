@@ -81,7 +81,7 @@ export const api = {
 
   // NetSuite -> CRM company sync (admin): preview first, then apply
   getNsSync: () => request(`/admin/netsuite-sync`),
-  previewNsSync: () => request(`/admin/netsuite-sync/preview`, { method: "POST", body: {} }),
+  previewNsSync: (rows) => request(`/admin/netsuite-sync/preview`, { method: "POST", body: { rows } }),
   applyNsSync: (runId) => request(`/admin/netsuite-sync/apply`, { method: "POST", body: { run_id: runId } }),
   reviewNsSync: (opId, decision) => request(`/admin/netsuite-sync/review`, { method: "POST", body: { op_id: opId, decision } }),
   setNsSyncAuto: (enabled) => request(`/admin/netsuite-sync/auto`, { method: "POST", body: { enabled } }),
