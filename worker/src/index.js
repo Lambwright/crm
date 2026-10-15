@@ -784,7 +784,10 @@ async function handleCompanyCreate(request, sql) {
 // A run is first stored as a PREVIEW; nothing changes until an admin applies it.
 // Existing companies' segment, region, hot-lead flag etc. are never touched.
 // ---------------------------------------------------------------------------
-const NS_SKIP_IDS = [2907, 12515]; // "Einbau Internal" and a dummy test customer
+// Internal / test records in NetSuite that are not real customers: Einbau Internal, a dummy
+// Go-Fast customer, IC-Einbau (intercompany), two Stratus-EB dry-run customers, XXTEST, and the
+// ZZTEST Claude E2E company.
+const NS_SKIP_IDS = [2907, 12515, 21, 2544, 2547, 16292, 16896];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // SuiteQL through netsuite-worker. NetSuite's hasMore flag is wrong after the
