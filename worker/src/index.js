@@ -1501,34 +1501,65 @@ async function resolveRunCompanies(sql) {
 async function handleScoutUnlinked(request, url, sql, user) {
   if (!isCrmAdmin(user)) return forbidden("Admin access required.");
   if (url.pathname === "/admin/scout-unlinked" && request.method === "GET") {
-    const companies = await resolveRunCompanies(sql);
-    const rows = await sql`select client, count(*)::int as runs, min(project_name) as example from scout_runs where company_id is null and not excluded and client is not null group by client order by count(*) desc, client`;
+    await resolveRunCompanies(sql);
+    // Suggestions come from every company with its city/province, so branches of one
+    // customer (each its own company) can be told apart; the province prefix on the
+    // project name ("ON – ", "AB – ") nudges the matching branch to the top.
+    const companies = await sql`select id, name, city, province from companies`;
+    const runs = await sql`select id, client, project_name, submitted_at, tier from scout_runs where company_id is null and not excluded and client is not null order by client, submitted_at`;
     const tokens = (v) => new Set(nsLoose(v).split(" ").filter((w) => w.length > 1));
-    const index = companies.map((c) => ({ id: c.id, name: c.name, t: tokens(c.name), first: nsLoose(c.name).split(" ")[0] }));
-    const out = rows.map((r) => {
-      const t = tokens(r.client);
-      const first = nsLoose(r.client).split(" ")[0];
-      const cand = index
+    const index = companies.map((c) => ({ id: c.id, name: c.name, city: c.city, province: c.province, t: tokens(c.name), first: nsLoose(c.name).split(" ")[0] }));
+    const provOf = (project) => { const m = /^\s*([A-Za-z]{2})\s*[–—-]/.exec(project || ""); return m ? m[1].toUpperCase() : null; };
+    const suggest = (client, project) => {
+      const t = tokens(client);
+      const first = nsLoose(client).split(" ")[0];
+      const prov = provOf(project);
+      return index
         .map((c) => {
           let overlap = 0;
           for (const w of t) if (c.t.has(w)) overlap++;
-          const score = t.size ? overlap / Math.max(t.size, 1) : 0;
-          return { id: c.id, name: c.name, score: score + (c.first && c.first === first ? 0.4 : 0) };
+          let score = t.size ? overlap / t.size : 0;
+          if (c.first && c.first === first) score += 0.4;
+          if (score >= 0.5 && prov && c.province && String(c.province).toUpperCase() === prov) score += 0.3;
+          return { id: c.id, name: c.name, city: c.city, province: c.province, score };
         })
         .filter((c) => c.score >= 0.5)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 4)
-        .map((c) => ({ id: c.id, name: c.name }));
-      return { client: r.client, runs: r.runs, example: r.example, suggestions: cand };
-    });
+        .sort((x, y) => y.score - x.score)
+        .slice(0, 6)
+        .map(({ id, name, city, province }) => ({ id, name, city, province }));
+    };
+    const byClient = new Map();
+    for (const r of runs) {
+      if (!byClient.has(r.client)) byClient.set(r.client, []);
+      byClient.get(r.client).push(r);
+    }
+    const out = [...byClient.entries()]
+      .map(([client, rs]) => ({
+        client,
+        runs: rs.length,
+        suggestions: suggest(client, rs[0].project_name),
+        items: rs.slice(0, 80).map((r) => ({ id: r.id, project_name: r.project_name, submitted_at: r.submitted_at, tier: r.tier, suggestions: suggest(client, r.project_name) })),
+      }))
+      .sort((x, y) => y.runs - x.runs || x.client.localeCompare(y.client));
     return json({ clients: out });
   }
   const body = await parseBody(request);
   if (url.pathname === "/admin/scout-unlinked/link" && request.method === "POST") {
-    if (!body.client || !body.company_id) return json({ error: "client and company_id are required" }, 400);
+    const runIds = Array.isArray(body.run_ids) ? body.run_ids.map(String).slice(0, 200) : null;
+    if ((!body.client && !runIds) || !body.company_id) return json({ error: "company_id and client or run_ids are required" }, 400);
     const [company] = await sql`select id, name from companies where id = ${body.company_id}`;
     if (!company) return json({ error: "not_found" }, 404);
-    const upd = await sql`update scout_runs set company_id = ${company.id} where client = ${body.client} returning id`;
+    // Specific runs: just those (a customer with several branches is matched run by run, and
+    // the spelling is NOT remembered as an alias because it doesn't point at one company).
+    if (runIds) {
+      let n = 0;
+      for (const id of runIds) {
+        const r = await sql`update scout_runs set company_id = ${company.id} where id = ${id} and company_id is null returning id`;
+        n += r.length;
+      }
+      return json({ ok: true, linked_runs: n, company: company.name });
+    }
+    const upd = await sql`update scout_runs set company_id = ${company.id} where client = ${body.client} and company_id is null returning id`;
     const key = nsNorm(body.client);
     if (key && key !== nsNorm(company.name)) {
       await sql`insert into company_aliases (alias_norm, company_id, alias_name) values (${key}, ${company.id}, ${body.client}) on conflict (alias_norm) do update set company_id = excluded.company_id, alias_name = excluded.alias_name`;
@@ -1536,7 +1567,13 @@ async function handleScoutUnlinked(request, url, sql, user) {
     return json({ ok: true, linked_runs: upd.length, company: company.name });
   }
   if (url.pathname === "/admin/scout-unlinked/exclude" && request.method === "POST") {
-    if (!body.client) return json({ error: "client is required" }, 400);
+    const runIds = Array.isArray(body.run_ids) ? body.run_ids.map(String).slice(0, 200) : null;
+    if (!body.client && !runIds) return json({ error: "client or run_ids is required" }, 400);
+    if (runIds) {
+      let n = 0;
+      for (const id of runIds) n += (await sql`update scout_runs set excluded = true where id = ${id} and company_id is null returning id`).length;
+      return json({ ok: true, excluded_runs: n });
+    }
     const upd = await sql`update scout_runs set excluded = true where client = ${body.client} and company_id is null returning id`;
     return json({ ok: true, excluded_runs: upd.length });
   }

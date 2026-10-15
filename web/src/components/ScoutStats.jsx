@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../api.js";
 import Tip from "./Tip.jsx";
 import { SERIES, StackedColumns, GroupedBars } from "./charts.jsx";
@@ -60,8 +60,12 @@ export default function ScoutStats({ access }) {
   const [error, setError] = useState(null);
   const [reload, setReload] = useState(0);
 
+  const lastKey = useRef("");
   useEffect(() => {
-    setData((d) => (range === "custom" && d && d.period?.key === "custom" ? d : null));
+    // Only blank the page when the period itself changed; a refresh after matching a
+    // client keeps everything (including open lists) in place.
+    const key = `${range}|${range === "custom" ? from + to : ""}`;
+    if (lastKey.current !== key) { lastKey.current = key; setData((d) => (range === "custom" && d && d.period?.key === "custom" ? d : null)); }
     let live = true;
     api.getScoutStats(range, from, to).then((d) => live && setData(d)).catch((e) => live && setError(e.message));
     return () => { live = false; };
@@ -98,10 +102,10 @@ export default function ScoutStats({ access }) {
     return { label: t.label, values: { rate: denom ? won / denom : null }, notes: { rate: `${r.won} won, ${r.lost} lost, ${r.open} still open` } };
   });
   const COHORT_SERIES = [
-    { key: "before", label: `Before ${since}`, color: SERIES[1] },
-    { key: "scout", label: "After: through SCOUT", color: SERIES[2] },
+    { key: "before", label: `Before prequalifying (before ${since})`, color: SERIES[1] },
+    { key: "after", label: `After prequalifying (from ${since})`, color: SERIES[2] },
   ];
-  const cohortFor = { before: c.before, scout: c.after_scout };
+  const cohortFor = { before: c.before, after: c.after_all };
   const rateGroup = [{
     label: `${mode === "pipeline" ? "Pipeline" : "Decided"} win rate, ${isValue ? "by dollars" : "by bids"}`,
     values: Object.fromEntries(COHORT_SERIES.map((s) => [s.key, cohortRates(cohortFor[s.key], basis, mode)])),
@@ -191,13 +195,13 @@ export default function ScoutStats({ access }) {
       <div className="card-title" style={{ marginBottom: 6 }}>
         <Tip label="Does prequalification help?" className="card-title">
           Bids are grouped by when they were <strong>created</strong> in CRM (for older bids, their due date), and judged by what happened to them since. Before {since} is the starting point.
-          "After: through SCOUT" counts only bids we can tie to a SCOUT run by project name, so it can undercount (early scoring-sheet entries rarely match a Bid Board name).
-          Archived bids are left out unless CRM recorded the decision. This section ignores the period filter.
+          Prequalifying every bid started {since}, so that date is the line between the two groups. Archived bids are left out unless CRM recorded the decision.
+          This section ignores the period filter.
         </Tip>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(420px, 1fr))", gap: 16, marginBottom: 20 }}>
         <GroupedBars
-          title={`Win rate: before and after ${since}`}
+          title="Win rate: before and after prequalifying bids"
           subtitle={`${mode === "pipeline" ? "Won ÷ (won + lost + still open after qualification)" : "Won ÷ (won + lost)"}, by ${isValue ? "dollars" : "number of bids"}`}
           groups={rateGroup}
           series={COHORT_SERIES}
@@ -212,7 +216,7 @@ export default function ScoutStats({ access }) {
         <table className="data-table">
           <thead><tr><th>Group</th><th className="num">Bids created</th><th className="num">Submitted</th><th className="num">Won</th><th className="num">Lost</th><th className="num">Open</th><th className="num">Decided rate</th><th className="num">Pipeline rate</th></tr></thead>
           <tbody>
-            {[["Before " + since, c.before], ["After: all bids", c.after_all], ["After: through SCOUT", c.after_scout]].map(([label, x]) => (
+            {[["Before prequalifying", c.before], ["After prequalifying", c.after_all]].map(([label, x]) => (
               <tr key={label}>
                 <td>{label}</td><td className="num">{num(x.created)}</td><td className="num">{num(x.complete + x.lost + x.midlate)}</td><td className="num">{num(isValue ? Math.round(x.complete_value) : x.complete)}</td><td className="num">{num(isValue ? Math.round(x.lost_value) : x.lost)}</td>
                 <td className="num">{num(isValue ? Math.round(x.midlate_value) : x.midlate)}</td><td className="num">{pct(cohortRates(x, basis, "decided"))}</td><td className="num">{pct(cohortRates(x, basis, "pipeline"))}</td>

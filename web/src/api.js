@@ -107,7 +107,9 @@ export const api = {
   // Match SCOUT history client names to companies (admin)
   getScoutUnlinked: () => request(`/admin/scout-unlinked`),
   linkScoutClient: (client, companyId) => request(`/admin/scout-unlinked/link`, { method: "POST", body: { client, company_id: companyId } }),
+  linkScoutRuns: (runIds, companyId) => request(`/admin/scout-unlinked/link`, { method: "POST", body: { run_ids: runIds, company_id: companyId } }),
   excludeScoutClient: (client) => request(`/admin/scout-unlinked/exclude`, { method: "POST", body: { client } }),
+  excludeScoutRuns: (runIds) => request(`/admin/scout-unlinked/exclude`, { method: "POST", body: { run_ids: runIds } }),
 
   // Procore project regions (one list, used for every region pick)
   listRegions: () => request(`/regions`),
