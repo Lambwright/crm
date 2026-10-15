@@ -533,6 +533,11 @@ async function handleMintRfqRef(sql, user) {
 async function handleScoutIntake(request, sql) {
   const body = await parseBody(request);
   const { rfq_ref, project_name, company_name, procore_vendor_id, contact, qualification_result, scout_score, scout_tier, hot_lead_applied, no_bid_reason, bid_due_date, procore_bid_board_id } = body;
+  // Optional, sent by newer SCOUT builds: why/who for an override, and which
+  // disqualifiers fired (a list of short strings). Absent = leave what's stored.
+  const overrideReason = body.override_reason ?? null;
+  const overrideApprover = body.override_approver ?? null;
+  const disqualifiers = Array.isArray(body.disqualifiers) ? JSON.stringify(body.disqualifiers.map((d) => String(d)).slice(0, 50)) : null;
   if (!rfq_ref) return json({ error: "rfq_ref is required" }, 400);
   if (!project_name) return json({ error: "project_name is required" }, 400);
   if (!company_name) return json({ error: "company_name is required" }, 400);
@@ -569,6 +574,9 @@ async function handleScoutIntake(request, sql) {
         scout_tier = ${scout_tier ?? existingBid[0].scout_tier},
         hot_lead_applied = ${Boolean(hot_lead_applied)},
         no_bid_reason = ${no_bid_reason ?? existingBid[0].no_bid_reason},
+        override_reason = ${overrideReason ?? existingBid[0].override_reason},
+        override_approver = ${overrideApprover ?? existingBid[0].override_approver},
+        disqualifiers = coalesce(${disqualifiers}::jsonb, disqualifiers),
         bid_due_date = ${bid_due_date ?? existingBid[0].bid_due_date},
         procore_bid_board_id = ${procore_bid_board_id ?? existingBid[0].procore_bid_board_id},
         updated_at = now()
@@ -579,11 +587,12 @@ async function handleScoutIntake(request, sql) {
       insert into bids (
         rfq_ref, project_name, company_id, contact_id, qualification_result,
         scout_score, scout_tier, hot_lead_applied, no_bid_reason, bid_due_date, stage,
-        procore_bid_board_id, next_action_date
+        procore_bid_board_id, next_action_date, override_reason, override_approver, disqualifiers
       ) values (
         ${rfq_ref}, ${project_name}, ${company.id}, ${contactRow ? contactRow.id : null}, ${qualification_result || "pending_review"},
         ${scout_score ?? null}, ${scout_tier ?? null}, ${Boolean(hot_lead_applied)}, ${no_bid_reason ?? null}, ${bid_due_date ?? null}, ${initialStage},
-        ${procore_bid_board_id ?? null}, ${autoFollowUpDate(settings.cadence, initialStage, null)}
+        ${procore_bid_board_id ?? null}, ${autoFollowUpDate(settings.cadence, initialStage, null)},
+        ${overrideReason}, ${overrideApprover}, coalesce(${disqualifiers}::jsonb, '[]'::jsonb)
       ) returning *`;
     await sql`insert into bid_stage_history (bid_id, from_stage, to_stage, changed_by, note)
       values (${bid.id}, null, ${initialStage}, 'system', 'Created from SCOUT intake')`;
@@ -1328,6 +1337,15 @@ SELF_MIGRATIONS.push({
     active boolean not null default true,
     updated_at timestamptz not null default now()
   )`],
+});
+SELF_MIGRATIONS.push({
+  // What SCOUT can now tell CRM about a decision (Ben, 2026-10-15): who approved
+  // an override and which disqualifiers fired. override_reason already existed.
+  id: "012_scout_override_fields",
+  statements: [
+    `alter table bids add column if not exists override_approver text`,
+    `alter table bids add column if not exists disqualifiers jsonb not null default '[]'::jsonb`,
+  ],
 });
 let schemaReady = null;
 function ensureSchema(sql) {
