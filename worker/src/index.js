@@ -946,7 +946,7 @@ async function insertNsOps(sql, runId, ops) {
     const tuples = chunk.map((o) => {
       const base = params.length;
       params.push(runId, o.op, o.ns_id, o.ns_name, o.company_id || null, o.company_name || null, o.procore_id || null, o.notes || null, o.detail || null);
-      return `(${Array.from({ length: 9 }, (_, k) => `${base + k + 1}`).join(", ")})`;
+      return `(${Array.from({ length: 9 }, (_, k) => "$" + (base + k + 1)).join(", ")})`;
     });
     await sql.query(`insert into ns_sync_ops (run_id, op, ns_id, ns_name, company_id, company_name, procore_id, notes, detail) values ${tuples.join(", ")}`, params);
   }
