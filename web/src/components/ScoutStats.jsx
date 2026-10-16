@@ -47,7 +47,7 @@ function WonProjects({ projects, onRefreshed }) {
   if (!projects || projects.length === 0) return null;
   async function refresh(id) {
     setBusy(id); setMsg(null);
-    try { await api.refreshProjectFinancials(id); onRefreshed(); }
+    try { const r = await api.refreshProjectFinancials(id); if (r.refresh_error) setMsg(`LEDGER couldn't refresh this project just now, so these are its last stored figures: ${r.refresh_error}`); onRefreshed(); }
     catch (e) { setMsg(e.data?.retry_after_seconds ? `${e.data.detail} Try again in about ${Math.ceil(e.data.retry_after_seconds / 60)} min.` : e.data?.detail || e.message); }
     finally { setBusy(null); }
   }

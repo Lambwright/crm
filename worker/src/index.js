@@ -1686,10 +1686,11 @@ async function handleFinancialsRefresh(request, env, sql, user) {
     return json({ error: "ledger_unreachable", detail: e.message }, 502);
   }
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) return json({ error: data.error || "ledger_error", detail: data.error || `LEDGER answered HTTP ${res.status}`, retry_after_seconds: data.retry_after_seconds || null }, res.status === 503 ? 503 : 502);
+  if (!res.ok) return json({ error: data.error || "ledger_error", detail: data.error || `LEDGER answered HTTP ${res.status}`, retry_after_seconds: data.retry_after_seconds || null }, [400, 404, 503].includes(res.status) ? res.status : 502);
   const item = data.item || data;
   await upsertFinancials(sql, [{ ...item, procore_project_id: item.procore_project_id || id }]);
-  return json({ ok: true });
+  // LEDGER may hand back its last stored figures with a note that the live refresh failed.
+  return json({ ok: !data.refresh_error, refresh_error: data.refresh_error || null });
 }
 
 // ---------------------------------------------------------------------------
