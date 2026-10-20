@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api.js";
 import Tip from "./Tip.jsx";
-import { SERIES, StackedColumns, GroupedBars } from "./charts.jsx";
+import { SERIES, StackedColumns, GroupedBars, CompareRows } from "./charts.jsx";
 import ScoutImport from "./ScoutImport.jsx";
 import ScoutLinkClients from "./ScoutLinkClients.jsx";
 
@@ -145,17 +145,26 @@ export default function ScoutStats({ access }) {
     { key: "after", label: `After prequalifying (from ${since})`, color: SERIES[2] },
   ];
   const cohortFor = { before: c.before, after: c.after_all };
-  const rateGroup = [{
-    label: `${mode === "pipeline" ? "Pipeline" : "Decided"} win rate, ${isValue ? "by dollars" : "by bids"}`,
-    values: Object.fromEntries(COHORT_SERIES.map((s) => [s.key, cohortRates(cohortFor[s.key], basis, mode)])),
-    notes: Object.fromEntries(COHORT_SERIES.map((s) => [s.key, `${cohortFor[s.key].created} bids, ${cohortFor[s.key].complete} won, ${cohortFor[s.key].lost} lost`])),
-  }];
   const avg = (sum, n) => (n ? sum / n : null);
-  const avgGroups = [
-    { label: "Average bid", values: Object.fromEntries(COHORT_SERIES.map((s) => [s.key, avg(cohortFor[s.key].est_sum, cohortFor[s.key].est_n)])), notes: Object.fromEntries(COHORT_SERIES.map((s) => [s.key, `${cohortFor[s.key].est_n} bids with an estimate`])) },
-    { label: "Average won bid", values: Object.fromEntries(COHORT_SERIES.map((s) => [s.key, avg(cohortFor[s.key].won_sum, cohortFor[s.key].won_n)])), notes: Object.fromEntries(COHORT_SERIES.map((s) => [s.key, `${cohortFor[s.key].won_n} won bids`])) },
-  ];
   const k = (v) => (v >= 1000 ? `$${Math.round(v / 100) / 10}K` : `$${Math.round(v)}`);
+  const noteFor = (key) => `${cohortFor[key].created} bids, ${cohortFor[key].complete} won, ${cohortFor[key].lost} lost`;
+  const rate = (key) => cohortRates(cohortFor[key], basis, mode);
+  const rateDelta = rate("before") != null && rate("after") != null ? { up: rate("after") >= rate("before"), text: `${Math.abs(Math.round((rate("after") - rate("before")) * 100))} pts` } : null;
+  const pctDelta = (b, a2) => (b && a2 != null ? { up: a2 >= b, text: `${Math.abs(Math.round(((a2 - b) / b) * 100))}%` } : null);
+  const avgBid = { before: avg(c.before.est_sum, c.before.est_n), after: avg(c.after_all.est_sum, c.after_all.est_n) };
+  const avgWon = { before: avg(c.before.won_sum, c.before.won_n), after: avg(c.after_all.won_sum, c.after_all.won_n) };
+  const compareRows = [
+    {
+      label: `${mode === "pipeline" ? "Pipeline" : "Decided"} win rate, ${isValue ? "by dollars" : "by bids"}`,
+      values: { before: rate("before"), after: rate("after") },
+      format: (v) => `${Math.round(v * 100)}%`,
+      max: 1,
+      delta: rateDelta,
+      notes: { before: noteFor("before"), after: noteFor("after") },
+    },
+    { label: "Average bid", values: avgBid, format: k, delta: pctDelta(avgBid.before, avgBid.after), notes: { before: `${c.before.est_n} bids with an estimate`, after: `${c.after_all.est_n} bids with an estimate` } },
+    { label: "Average won bid", values: avgWon, format: k, delta: pctDelta(avgWon.before, avgWon.after), notes: { before: `${c.before.won_n} won bids`, after: `${c.after_all.won_n} won bids` } },
+  ];
 
   const dec = data.declined;
   const o = data.outcomes;
@@ -260,15 +269,14 @@ export default function ScoutStats({ access }) {
         </Tip>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(420px, 1fr))", gap: 16, marginBottom: 20 }}>
-        <GroupedBars
-          title="Win rate: before and after prequalifying bids"
-          subtitle={`${mode === "pipeline" ? "Won ÷ (won + lost + still open after qualification)" : "Won ÷ (won + lost)"}, by ${isValue ? "dollars" : "number of bids"}`}
-          groups={rateGroup}
-          series={COHORT_SERIES}
-          format={(v) => `${Math.round(v * 100)}%`}
-          max={1}
-        />
-        <GroupedBars title="Average bid and average won bid" subtitle="Estimate (final value for won bids where entered); bids with no value are left out" groups={avgGroups} series={COHORT_SERIES} format={k} />
+        <div style={{ gridColumn: "1 / -1" }}>
+          <CompareRows
+            title="Before and after prequalifying bids"
+            subtitle={`Win rate: ${mode === "pipeline" ? "won ÷ (won + lost + still open after qualification)" : "won ÷ (won + lost)"}. Averages are estimates (final value for won bids where entered); bids with no value are left out. Each row has its own scale.`}
+            rows={compareRows}
+            series={COHORT_SERIES}
+          />
+        </div>
       </div>
 
       <div className="card" style={{ marginBottom: 20 }}>

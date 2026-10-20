@@ -180,3 +180,41 @@ export function GroupedBars({ title, subtitle, groups, series, format = (v) => S
     </ChartFrame>
   );
 }
+
+// ---- compact before/after rows ------------------------------------------------------------
+// One row per measure, a thin bar per group on that row's own scale (never a shared or dual
+// axis), the value at each bar's tip and the change on the right. Meant for a handful of
+// headline comparisons that would otherwise each need a full-size chart.
+// rows: [{ label, values: { [seriesKey]: number|null }, format, max, delta: { text, up }, notes: { [seriesKey]: string } }]
+export function CompareRows({ title, subtitle, rows, series }) {
+  const table = <DataTable head={["", ...series.map((s) => s.label), "Change"]} rows={rows.map((r) => [r.label, ...series.map((s) => (r.values[s.key] == null ? "—" : r.format(r.values[s.key]))), r.delta ? r.delta.text : "—"])} />;
+  return (
+    <ChartFrame title={title} subtitle={subtitle} series={series} table={table}>
+      <div style={{ marginTop: 6 }}>
+        {rows.map((r) => {
+          const max = r.max || niceMax(Math.max(1, ...series.map((s) => r.values[s.key] || 0)));
+          return (
+            <div key={r.label} style={{ display: "grid", gridTemplateColumns: "150px 1fr 90px", alignItems: "center", gap: 12, padding: "8px 0", borderTop: `1px solid ${GRID}` }}>
+              <div style={{ fontSize: 12, color: INK }}>{r.label}</div>
+              <div>
+                {series.map((s) => {
+                  const v = r.values[s.key];
+                  const pctW = v == null ? 0 : Math.max(1, (v / max) * 100);
+                  return (
+                    <div key={s.key} title={`${s.label}: ${v == null ? "n/a" : r.format(v)}${r.notes?.[s.key] ? " (" + r.notes[s.key] + ")" : ""}`} style={{ display: "flex", alignItems: "center", gap: 8, margin: "3px 0" }}>
+                      <div style={{ width: `${pctW}%`, maxWidth: "calc(100% - 56px)", height: 12, background: s.color, borderRadius: "0 4px 4px 0", minWidth: v == null ? 0 : 3 }} />
+                      <span style={{ fontSize: 11, color: INK, whiteSpace: "nowrap" }}>{v == null ? "n/a" : r.format(v)}</span>
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{ fontSize: 12, color: INK2, textAlign: "right", whiteSpace: "nowrap" }}>
+                {r.delta ? `${r.delta.up ? "▲" : "▼"} ${r.delta.text}` : "—"}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </ChartFrame>
+  );
+}
