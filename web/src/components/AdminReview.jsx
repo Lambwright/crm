@@ -98,6 +98,22 @@ export default function AdminReview() {
         </table>
       </Section>
 
+      <Section
+        title="🔥 Priority-client RFQs that scored below the line (last 180 days)"
+        count={data.proceeds.length}
+        tip="RFQs for priority clients that scored No Bid in SCOUT but went ahead anyway, without an override. These are the ones that would have failed without the priority flag."
+        empty="None."
+      >
+        <table className="data-table">
+          <thead><tr><th>Date</th><th>Client</th><th>Project</th><th className="num">Score</th><th>Estimator</th></tr></thead>
+          <tbody>
+            {data.proceeds.map((o) => (
+              <tr key={o.id}><td>{fmtDate(o.submitted_at)}</td><td>{o.client}</td><td>{o.project_name}</td><td className="num">{o.total_score != null ? Number(o.total_score) : "—"}</td><td>{o.estimator || "—"}</td></tr>
+            ))}
+          </tbody>
+        </table>
+      </Section>
+
       <Section title="⛔ Blacklisted clients" count={data.blacklisted.length} empty="No blacklisted clients.">
         <table className="data-table">
           <thead><tr><th>Client</th><th>Reason</th><th>By</th><th>Date</th></tr></thead>

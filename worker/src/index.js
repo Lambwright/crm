@@ -1755,11 +1755,19 @@ async function handleAdminReview(request, url, sql, user) {
       where not excluded and outcome = 'submitted' and lower(coalesce(tier, '')) in ('no bid', 'no_bid')
         and coalesce((payload->>'priority_client'), 'false') <> 'true' and submitted_at > now() - interval '120 days'
       order by submitted_at desc limit 100`;
+    // Priority clients' RFQs that scored No Bid but went ahead anyway: the ones that would
+    // have failed without the flag. No override is needed for these, so they are listed here.
+    const proceeds = await sql`
+      select id, client, project_name, total_score, submitted_at, estimator
+      from scout_runs
+      where not excluded and outcome = 'submitted' and lower(coalesce(tier, '')) in ('no bid', 'no_bid')
+        and coalesce((payload->>'priority_client'), 'false') = 'true' and submitted_at > now() - interval '180 days'
+      order by submitted_at desc limit 100`;
     const blacklisted = await sql`
       select id, name, blacklist_reason, blacklisted_by, blacklisted_at from companies where blacklisted order by blacklisted_at desc nulls last, name`;
     const priority = await sql`
       select id, name, hot_lead_reason, hot_lead_set_by, hot_lead_set_at, priority_permanent from companies where hot_lead order by priority_permanent desc, hot_lead_set_at desc nulls last, name`;
-    return json({ declined, overrides, blacklisted, priority });
+    return json({ declined, overrides, proceeds, blacklisted, priority });
   }
   return json({ error: "not_found" }, 404);
 }
