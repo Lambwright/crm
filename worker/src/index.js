@@ -165,7 +165,10 @@ async function requireLogin(request, env) {
 // cosmetic only.
 // ---------------------------------------------------------------------------
 
-const CRM_LEVELS = ["admin", "estimator", "pm"];
+// followup_manager (Ben, 2026-10-21): everything an estimator can do, plus owning the follow-up
+// assignment rules. HELM's role matrix assigns it; until HELM defines the level nobody has it.
+const CRM_LEVELS = ["admin", "estimator", "followup_manager", "pm"];
+const isEstLevel = (level) => level === "admin" || level === "estimator" || level === "followup_manager";
 
 function resolveCrmAccess(user) {
   const roles = user && user.appRoles && typeof user.appRoles === "object" ? user.appRoles : null;
@@ -189,15 +192,15 @@ function crmOf(user) {
 // legacy user.role.
 function canMoveStages(user) {
   const c = crmOf(user);
-  return c.mode === "live" ? c.level === "admin" || c.level === "estimator" : true;
+  return c.mode === "live" ? isEstLevel(c.level) : true;
 }
 function canSetHotLead(user) {
   const c = crmOf(user);
-  return c.mode === "live" ? c.level === "admin" || c.level === "estimator" : true;
+  return c.mode === "live" ? isEstLevel(c.level) : true;
 }
 function canAssignFollowups(user) {
   const c = crmOf(user);
-  return c.mode === "live" ? c.level === "admin" || c.level === "estimator" : true;
+  return c.mode === "live" ? isEstLevel(c.level) : true;
 }
 // Ben, 2026-10-05 (live mode only — legacy keeps today's no-restriction behaviour):
 // blacklist designation = admin only; account segment and handoff_status =
@@ -209,11 +212,11 @@ function canManageBlacklist(user) {
 }
 function canChangeSegment(user) {
   const c = crmOf(user);
-  return c.mode === "live" ? c.level === "admin" || c.level === "estimator" : true;
+  return c.mode === "live" ? isEstLevel(c.level) : true;
 }
 function canSetHandoffStatus(user) {
   const c = crmOf(user);
-  return c.mode === "live" ? c.level === "admin" || c.level === "estimator" : true;
+  return c.mode === "live" ? isEstLevel(c.level) : true;
 }
 function isCrmAdmin(user) {
   const c = crmOf(user);
@@ -236,7 +239,10 @@ async function loadGrants(sql) {
 async function attachCaps(sql, user) {
   const c = crmOf(user);
   if (c.mode !== "live" || c.level === "admin") user._caps = [...CRM_CAPS];
-  else user._caps = ((await loadGrants(sql))[user.username] || []).filter((x) => CRM_CAPS.includes(x));
+  else {
+    user._caps = ((await loadGrants(sql))[user.username] || []).filter((x) => CRM_CAPS.includes(x));
+    if (c.level === "followup_manager" && !user._caps.includes("followup_manager")) user._caps.push("followup_manager");
+  }
 }
 function hasCap(user, cap) {
   return Array.isArray(user._caps) && user._caps.includes(cap);
@@ -245,7 +251,7 @@ function hasCap(user, cap) {
 // nothing else (Ben, 2026-10-07). Everyone else sees every bid.
 function canSeeAllBids(user) {
   const c = crmOf(user);
-  return c.mode === "live" ? c.level === "admin" || c.level === "estimator" : true;
+  return c.mode === "live" ? isEstLevel(c.level) : true;
 }
 function ownsBid(user, bid) {
   return Boolean(bid) && (bid.owner_username === user.username || bid.estimator_username === user.username);
@@ -255,6 +261,18 @@ function bidAccessDenied(user, bid) {
 }
 function scopeDenied(user) {
   return canSeeAllBids(user) ? null : forbidden("Your role can only see the dashboard and the follow-ups assigned to you.");
+}
+
+// The follow-up dashboard exists only for admins, estimators and follow-up managers. The rules
+// are read-only for admins and estimators unless they confirm in the UI (a prompt, not a block);
+// only a follow-up manager edits them without it.
+function canSeeFollowupDashboard(user) {
+  const c = crmOf(user);
+  return c.mode === "live" ? isEstLevel(c.level) : true;
+}
+function canEditRulesDirectly(user) {
+  const c = crmOf(user);
+  return c.mode === "live" && c.level === "followup_manager";
 }
 
 function forbidden(detail) {
@@ -1774,6 +1792,184 @@ async function handleAdminReview(request, url, sql, user) {
 }
 
 // ---------------------------------------------------------------------------
+// Follow-up dashboard (Ben, 2026-10-21): progress, bulk assignment and auto-assignment
+// rules, for admins, estimators and follow-up managers only.
+// ---------------------------------------------------------------------------
+const provinceOfProject = (name) => { const m = /^\s*([A-Za-z]{2})\s*[–—-]/.exec(name || ""); return m ? m[1].toUpperCase() : null; };
+const today = () => new Date().toISOString().slice(0, 10);
+const dayOf = (d) => (d ? new Date(d).toISOString().slice(0, 10) : null);
+
+async function loadFollowupPeople(env, user) {
+  try { return (await eligibleAssignees(env, user)).map((p) => ({ username: p.username, displayName: p.displayName, level: p.level })); }
+  catch (e) { return []; }
+}
+
+async function handleFollowupDashboard(env, sql, user) {
+  if (!canSeeFollowupDashboard(user)) return forbidden("The follow-up dashboard isn't available to your role.");
+  const people = await loadFollowupPeople(env, user);
+  const bids = await sql`
+    select b.id, b.project_name, b.stage, b.owner_username, b.estimator_username, b.next_action_date, b.created_at,
+      c.name as company_name, c.region as company_region, c.province as company_province
+    from bids b left join companies c on c.id = b.company_id
+    where b.stage in ('rfq', 'invitation', 'accepted', 'estimating', 'bid_submitted', 'to_do', 'delayed', 'in_progress')
+    order by b.next_action_date nulls first limit 1500`;
+  const t = today();
+  const assignedTo = (b) => b.owner_username || b.estimator_username || null;
+  const daysOver = (b) => (b.next_action_date ? Math.floor((new Date(t) - new Date(dayOf(b.next_action_date))) / 86400000) : null);
+  const summary = { open_bids: bids.length, overdue: 0, due_today: 0, never_set: 0, unassigned: 0, unassigned_overdue: 0 };
+  const stats = new Map(people.map((p) => [p.username, { ...p, open: 0, overdue: 0, due_today: 0 }]));
+  for (const b of bids) {
+    const d = daysOver(b);
+    const overdue = d != null && d > 0;
+    if (overdue) summary.overdue++;
+    else if (d === 0) summary.due_today++;
+    else if (d == null) summary.never_set++;
+    const who = assignedTo(b);
+    if (!who) { summary.unassigned++; if (overdue || d == null) summary.unassigned_overdue++; }
+    if (who && stats.has(who)) { const st = stats.get(who); st.open++; if (overdue) st.overdue++; else if (d === 0) st.due_today++; }
+  }
+  const logged = await sql`
+    select logged_by, count(*) filter (where sent_at > now() - interval '7 days')::int as d7, count(*) filter (where sent_at > now() - interval '30 days')::int as d30
+    from bid_emails where direction = 'outbound' and sent_at > now() - interval '30 days' group by logged_by`;
+  for (const l of logged) if (stats.has(l.logged_by)) { const st = stats.get(l.logged_by); st.logged_7d = l.d7; st.logged_30d = l.d30; }
+  const team = [...stats.values()].map((x) => ({ ...x, logged_7d: x.logged_7d || 0, logged_30d: x.logged_30d || 0 })).sort((a, b) => b.overdue - a.overdue || b.open - a.open);
+
+  // The bids worth acting on: overdue, never given a date, or unassigned.
+  const work = bids
+    .filter((b) => !assignedTo(b) || daysOver(b) == null || daysOver(b) > 0)
+    .slice(0, 400)
+    .map((b) => ({
+      id: b.id, project_name: b.project_name, company_name: b.company_name, stage: b.stage,
+      owner_username: b.owner_username, estimator_username: b.estimator_username,
+      next_action_date: dayOf(b.next_action_date), days_overdue: daysOver(b),
+      province: provinceOfProject(b.project_name) || b.company_province || null, region: b.company_region || null,
+    }));
+  const rules = await sql`
+    select r.id, r.position, r.kind, r.company_id, r.value, r.assignee_username, r.pool, r.active, r.note, r.updated_by, r.updated_at, c.name as company_name
+    from followup_rules r left join companies c on c.id = r.company_id order by r.position, r.updated_at`;
+  const managers = people.filter((p) => p.level === "followup_manager");
+  return json({
+    summary, team, work, rules, managers, people,
+    can: { assign: canAssignFollowups(user), edit_rules_directly: canEditRulesDirectly(user) },
+  });
+}
+
+async function handleBulkAssign(request, env, sql, user) {
+  if (!canSeeFollowupDashboard(user) || !canAssignFollowups(user)) return forbidden("You can't assign follow-ups.");
+  const body = await parseBody(request);
+  const ids = Array.isArray(body.bid_ids) ? body.bid_ids.map(String).slice(0, 300) : [];
+  if (!ids.length) return json({ error: "bid_ids is required" }, 400);
+  const target = body.owner_username || null;
+  if (target) {
+    const eligible = new Set((await eligibleAssignees(env, user)).map((p) => p.username));
+    if (!eligible.has(target)) return json({ error: "not_assignable", detail: `"${target}" can't be assigned follow-ups; they need CRM access at PM level or above.` }, 422);
+  }
+  let n = 0;
+  for (const id of ids) {
+    const r = await sql`update bids set owner_username = ${target}, updated_at = now() where id = ${id} and stage in ('rfq', 'invitation', 'accepted', 'estimating', 'bid_submitted', 'to_do', 'delayed', 'in_progress') returning id`;
+    n += r.length;
+  }
+  return json({ ok: true, assigned: n });
+}
+
+// The rules, in order; the first one that gives a bid an assignee wins.
+async function planRuleAssignments(env, sql, user) {
+  const people = await eligibleAssignees(env, user);
+  const eligible = new Set(people.map((p) => p.username));
+  const rules = (await sql`select * from followup_rules where active order by position, updated_at`);
+  const bids = await sql`
+    select b.id, b.project_name, b.company_id, b.owner_username, b.estimator_username, b.created_at,
+      c.name as company_name, c.region as company_region, c.province as company_province
+    from bids b left join companies c on c.id = b.company_id
+    where b.stage in ('rfq', 'invitation', 'accepted', 'estimating', 'bid_submitted', 'to_do', 'delayed', 'in_progress')`;
+  const load = new Map();
+  for (const b of bids) { const w = b.owner_username || b.estimator_username; if (w) load.set(w, (load.get(w) || 0) + 1); }
+  // relationship: the person who most recently owned a bid for the same company
+  const lastOwner = new Map();
+  for (const b of [...bids].sort((x, y) => new Date(y.created_at) - new Date(x.created_at))) {
+    const w = b.owner_username || b.estimator_username;
+    if (w && b.company_id && eligible.has(w) && !lastOwner.has(b.company_id)) lastOwner.set(b.company_id, w);
+  }
+  const out = [];
+  let unmatched = 0;
+  for (const b of bids) {
+    if (b.owner_username || b.estimator_username) continue;
+    let pick = null, why = null;
+    for (const r of rules) {
+      let who = null;
+      if (r.kind === "client" && r.company_id && r.company_id === b.company_id) who = r.assignee_username;
+      else if (r.kind === "region" && r.value && b.company_region === r.value) who = r.assignee_username;
+      else if (r.kind === "province" && r.value && (provinceOfProject(b.project_name) === String(r.value).toUpperCase() || (!provinceOfProject(b.project_name) && String(b.company_province || "").toUpperCase() === String(r.value).toUpperCase()))) who = r.assignee_username;
+      else if (r.kind === "relationship" && b.company_id && lastOwner.has(b.company_id)) who = lastOwner.get(b.company_id);
+      else if (r.kind === "balance") {
+        const pool = (Array.isArray(r.pool) ? r.pool : []).filter((u) => eligible.has(u));
+        if (pool.length) who = pool.slice().sort((a, c2) => (load.get(a) || 0) - (load.get(c2) || 0))[0];
+      }
+      if (who && eligible.has(who)) { pick = who; why = r; break; }
+    }
+    if (!pick) { unmatched++; continue; }
+    load.set(pick, (load.get(pick) || 0) + 1);
+    out.push({ bid_id: b.id, project_name: b.project_name, company_name: b.company_name, assignee: pick, rule_id: why.id, rule_kind: why.kind });
+  }
+  return { assignments: out, unmatched, rules_active: rules.length };
+}
+
+async function handleFollowupRules(request, url, env, sql, user) {
+  if (!canSeeFollowupDashboard(user)) return forbidden("The follow-up dashboard isn't available to your role.");
+  const path = url.pathname;
+  if (path === "/followups/rules/preview" && request.method === "POST") return json(await planRuleAssignments(env, sql, user));
+  if (path === "/followups/rules/apply" && request.method === "POST") {
+    if (!canAssignFollowups(user)) return forbidden("You can't assign follow-ups.");
+    const plan = await planRuleAssignments(env, sql, user);
+    let n = 0;
+    for (const a of plan.assignments) {
+      const r = await sql`update bids set owner_username = ${a.assignee}, updated_at = now() where id = ${a.bid_id} and owner_username is null and estimator_username is null returning id`;
+      n += r.length;
+    }
+    return json({ ok: true, assigned: n, unmatched: plan.unmatched });
+  }
+  if (path === "/followups/rules" && request.method === "POST") {
+    const body = await parseBody(request);
+    const kinds = ["client", "region", "province", "relationship", "balance"];
+    if (body.action === "delete") {
+      await sql`delete from followup_rules where id = ${body.id}`;
+      return json({ ok: true });
+    }
+    if (body.action === "move") {
+      const rows = await sql`select id, position from followup_rules order by position, updated_at`;
+      const i = rows.findIndex((r) => r.id === body.id);
+      const j = body.direction === "up" ? i - 1 : i + 1;
+      if (i < 0 || j < 0 || j >= rows.length) return json({ ok: true });
+      const order = rows.map((r) => r.id);
+      [order[i], order[j]] = [order[j], order[i]];
+      for (let k = 0; k < order.length; k++) await sql`update followup_rules set position = ${k}, updated_by = ${user.username}, updated_at = now() where id = ${order[k]}`;
+      return json({ ok: true });
+    }
+    if (body.action === "toggle") {
+      await sql`update followup_rules set active = ${Boolean(body.active)}, updated_by = ${user.username}, updated_at = now() where id = ${body.id}`;
+      return json({ ok: true });
+    }
+    if (body.action === "create") {
+      if (!kinds.includes(body.kind)) return json({ error: "kind must be one of " + kinds.join(", ") }, 400);
+      const eligible = new Set((await eligibleAssignees(env, user)).map((p) => p.username));
+      let assignee = body.assignee_username || null;
+      let pool = Array.isArray(body.pool) ? body.pool.map(String) : [];
+      if (body.kind === "balance") { pool = pool.filter((u) => eligible.has(u)); if (!pool.length) return json({ error: "A balance rule needs at least one person." }, 400); assignee = null; }
+      else if (body.kind !== "relationship") { if (!assignee || !eligible.has(assignee)) return json({ error: "not_assignable", detail: "Pick someone with CRM access at PM level or above." }, 422); }
+      else assignee = null;
+      if (body.kind === "client" && !body.company_id) return json({ error: "Pick the client." }, 400);
+      if ((body.kind === "region" || body.kind === "province") && !String(body.value || "").trim()) return json({ error: "A value is required for this rule." }, 400);
+      const [{ n }] = await sql`select coalesce(max(position), -1)::int + 1 as n from followup_rules`;
+      await sql`insert into followup_rules (position, kind, company_id, value, assignee_username, pool, note, updated_by)
+        values (${n}, ${body.kind}, ${body.kind === "client" ? body.company_id : null}, ${body.kind === "region" || body.kind === "province" ? String(body.value).trim() : null}, ${assignee}, ${JSON.stringify(pool)}::jsonb, ${body.note || null}, ${user.username})`;
+      return json({ ok: true });
+    }
+    return json({ error: "action must be create, delete, move or toggle" }, 400);
+  }
+  return json({ error: "not_found" }, 404);
+}
+
+// ---------------------------------------------------------------------------
 // Customer payment scores — POST /internal/payment-scores (Ben, 2026-10-16).
 // netsuite-worker computes the score once and pushes the finished values here,
 // right after it writes the custentity_scout_pay* NetSuite fields. CRM stores
@@ -2338,6 +2534,8 @@ async function handleAccess(env, user) {
     blacklist: canManageBlacklist(user),
     handoff_status: canSetHandoffStatus(user),
     all_bids: canSeeAllBids(user),
+    followup_dashboard: canSeeFollowupDashboard(user),
+    followup_rules_direct: canEditRulesDirectly(user),
     followup_manager: hasCap(user, "followup_manager"),
     campaign_manager: hasCap(user, "campaign_manager"),
   };
@@ -2661,6 +2859,24 @@ SELF_MIGRATIONS.push({
       created_at timestamptz not null default now()
     )`,
     `create unique index if not exists review_queue_kind_rfq_idx on review_queue (kind, rfq_ref) where rfq_ref is not null`,
+  ],
+});
+SELF_MIGRATIONS.push({
+  id: "022_followup_rules",
+  statements: [
+    `create table if not exists followup_rules (
+      id uuid primary key default gen_random_uuid(),
+      position int not null default 0,
+      kind text not null check (kind in ('client', 'region', 'province', 'relationship', 'balance')),
+      company_id uuid references companies(id) on delete cascade,
+      value text,                               -- region name or 2-letter province code
+      assignee_username text,                   -- client / region / province rules
+      pool jsonb not null default '[]'::jsonb,  -- balance rules: usernames to spread across
+      active boolean not null default true,
+      note text,
+      updated_by text,
+      updated_at timestamptz not null default now()
+    )`,
   ],
 });
 let schemaReady = null;
@@ -3348,6 +3564,9 @@ export default {
       if (url.pathname.startsWith("/admin/contacts-import") && request.method === "POST") return withRefresh(await handleContactsImport(request, url, sql, auth.user));
       if (url.pathname.startsWith("/admin/companies/merge")) return withRefresh(await handleCompanyMerge(request, url, sql, auth.user));
       if (url.pathname.startsWith("/admin/netsuite-sync")) return withRefresh(await handleNsSyncRoute(request, url, sql, env, auth.user));
+      if (url.pathname === "/followups/dashboard" && request.method === "GET") return withRefresh(await handleFollowupDashboard(env, sql, auth.user));
+      if (url.pathname === "/followups/bulk-assign" && request.method === "POST") return withRefresh(await handleBulkAssign(request, env, sql, auth.user));
+      if (url.pathname.startsWith("/followups/rules")) return withRefresh(await handleFollowupRules(request, url, env, sql, auth.user));
       if (url.pathname === "/regions" && request.method === "GET") return withRefresh(await handleRegionsList(env, sql));
       if (url.pathname === "/grants" && request.method === "GET") return withRefresh(await handleGrantsGet(env, sql, auth.user));
       if (url.pathname === "/grants" && request.method === "PATCH") return withRefresh(await handleGrantsPatch(request, sql, auth.user));

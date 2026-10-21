@@ -118,6 +118,13 @@ export const api = {
   getAdminReview: () => request(`/admin/review`),
   resolveReviewItem: (id, note) => request(`/admin/review/resolve`, { method: "POST", body: { id, note } }),
 
+  // Follow-up manager dashboard: progress, bulk assignment, auto-assignment rules
+  getFollowupDashboard: () => request(`/followups/dashboard`),
+  bulkAssignFollowups: (bidIds, owner) => request(`/followups/bulk-assign`, { method: "POST", body: { bid_ids: bidIds, owner_username: owner } }),
+  followupRule: (body) => request(`/followups/rules`, { method: "POST", body }),
+  previewFollowupRules: () => request(`/followups/rules/preview`, { method: "POST", body: {} }),
+  applyFollowupRules: () => request(`/followups/rules/apply`, { method: "POST", body: {} }),
+
   // Procore project regions (one list, used for every region pick)
   listRegions: () => request(`/regions`),
 
