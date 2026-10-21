@@ -250,10 +250,10 @@ export default function Dashboard() {
         </div>
 
         <div className="card">
-          <Tip label="Hot leads flagged">
-            Customers currently flagged as hot leads (which nudges SCOUT's scoring in their favour). This one ignores the
+          <Tip label="Priority clients">
+            Customers currently flagged as priority clients: estimators proceed with their estimates whatever the RFQ scores. This one ignores the
             date filter — it's a count of flags in place right now. A flag prompts for renewal at 30 days and clears itself at 37
-            unless someone renews it.<br /><br />
+            unless someone renews it or an admin makes it permanent.<br /><br />
             <strong>{fmtNum(summary.hot_leads)}</strong> flagged.
           </Tip>
           <div className="kv-value mono stat">🔥 {fmtNum(summary.hot_leads)}</div>

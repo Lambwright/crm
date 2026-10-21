@@ -609,6 +609,16 @@ async function handleScoutIntake(request, sql) {
       values (${bid.id}, null, ${initialStage}, 'system', 'Created from SCOUT intake')`;
   }
 
+  // A priority client's RFQ that an estimator declines is escalated: it lands in the admin
+  // review queue so an admin can follow up with the customer personally.
+  if (company.hot_lead && (body.scout_outcome === "declined" || qualification_result === "no_bid") && rfq_ref) {
+    const who = body.scout_record && typeof body.scout_record === "object" ? body.scout_record.estimator : null;
+    await sql`
+      insert into review_queue (kind, company_id, rfq_ref, project_name, reason, actor)
+      values ('priority_declined', ${company.id}, ${rfq_ref}, ${project_name}, ${no_bid_reason || null}, ${who || null})
+      on conflict (kind, rfq_ref) where rfq_ref is not null do nothing`;
+  }
+
   // SCOUT's complete record for this push, kept as its own permanent row.
   // `scout_record` is the same object SCOUT already sends to Excel/NetSuite;
   // the few fields around it say how the push ended. Absent = an older SCOUT.
@@ -721,11 +731,11 @@ async function handleCompanyLookup(url, sql) {
   if (!name && !nsId) return json({ error: "name or ns_id query param is required" }, 400);
   let company = null, matchedBy = null;
   if (nsId) {
-    const r = await sql`select id, name, account_segment, hot_lead, hot_lead_weight, hot_lead_reason, netsuite_customer_id from companies where netsuite_customer_id = ${nsId} limit 2`;
+    const r = await sql`select id, name, account_segment, hot_lead, hot_lead_weight, hot_lead_reason, netsuite_customer_id, priority_permanent, blacklisted, blacklist_reason from companies where netsuite_customer_id = ${nsId} limit 2`;
     if (r.length === 1) { company = r[0]; matchedBy = "netsuite_id"; }
   }
   if (!company && name) {
-    const r = await sql`select id, name, account_segment, hot_lead, hot_lead_weight, hot_lead_reason, netsuite_customer_id from companies where lower(name) = lower(${name}) limit 1`;
+    const r = await sql`select id, name, account_segment, hot_lead, hot_lead_weight, hot_lead_reason, netsuite_customer_id, priority_permanent, blacklisted, blacklist_reason from companies where lower(name) = lower(${name}) limit 1`;
     if (r.length) { company = r[0]; matchedBy = "name"; }
   }
   if (!company && name) {
@@ -733,18 +743,30 @@ async function handleCompanyLookup(url, sql) {
     if (key) {
       const [alias] = await sql`select company_id from company_aliases where alias_norm = ${key}`;
       if (alias) {
-        const [c] = await sql`select id, name, account_segment, hot_lead, hot_lead_weight, hot_lead_reason, netsuite_customer_id from companies where id = ${alias.company_id}`;
+        const [c] = await sql`select id, name, account_segment, hot_lead, hot_lead_weight, hot_lead_reason, netsuite_customer_id, priority_permanent, blacklisted, blacklist_reason from companies where id = ${alias.company_id}`;
         if (c) { company = c; matchedBy = "alias"; }
       }
       if (!company) {
-        const all = await sql`select id, name, account_segment, hot_lead, hot_lead_weight, hot_lead_reason, netsuite_customer_id from companies`;
+        const all = await sql`select id, name, account_segment, hot_lead, hot_lead_weight, hot_lead_reason, netsuite_customer_id, priority_permanent, blacklisted, blacklist_reason from companies`;
         const same = all.filter((c) => nsNorm(c.name) === key);
         if (same.length === 1) { company = same[0]; matchedBy = "normalized_name"; }
       }
     }
   }
   if (!company) return json({ found: false });
-  return json({ found: true, matched_by: matchedBy, company, win_stats: await companyWinStats(sql, company.id) });
+  // "priority" is the Priority Client flag (stored as hot_lead). Estimators proceed with the
+  // estimate whatever the RFQ scores; a decline is escalated to admins. "blacklisted" is the
+  // admin-only blacklist checkbox.
+  return json({
+    found: true,
+    matched_by: matchedBy,
+    company: { ...company, priority: Boolean(company.hot_lead), priority_reason: company.hot_lead_reason || null },
+    priority: Boolean(company.hot_lead),
+    priority_permanent: Boolean(company.priority_permanent),
+    blacklisted: Boolean(company.blacklisted),
+    blacklist_reason: company.blacklist_reason || null,
+    win_stats: await companyWinStats(sql, company.id),
+  });
 }
 
 // All-time decided win rate for one company against the whole book, for SCOUT
@@ -1144,6 +1166,8 @@ async function handleCompanyMerge(request, url, sql, user) {
     const blacklisted = [keep.account_segment, dupe.account_segment].find((x) => BLACKLIST_SEGMENTS.includes(x));
     const segment = blacklisted || (keep.account_segment === "unreviewed" ? dupe.account_segment : keep.account_segment);
     const takeHot = !keep.hot_lead && dupe.hot_lead;
+    // A blacklist on either company survives the merge (with its reason), and so does "permanent".
+    const bl = keep.blacklisted ? keep : dupe.blacklisted ? dupe : null;
     const notes = keep.notes && dupe.notes && keep.notes !== dupe.notes ? `${keep.notes}\n\n(Merged from "${dupe.name}")\n${dupe.notes}` : keep.notes || dupe.notes || null;
     await sql`
       update companies set
@@ -1159,6 +1183,11 @@ async function handleCompanyMerge(request, url, sql, user) {
         hot_lead_reason = ${takeHot ? dupe.hot_lead_reason : keep.hot_lead_reason},
         hot_lead_set_by = ${takeHot ? dupe.hot_lead_set_by : keep.hot_lead_set_by},
         hot_lead_set_at = ${takeHot ? dupe.hot_lead_set_at : keep.hot_lead_set_at},
+        blacklisted = ${Boolean(bl)},
+        blacklist_reason = ${bl ? bl.blacklist_reason : null},
+        blacklisted_by = ${bl ? bl.blacklisted_by : null},
+        blacklisted_at = ${bl ? bl.blacklisted_at : null},
+        priority_permanent = ${Boolean(keep.priority_permanent || dupe.priority_permanent)},
         updated_at = now()
       where id = ${keep.id}`;
     const aliasKey = nsNorm(dupe.name);
@@ -1305,7 +1334,7 @@ async function handleScoutStats(url, sql) {
   const bounds = rangeBounds(range, { from: url.searchParams.get("from"), to: url.searchParams.get("to") });
   const startMs = bounds.start.getTime(), endMs = bounds.end.getTime();
 
-  const runs = await sql`select id, company_id, bid_id, source, outcome, submitted_at, received_at, client, project_name, tier, total_score, disqualifiers, override_reason, override_approver, push_to_bid
+  const runs = await sql`select id, company_id, bid_id, source, outcome, ((payload->>'priority_client') = 'true') as priority_client, submitted_at, received_at, client, project_name, tier, total_score, disqualifiers, override_reason, override_approver, push_to_bid
     from scout_runs where not excluded`;
   const bids = await sql`select id, project_name, stage, created_at, final_value, estimated_value, procore_project_id, source_archived, (decided_at is not null) as decision_recorded from bids`;
   const bidById = new Map(bids.map((b) => [b.id, b]));
@@ -1332,6 +1361,7 @@ async function handleScoutStats(url, sql) {
   // ---- Section A: activity in the period (by when SCOUT ran) -------------------
   const inPeriod = all.filter((u) => u.at >= startMs && u.at < endMs);
   const tiers = { A: 0, B: 0, C: 0, "No bid": 0, untiered: 0 };
+  let priorityProceeds = 0;
   let overrides = 0, declinedScore = 0, declinedDisq = 0, declinedPerson = 0, declinedOther = 0, submitted = 0;
   const byTier = {}; // outcomes by tier for submitted bids that have a bid record
   const monthly = new Map();
@@ -1344,7 +1374,9 @@ async function handleScoutStats(url, sql) {
     const disq = Array.isArray(u.disqualifiers) ? u.disqualifiers.length : 0;
     const declined = String(u.outcome || "").toLowerCase() === "declined";
     const unknownOutcome = String(u.outcome || "").toLowerCase() === "unknown"; // scored on the sheet, no decision recorded
-    const isOverride = !declined && !unknownOutcome && tier === "No bid";
+    const isPriorityProceed = !declined && !unknownOutcome && tier === "No bid" && u.priority_client === true;
+    const isOverride = !declined && !unknownOutcome && tier === "No bid" && !isPriorityProceed;
+    if (isPriorityProceed) priorityProceeds++;
     const month = new Date(u.at).toISOString().slice(0, 7);
     const m = monthly.get(month) || { month, bids: 0, overrides: 0, declined_score: 0, declined_disqualifier: 0, declined_person: 0 };
     m.bids++;
@@ -1448,6 +1480,7 @@ async function handleScoutStats(url, sql) {
     tiers,
     submitted,
     overrides,
+    priority_proceeds: priorityProceeds,
     declined: { total: declinedScore + declinedDisq + declinedPerson + declinedOther, by_score: declinedScore, by_disqualifier: declinedDisq, by_person: declinedPerson, other: declinedOther },
     outcomes: { won, lost, open, no_record: noRecord, became_project: becameProject, won_value: wonValue, won_estimate: wonEstimate },
     by_tier: ["A", "B", "C", "No bid", "untiered"].map((t) => byTier[t]).filter(Boolean),
@@ -1694,6 +1727,44 @@ async function handleFinancialsRefresh(request, env, sql, user) {
 }
 
 // ---------------------------------------------------------------------------
+// Admin review: what the leadership should look at in one place (Ben, 2026-10-21):
+// declined priority-client RFQs (a queue to work through), SCOUT overrides, blacklisted
+// clients and priority clients.
+// ---------------------------------------------------------------------------
+async function handleAdminReview(request, url, sql, user) {
+  if (!isCrmAdmin(user)) return forbidden("Admin access required.");
+  if (url.pathname === "/admin/review/resolve" && request.method === "POST") {
+    const body = await parseBody(request);
+    if (!body.id) return json({ error: "id is required" }, 400);
+    const [row] = await sql`
+      update review_queue set status = 'done', resolved_by = ${user.username}, resolved_at = now(), resolution_note = ${body.note || null}
+      where id = ${body.id} and status = 'open' returning id`;
+    if (!row) return json({ error: "not_found" }, 404);
+    return json({ ok: true });
+  }
+  if (url.pathname === "/admin/review" && request.method === "GET") {
+    const declined = await sql`
+      select q.id, q.rfq_ref, q.project_name, q.reason, q.actor, q.status, q.created_at, q.resolved_by, q.resolved_at, q.resolution_note,
+        c.id as company_id, c.name as company_name
+      from review_queue q left join companies c on c.id = q.company_id
+      where q.kind = 'priority_declined' and (q.status = 'open' or q.resolved_at > now() - interval '60 days')
+      order by (q.status = 'open') desc, q.created_at desc limit 200`;
+    const overrides = await sql`
+      select id, client, project_name, tier, submitted_at, override_reason, override_approver, estimator
+      from scout_runs
+      where not excluded and outcome = 'submitted' and lower(coalesce(tier, '')) in ('no bid', 'no_bid')
+        and coalesce((payload->>'priority_client'), 'false') <> 'true' and submitted_at > now() - interval '120 days'
+      order by submitted_at desc limit 100`;
+    const blacklisted = await sql`
+      select id, name, blacklist_reason, blacklisted_by, blacklisted_at from companies where blacklisted order by blacklisted_at desc nulls last, name`;
+    const priority = await sql`
+      select id, name, hot_lead_reason, hot_lead_set_by, hot_lead_set_at, priority_permanent from companies where hot_lead order by priority_permanent desc, hot_lead_set_at desc nulls last, name`;
+    return json({ declined, overrides, blacklisted, priority });
+  }
+  return json({ error: "not_found" }, 404);
+}
+
+// ---------------------------------------------------------------------------
 // Customer payment scores — POST /internal/payment-scores (Ben, 2026-10-16).
 // netsuite-worker computes the score once and pushes the finished values here,
 // right after it writes the custentity_scout_pay* NetSuite fields. CRM stores
@@ -1760,7 +1831,7 @@ async function handleCompanyDetail(id, sql) {
   return json({ company: rows[0], contacts, bids, payment });
 }
 
-const COMPANY_PATCHABLE = ["account_segment", "region", "vertical", "tier", "notes", "hot_lead", "hot_lead_weight", "hot_lead_reason", "netsuite_customer_id"];
+const COMPANY_PATCHABLE = ["account_segment", "region", "vertical", "tier", "notes", "hot_lead", "hot_lead_weight", "hot_lead_reason", "netsuite_customer_id", "blacklisted", "blacklist_reason", "priority_permanent"];
 
 async function handleCompanyPatch(id, request, sql, env, user) {
   const body = await parseBody(request);
@@ -1769,6 +1840,13 @@ async function handleCompanyPatch(id, request, sql, env, user) {
   }
   const existing = await sql`select * from companies where id = ${id}`;
   if (!existing.length) return json({ error: "not_found" }, 404);
+  // Blacklisting, its reason, and making a priority client permanent are admin-only.
+  if (["blacklisted", "blacklist_reason"].some((f) => body[f] !== undefined && body[f] !== existing[0][f]) && !canManageBlacklist(user)) {
+    return forbidden("Only admins can blacklist or un-blacklist a client.");
+  }
+  if (body.priority_permanent !== undefined && Boolean(body.priority_permanent) !== Boolean(existing[0].priority_permanent) && !isCrmAdmin(user)) {
+    return forbidden("Only admins can make a priority client permanent.");
+  }
 
   const fields = Object.keys(body).filter((k) => COMPANY_PATCHABLE.includes(k));
   if (!fields.length) return json({ error: "no_valid_fields", detail: `Patchable fields: ${COMPANY_PATCHABLE.join(", ")}` }, 400);
@@ -1790,6 +1868,23 @@ async function handleCompanyPatch(id, request, sql, env, user) {
 
   const hotLeadTouched = fields.includes("hot_lead") || fields.includes("hot_lead_weight");
   const setClauses = { ...existing[0], ...body };
+  // The blacklist checkbox drives the old Do Not Pursue designation too, so anything that
+  // still reads account_segment (older SCOUT builds) keeps working. Un-blacklisting puts the
+  // account back to Unreviewed rather than guessing its earlier segment.
+  if (body.blacklisted !== undefined && Boolean(body.blacklisted) !== Boolean(existing[0].blacklisted)) {
+    if (body.blacklisted) {
+      setClauses.blacklisted_by = user.username;
+      setClauses.blacklisted_at = new Date().toISOString();
+      if (!BLACKLIST_SEGMENTS.includes(setClauses.account_segment)) setClauses.account_segment = "do_not_pursue";
+    } else {
+      setClauses.blacklisted_by = null;
+      setClauses.blacklisted_at = null;
+      setClauses.blacklist_reason = null;
+      if (BLACKLIST_SEGMENTS.includes(setClauses.account_segment)) setClauses.account_segment = "unreviewed";
+    }
+  }
+  // Un-flagging a priority client also clears "permanent".
+  if (body.hot_lead === false) setClauses.priority_permanent = false;
   if (hotLeadTouched) {
     setClauses.hot_lead_set_by = user.username;
     setClauses.hot_lead_set_at = new Date().toISOString();
@@ -1808,6 +1903,11 @@ async function handleCompanyPatch(id, request, sql, env, user) {
       hot_lead_set_by = ${setClauses.hot_lead_set_by},
       hot_lead_set_at = ${setClauses.hot_lead_set_at},
       netsuite_customer_id = ${setClauses.netsuite_customer_id},
+      blacklisted = ${Boolean(setClauses.blacklisted)},
+      blacklist_reason = ${setClauses.blacklist_reason ?? null},
+      blacklisted_by = ${setClauses.blacklisted_by ?? null},
+      blacklisted_at = ${setClauses.blacklisted_at ?? null},
+      priority_permanent = ${Boolean(setClauses.priority_permanent)},
       updated_at = now()
     where id = ${id}
     returning *`;
@@ -2512,6 +2612,37 @@ SELF_MIGRATIONS.push({
     received_at timestamptz not null default now()
   )`],
 });
+SELF_MIGRATIONS.push({
+  // Blacklist as one admin-only checkbox with a reason, permanent priority clients, and the
+  // admin review queue (declined priority-client RFQs). Ben, 2026-10-21.
+  id: "021_blacklist_priority_queue",
+  statements: [
+    `alter table companies add column if not exists blacklisted boolean not null default false`,
+    `alter table companies add column if not exists blacklist_reason text`,
+    `alter table companies add column if not exists blacklisted_by text`,
+    `alter table companies add column if not exists blacklisted_at timestamptz`,
+    `alter table companies add column if not exists priority_permanent boolean not null default false`,
+    // Anything already designated Do Not Pursue / Do Not Work With becomes blacklisted.
+    `update companies set blacklisted = true, blacklisted_at = coalesce(blacklisted_at, now()),
+        blacklist_reason = coalesce(blacklist_reason, 'Was designated ' || replace(initcap(replace(account_segment, '_', ' ')), '_', ' ') || ' before the blacklist checkbox')
+      where account_segment in ('do_not_pursue', 'do_not_work_with') and not blacklisted`,
+    `create table if not exists review_queue (
+      id uuid primary key default gen_random_uuid(),
+      kind text not null,                       -- priority_declined
+      company_id uuid references companies(id) on delete set null,
+      rfq_ref text,
+      project_name text,
+      reason text,
+      actor text,                               -- who declined it
+      status text not null default 'open',      -- open | done
+      resolved_by text,
+      resolved_at timestamptz,
+      resolution_note text,
+      created_at timestamptz not null default now()
+    )`,
+    `create unique index if not exists review_queue_kind_rfq_idx on review_queue (kind, rfq_ref) where rfq_ref is not null`,
+  ],
+});
 let schemaReady = null;
 function ensureSchema(sql) {
   if (!schemaReady) {
@@ -2894,16 +3025,16 @@ async function runStalenessSweep(env) {
   // A week of grace between prompt and auto-clear, not configurable yet.
   const expiringSoon = await sql`
     select id, name from companies
-    where hot_lead = true and hot_lead_set_at < now() - interval '30 days'
+    where hot_lead = true and not priority_permanent and hot_lead_set_at < now() - interval '30 days'
       and id not in (select company_id from notifications where type = 'hot_lead_expiring' and status = 'pending')`;
   for (const company of expiringSoon) {
     await sql`insert into notifications (company_id, type, message)
-      values (${company.id}, 'hot_lead_expiring', ${`"${company.name}"'s hot-lead flag is 30+ days old — renew it or let it expire.`})`;
+      values (${company.id}, 'hot_lead_expiring', ${`🔥 "${company.name}" has been a priority client for 30+ days — renew it, make it permanent, or let it expire.`})`;
   }
 
   const autoExpired = await sql`
     update companies set hot_lead = false, hot_lead_reason = coalesce(hot_lead_reason, '') || ' (auto-expired after 37 days unrenewed)'
-    where hot_lead = true and hot_lead_set_at < now() - interval '37 days'
+    where hot_lead = true and not priority_permanent and hot_lead_set_at < now() - interval '37 days'
     returning id`;
 
   return { flagged_overdue: overdue.length, flagged_no_owner: noOwner.length, flagged_hot_lead_expiring: expiringSoon.length, auto_expired_hot_leads: autoExpired.length };
@@ -3191,6 +3322,7 @@ export default {
       if (url.pathname === "/access" && request.method === "GET") return withRefresh(await handleAccess(env, auth.user));
       if (url.pathname === "/scout/financials/refresh" && request.method === "POST") return withRefresh(await handleFinancialsRefresh(request, env, sql, auth.user));
       if (url.pathname === "/scout/stats" && request.method === "GET") return withRefresh(await handleScoutStats(url, sql));
+      if (url.pathname.startsWith("/admin/review")) return withRefresh(await handleAdminReview(request, url, sql, auth.user));
       if (url.pathname.startsWith("/admin/scout-unlinked")) return withRefresh(await handleScoutUnlinked(request, url, sql, auth.user));
       if (url.pathname.startsWith("/admin/scout-import") && request.method === "POST") return withRefresh(await handleScoutImport(request, url, sql, auth.user));
       if (url.pathname.startsWith("/admin/contacts-import") && request.method === "POST") return withRefresh(await handleContactsImport(request, url, sql, auth.user));

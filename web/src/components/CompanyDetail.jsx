@@ -11,6 +11,8 @@ export default function CompanyDetail({ id, onClose, onChanged, canHotLead = tru
   // Role matrix — cosmetic; the worker enforces all of these.
   const canSegment = can?.segment ?? true;
   const canBlacklist = can?.blacklist ?? true;
+  const isAdmin = can?.admin === true;
+  const [blacklistReason, setBlacklistReason] = useState("");
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [saving, setSaving] = useState(false);
@@ -20,6 +22,7 @@ export default function CompanyDetail({ id, onClose, onChanged, canHotLead = tru
     api.getCompany(id).then((d) => {
       setData(d);
       setHotLeadReason(d.company.hot_lead_reason || "");
+      setBlacklistReason(d.company.blacklist_reason || "");
     }).catch((e) => setError(e.message));
   }
 
@@ -71,10 +74,11 @@ export default function CompanyDetail({ id, onClose, onChanged, canHotLead = tru
             <select
               value={company.account_segment}
               onChange={(e) => patch({ account_segment: e.target.value })}
-              disabled={saving || (BLACKLIST.includes(company.account_segment) ? !canBlacklist : !canSegment)}
-              title={!canSegment ? "Only estimators and admins can change an account's segment" : BLACKLIST.includes(company.account_segment) && !canBlacklist ? "Only admins can remove a Do Not Pursue / Do Not Work With designation" : undefined}
+              disabled={saving || BLACKLIST.includes(company.account_segment) || !canSegment}
+              title={!canSegment ? "Only estimators and admins can change an account's segment" : BLACKLIST.includes(company.account_segment) ? "Blacklisted accounts are changed with the Blacklisted checkbox below" : undefined}
             >
-              {ACCOUNT_SEGMENTS.map((s) => <option key={s} value={s} disabled={BLACKLIST.includes(s) && !canBlacklist}>{ACCOUNT_SEGMENT_LABELS[s]}</option>)}
+              {ACCOUNT_SEGMENTS.filter((s) => !BLACKLIST.includes(s)).map((s) => <option key={s} value={s}>{ACCOUNT_SEGMENT_LABELS[s]}</option>)}
+              {BLACKLIST.includes(company.account_segment) && <option value={company.account_segment} disabled>Blacklisted (see below)</option>}
             </select>
           </div>
           <div className="field">
@@ -88,16 +92,22 @@ export default function CompanyDetail({ id, onClose, onChanged, canHotLead = tru
         </div>
 
         <div className="card" style={{ background: "var(--bg-page)" }}>
-          <div className="card-title">Hot-lead weighting</div>
+          <div className="card-title">🔥 Priority client</div>
           <div className="field-help" style={{ marginBottom: 8 }}>
-            Manual override read by SCOUT at scoring time — a flagged account can get a passing
-            tier on a borderline score. Recorded here and mirrored to NetSuite during the
-            parallel-run period.
+            Estimators proceed with this client's estimates whatever the RFQ scores. SCOUT shows the priority flag and lets a No Bid score
+            through without an override. If an estimator declines one anyway, it goes to the admin review queue so an admin can follow up with
+            the customer personally. A priority flag expires after 37 days unless it's renewed, or made permanent by an admin.
           </div>
           <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
             <input type="checkbox" checked={company.hot_lead} onChange={(e) => patch({ hot_lead: e.target.checked, hot_lead_reason: hotLeadReason })} disabled={saving || !canHotLead} />
-            Hot lead
+            Priority client
           </label>
+          {company.hot_lead && (
+            <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }} title={isAdmin ? "" : "Only admins can make a priority client permanent"}>
+              <input type="checkbox" checked={Boolean(company.priority_permanent)} onChange={(e) => patch({ priority_permanent: e.target.checked })} disabled={saving || !isAdmin} />
+              Permanent (never expires)
+            </label>
+          )}
           <div className="field">
             <label>Reason</label>
             <input
@@ -105,15 +115,41 @@ export default function CompanyDetail({ id, onClose, onChanged, canHotLead = tru
               onChange={(e) => setHotLeadReason(e.target.value)}
               onBlur={() => canHotLead && hotLeadReason !== (company.hot_lead_reason || "") && patch({ hot_lead_reason: hotLeadReason })}
               disabled={!canHotLead}
-              placeholder="Why this account gets weighted (relationship, strategic account, referral…)"
+              placeholder="Why this client is a priority (relationship, strategic account, referral…)"
             />
           </div>
-          {!canHotLead && <div className="field-help" style={{ marginTop: 6 }}>Only estimators and admins can add or change the hot-lead designation.</div>}
+          {!canHotLead && <div className="field-help" style={{ marginTop: 6 }}>Only estimators and admins can add or change the priority designation.</div>}
           {company.hot_lead_set_by && (
             <div className="field-help" style={{ marginTop: 6 }}>
               Set by {company.hot_lead_set_by} on {new Date(company.hot_lead_set_at).toLocaleString()}
+              {company.priority_permanent ? " · permanent" : ""}
               {company.netsuite_sync_status === "synced" ? " · mirrored to NetSuite" : ""}
             </div>
+          )}
+        </div>
+
+        <div className="card" style={{ background: "var(--bg-page)", marginTop: 12, borderColor: company.blacklisted ? "var(--red)" : undefined }}>
+          <div className="card-title">⛔ Blacklisted</div>
+          <div className="field-help" style={{ marginBottom: 8 }}>
+            A blacklisted client shows a warning in SCOUT and ticks SCOUT's "Blacklisted client" disqualifier for the estimator. Only admins can
+            add or remove it.
+          </div>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+            <input type="checkbox" checked={Boolean(company.blacklisted)} onChange={(e) => patch({ blacklisted: e.target.checked, blacklist_reason: blacklistReason })} disabled={saving || !isAdmin} />
+            Blacklisted
+          </label>
+          <div className="field">
+            <label>Reason</label>
+            <input
+              value={blacklistReason}
+              onChange={(e) => setBlacklistReason(e.target.value)}
+              onBlur={() => isAdmin && blacklistReason !== (company.blacklist_reason || "") && patch({ blacklist_reason: blacklistReason })}
+              disabled={!isAdmin}
+              placeholder="Why (non-payment, scope, conduct…)"
+            />
+          </div>
+          {company.blacklisted_by && (
+            <div className="field-help" style={{ marginTop: 6 }}>Blacklisted by {company.blacklisted_by}{company.blacklisted_at ? " on " + new Date(company.blacklisted_at).toLocaleString() : ""}</div>
           )}
         </div>
 

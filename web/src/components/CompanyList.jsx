@@ -132,7 +132,7 @@ export default function CompanyList({ access }) {
         {sortedCompanies.map((c) => (
           <div className="row-item" key={c.id} onClick={() => setSelectedId(c.id)}>
             <div className="row-primary">
-              {c.hot_lead && <span className="hot-lead-flame">🔥</span>}
+              {c.hot_lead && <span className="hot-lead-flame" title="Priority client">🔥</span>}{c.blacklisted && <span title="Blacklisted"> ⛔</span>}
               {c.name}
             </div>
             <div><span className="badge badge-segment">{ACCOUNT_SEGMENT_LABELS[c.account_segment]}</span></div>

@@ -114,6 +114,10 @@ export const api = {
   // Ask LEDGER to refresh one project's contract / change-order figures now
   refreshProjectFinancials: (procoreProjectId) => request(`/scout/financials/refresh`, { method: "POST", body: { procore_project_id: procoreProjectId } }),
 
+  // Admin review queue (declined priority-client RFQs, overrides, blacklist, priority clients)
+  getAdminReview: () => request(`/admin/review`),
+  resolveReviewItem: (id, note) => request(`/admin/review/resolve`, { method: "POST", body: { id, note } }),
+
   // Procore project regions (one list, used for every region pick)
   listRegions: () => request(`/regions`),
 

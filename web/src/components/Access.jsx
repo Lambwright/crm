@@ -18,7 +18,7 @@ const CAP_LABELS = {
 
 const LEVEL_HELP = {
   admin: "Everything.",
-  estimator: "Pipeline, Companies, stage moves, hot leads, assigning follow-ups.",
+  estimator: "Pipeline, Companies, stage moves, priority clients, assigning follow-ups.",
   pm: "Dashboard, plus follow-ups on bids assigned to them.",
 };
 

@@ -8,6 +8,7 @@ import CompanyList from "./components/CompanyList.jsx";
 import Dashboard from "./components/Dashboard.jsx";
 import Followups from "./components/Followups.jsx";
 import ScoutStats from "./components/ScoutStats.jsx";
+import AdminReview from "./components/AdminReview.jsx";
 
 // "PM" here is CRM's assignable-users list (HELM → CRM Options), not a real
 // role — anyone on it gets Follow-ups first in the nav, since they're the
@@ -27,6 +28,7 @@ function visibleTabs(access) {
   if (access && access.can && access.can.all_bids === false) {
     tabs = tabs.filter((t) => t.key === "dashboard" || t.key === "followups" || t.key === "scout");
   }
+  if (access && access.can && access.can.admin) tabs = [...tabs, { key: "admin", label: "Admin" }];
   return tabs;
 }
 
@@ -136,6 +138,7 @@ export default function App() {
         {tab === "companies" && <CompanyList access={access} />}
         {tab === "dashboard" && <Dashboard />}
         {tab === "scout" && <ScoutStats access={access} />}
+        {tab === "admin" && <AdminReview />}
       </div>
     </>
   );
