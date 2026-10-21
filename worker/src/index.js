@@ -165,10 +165,15 @@ async function requireLogin(request, env) {
 // cosmetic only.
 // ---------------------------------------------------------------------------
 
-// followup_manager (Ben, 2026-10-21): everything an estimator can do, plus owning the follow-up
-// assignment rules. HELM's role matrix assigns it; until HELM defines the level nobody has it.
-const CRM_LEVELS = ["admin", "estimator", "followup_manager", "pm"];
-const isEstLevel = (level) => level === "admin" || level === "estimator" || level === "followup_manager";
+// Levels: admin / estimator / pm, from HELM's role matrix. "Follow-up manager" (Ben, 2026-10-21) is
+// NOT a level: it's an extra permission ticked on the person's HELM record (user.appExtras.CRM),
+// so an estimator or PM keeps their own level everywhere else and gains the follow-up
+// dashboard, bulk assignment and ownership of the assignment rules.
+const CRM_LEVELS = ["admin", "estimator", "pm"];
+const isEstLevel = (level) => level === "admin" || level === "estimator";
+const EXTRA_FOLLOWUP_MANAGER = "followup_manager";
+const extrasOf = (user) => (Array.isArray(user && user._extras) ? user._extras : []);
+const isFollowupManager = (user) => extrasOf(user).includes(EXTRA_FOLLOWUP_MANAGER);
 
 function resolveCrmAccess(user) {
   const roles = user && user.appRoles && typeof user.appRoles === "object" ? user.appRoles : null;
@@ -200,7 +205,7 @@ function canSetHotLead(user) {
 }
 function canAssignFollowups(user) {
   const c = crmOf(user);
-  return c.mode === "live" ? isEstLevel(c.level) : true;
+  return c.mode === "live" ? isEstLevel(c.level) || isFollowupManager(user) : true;
 }
 // Ben, 2026-10-05 (live mode only — legacy keeps today's no-restriction behaviour):
 // blacklist designation = admin only; account segment and handoff_status =
@@ -238,10 +243,13 @@ async function loadGrants(sql) {
 }
 async function attachCaps(sql, user) {
   const c = crmOf(user);
+  // Extras come from the Einbau ID token (HELM sets them per person per app).
+  const raw = user && user.appExtras && typeof user.appExtras === "object" ? user.appExtras.CRM : null;
+  user._extras = Array.isArray(raw) ? raw.map(String) : [];
   if (c.mode !== "live" || c.level === "admin") user._caps = [...CRM_CAPS];
   else {
     user._caps = ((await loadGrants(sql))[user.username] || []).filter((x) => CRM_CAPS.includes(x));
-    if (c.level === "followup_manager" && !user._caps.includes("followup_manager")) user._caps.push("followup_manager");
+    if (isFollowupManager(user) && !user._caps.includes("followup_manager")) user._caps.push("followup_manager");
   }
 }
 function hasCap(user, cap) {
@@ -268,11 +276,13 @@ function scopeDenied(user) {
 // only a follow-up manager edits them without it.
 function canSeeFollowupDashboard(user) {
   const c = crmOf(user);
-  return c.mode === "live" ? isEstLevel(c.level) : true;
+  return c.mode === "live" ? isEstLevel(c.level) || isFollowupManager(user) : true;
 }
+// Only someone ticked as a follow-up manager edits the rules without the confirmation prompt
+// (admins don't, on purpose: the rules belong to the follow-up managers).
 function canEditRulesDirectly(user) {
   const c = crmOf(user);
-  return c.mode === "live" && c.level === "followup_manager";
+  return c.mode === "live" && isFollowupManager(user);
 }
 
 function forbidden(detail) {
@@ -1800,7 +1810,7 @@ const today = () => new Date().toISOString().slice(0, 10);
 const dayOf = (d) => (d ? new Date(d).toISOString().slice(0, 10) : null);
 
 async function loadFollowupPeople(env, user) {
-  try { return (await eligibleAssignees(env, user)).map((p) => ({ username: p.username, displayName: p.displayName, level: p.level })); }
+  try { return (await eligibleAssignees(env, user)).map((p) => ({ username: p.username, displayName: p.displayName, level: p.level, extras: Array.isArray(p.extras) ? p.extras : [] })); }
   catch (e) { return []; }
 }
 
@@ -1847,7 +1857,7 @@ async function handleFollowupDashboard(env, sql, user) {
   const rules = await sql`
     select r.id, r.position, r.kind, r.company_id, r.value, r.assignee_username, r.pool, r.active, r.note, r.updated_by, r.updated_at, c.name as company_name
     from followup_rules r left join companies c on c.id = r.company_id order by r.position, r.updated_at`;
-  const managers = people.filter((p) => p.level === "followup_manager");
+  const managers = people.filter((p) => p.extras.includes(EXTRA_FOLLOWUP_MANAGER));
   return json({
     summary, team, work, rules, managers, people,
     can: { assign: canAssignFollowups(user), edit_rules_directly: canEditRulesDirectly(user) },
@@ -2536,7 +2546,7 @@ async function handleAccess(env, user) {
     all_bids: canSeeAllBids(user),
     followup_dashboard: canSeeFollowupDashboard(user),
     followup_rules_direct: canEditRulesDirectly(user),
-    followup_manager: hasCap(user, "followup_manager"),
+    followup_manager: isFollowupManager(user),
     campaign_manager: hasCap(user, "campaign_manager"),
   };
   if (c.mode !== "live") return json({ mode: c.mode, level: c.level, can, caps: user._caps || [], people: null });
