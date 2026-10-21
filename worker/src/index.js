@@ -611,7 +611,7 @@ async function handleScoutIntake(request, sql) {
 
   // A priority client's RFQ that an estimator declines is escalated: it lands in the admin
   // review queue so an admin can follow up with the customer personally.
-  if (company.hot_lead && (body.scout_outcome === "declined" || qualification_result === "no_bid") && rfq_ref) {
+  if (company.hot_lead && !company.blacklisted && (body.scout_outcome === "declined" || qualification_result === "no_bid") && rfq_ref) {
     const who = body.scout_record && typeof body.scout_record === "object" ? body.scout_record.estimator : null;
     await sql`
       insert into review_queue (kind, company_id, rfq_ref, project_name, reason, actor)
@@ -761,8 +761,8 @@ async function handleCompanyLookup(url, sql) {
     found: true,
     matched_by: matchedBy,
     company: { ...company, priority: Boolean(company.hot_lead), priority_reason: company.hot_lead_reason || null },
-    priority: Boolean(company.hot_lead),
-    priority_permanent: Boolean(company.priority_permanent),
+    priority: Boolean(company.hot_lead) && !company.blacklisted,
+    priority_permanent: Boolean(company.priority_permanent) && !company.blacklisted,
     blacklisted: Boolean(company.blacklisted),
     blacklist_reason: company.blacklist_reason || null,
     win_stats: await companyWinStats(sql, company.id),
@@ -1178,7 +1178,7 @@ async function handleCompanyMerge(request, url, sql, user) {
         tier = ${keep.tier || dupe.tier || null},
         account_segment = ${segment},
         notes = ${notes},
-        hot_lead = ${takeHot ? true : keep.hot_lead},
+        hot_lead = ${bl ? false : takeHot ? true : keep.hot_lead},
         hot_lead_weight = ${takeHot ? dupe.hot_lead_weight : keep.hot_lead_weight},
         hot_lead_reason = ${takeHot ? dupe.hot_lead_reason : keep.hot_lead_reason},
         hot_lead_set_by = ${takeHot ? dupe.hot_lead_set_by : keep.hot_lead_set_by},
@@ -1187,7 +1187,7 @@ async function handleCompanyMerge(request, url, sql, user) {
         blacklist_reason = ${bl ? bl.blacklist_reason : null},
         blacklisted_by = ${bl ? bl.blacklisted_by : null},
         blacklisted_at = ${bl ? bl.blacklisted_at : null},
-        priority_permanent = ${Boolean(keep.priority_permanent || dupe.priority_permanent)},
+        priority_permanent = ${bl ? false : Boolean(keep.priority_permanent || dupe.priority_permanent)},
         updated_at = now()
       where id = ${keep.id}`;
     const aliasKey = nsNorm(dupe.name);
@@ -1846,6 +1846,17 @@ async function handleCompanyPatch(id, request, sql, env, user) {
   }
   if (body.priority_permanent !== undefined && Boolean(body.priority_permanent) !== Boolean(existing[0].priority_permanent) && !isCrmAdmin(user)) {
     return forbidden("Only admins can make a priority client permanent.");
+  }
+
+  // A client is either blacklisted or a priority client, never both (Ben, 2026-10-21): the
+  // other flag has to be removed first.
+  const willBlacklist = body.blacklisted === true && !existing[0].blacklisted;
+  const willPrioritize = body.hot_lead === true && !existing[0].hot_lead;
+  if (willBlacklist && (existing[0].hot_lead && body.hot_lead !== false)) {
+    return json({ error: "flag_conflict", detail: "This client is a priority client. Remove the priority flag before blacklisting it." }, 409);
+  }
+  if (willPrioritize && (existing[0].blacklisted && body.blacklisted !== false)) {
+    return json({ error: "flag_conflict", detail: "This client is blacklisted. Remove the blacklist before making it a priority client." }, 409);
   }
 
   const fields = Object.keys(body).filter((k) => COMPANY_PATCHABLE.includes(k));

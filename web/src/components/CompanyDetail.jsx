@@ -91,6 +91,7 @@ export default function CompanyDetail({ id, onClose, onChanged, canHotLead = tru
           </div>
         </div>
 
+        {!company.blacklisted && (
         <div className="card" style={{ background: "var(--bg-page)" }}>
           <div className="card-title">🔥 Priority client</div>
           <div className="field-help" style={{ marginBottom: 8 }}>
@@ -128,6 +129,9 @@ export default function CompanyDetail({ id, onClose, onChanged, canHotLead = tru
           )}
         </div>
 
+        )}
+
+        {!company.hot_lead && (
         <div className="card" style={{ background: "var(--bg-page)", marginTop: 12, borderColor: company.blacklisted ? "var(--red)" : undefined }}>
           <div className="card-title">⛔ Blacklisted</div>
           <div className="field-help" style={{ marginBottom: 8 }}>
@@ -152,6 +156,7 @@ export default function CompanyDetail({ id, onClose, onChanged, canHotLead = tru
             <div className="field-help" style={{ marginTop: 6 }}>Blacklisted by {company.blacklisted_by}{company.blacklisted_at ? " on " + new Date(company.blacklisted_at).toLocaleString() : ""}</div>
           )}
         </div>
+        )}
 
         <div style={{ marginTop: 12 }}><PaymentHistory payment={data.payment} /></div>
 
