@@ -612,7 +612,8 @@ async function handleScoutIntake(request, sql) {
   // A priority client's RFQ that an estimator declines is escalated: it lands in the admin
   // review queue so an admin can follow up with the customer personally.
   if (company.hot_lead && !company.blacklisted && (body.scout_outcome === "declined" || qualification_result === "no_bid") && rfq_ref) {
-    const who = body.scout_record && typeof body.scout_record === "object" ? body.scout_record.estimator : null;
+    const rec0 = body.scout_record && typeof body.scout_record === "object" ? body.scout_record : {};
+    const who = (rec0.estimator && String(rec0.estimator).trim()) || rec0.submitted_by || body.submitted_by || null;
     await sql`
       insert into review_queue (kind, company_id, rfq_ref, project_name, reason, actor)
       values ('priority_declined', ${company.id}, ${rfq_ref}, ${project_name}, ${no_bid_reason || null}, ${who || null})
@@ -1750,7 +1751,7 @@ async function handleAdminReview(request, url, sql, user) {
       where q.kind = 'priority_declined' and (q.status = 'open' or q.resolved_at > now() - interval '60 days')
       order by (q.status = 'open') desc, q.created_at desc limit 200`;
     const overrides = await sql`
-      select id, client, project_name, tier, submitted_at, override_reason, override_approver, estimator
+      select id, client, project_name, tier, submitted_at, override_reason, override_approver, coalesce(nullif(estimator, ''), payload->>'submitted_by') as estimator
       from scout_runs
       where not excluded and outcome = 'submitted' and lower(coalesce(tier, '')) in ('no bid', 'no_bid')
         and coalesce((payload->>'priority_client'), 'false') <> 'true' and submitted_at > now() - interval '120 days'
@@ -1758,7 +1759,7 @@ async function handleAdminReview(request, url, sql, user) {
     // Priority clients' RFQs that scored No Bid but went ahead anyway: the ones that would
     // have failed without the flag. No override is needed for these, so they are listed here.
     const proceeds = await sql`
-      select id, client, project_name, total_score, submitted_at, estimator
+      select id, client, project_name, total_score, submitted_at, coalesce(nullif(estimator, ''), payload->>'submitted_by') as estimator
       from scout_runs
       where not excluded and outcome = 'submitted' and lower(coalesce(tier, '')) in ('no bid', 'no_bid')
         and coalesce((payload->>'priority_client'), 'false') = 'true' and submitted_at > now() - interval '180 days'
