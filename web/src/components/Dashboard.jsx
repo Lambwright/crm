@@ -73,47 +73,6 @@ function periodCaption(range, period, rangeInfo) {
   return `Win rates count bids decided ${rangeInfo.phrase}; other figures count bids created ${rangeInfo.phrase}.`;
 }
 
-// How the RFQ prequalifier is doing (Ben, 2026-10-07): bids that went through
-// SCOUT against bids that didn't, and against bids from before SCOUT existed,
-// plus the result by the tier SCOUT gave them. Decided win rate throughout.
-function ScoutResults({ scout, phrase }) {
-  if (!scout || !scout.all || scout.all.created + scout.all.won + scout.all.lost === 0) return null;
-  const since = scout.since ? new Date(scout.since).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : null;
-  const tierOrder = ["A", "B", "C", "untiered"];
-  const tiers = Object.entries(scout.tiers || {}).sort((a, b) => (tierOrder.indexOf(a[0]) === -1 ? 9 : tierOrder.indexOf(a[0])) - (tierOrder.indexOf(b[0]) === -1 ? 9 : tierOrder.indexOf(b[0])));
-  const rows = [
-    ["Through SCOUT", scout.all],
-    ...tiers.map(([k, v]) => [`  Tier ${k === "untiered" ? "(none)" : k}`, v]),
-    [`Not through SCOUT (since ${since || "SCOUT began"})`, scout.others],
-    ["Before SCOUT", scout.before],
-  ].filter(([, v]) => v && (v.created || v.won || v.lost));
-  return (
-    <div style={{ marginBottom: 24 }}>
-      <Tip label="SCOUT prequalifier results" className="card-title">
-        Bids whose RFQ was run through SCOUT (it assigns each one a reference number and a tier), compared with bids that came
-        straight onto the Procore Bid Board without it{since ? ` since SCOUT's first bid on ${since}` : ""}, and with bids from before SCOUT existed.<br /><br />
-        <strong>Won / Lost</strong>: decided {phrase}. <strong>Win rate</strong> is Won ÷ (Won + Lost). <strong>Open</strong> is bids
-        created {phrase} still in play after qualification. A tier with only a handful of decided bids says very little yet.
-      </Tip>
-      <table className="data-table">
-        <thead><tr><th>Group</th><th className="num">Bids created</th><th className="num">Won</th><th className="num">Lost</th><th className="num">Open</th><th className="num">Win rate</th></tr></thead>
-        <tbody>
-          {rows.map(([label, v]) => (
-            <tr key={label}>
-              <td style={{ whiteSpace: "pre" }}>{label}</td>
-              <td className="num">{fmtNum(v.created)}</td>
-              <td className="num">{fmtNum(v.won)}</td>
-              <td className="num">{fmtNum(v.lost)}</td>
-              <td className="num">{fmtNum(v.open)}</td>
-              <td className="num">{fmtPct(v.decided_win_rate)}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
 export default function Dashboard() {
   const [range, setRange] = useState("all");
   const [basis, setBasis] = useState("count");
@@ -314,8 +273,6 @@ export default function Dashboard() {
           );
         })}
       </div>
-
-      <ScoutResults scout={summary.scout} phrase={rangeInfo.phrase} />
 
       <div style={{ marginBottom: 24 }}>
         <CustomerTable
