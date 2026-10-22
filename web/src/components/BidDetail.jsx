@@ -86,11 +86,14 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
     }
   }
 
-  function assignSelect(field, currentValue) {
+  // `only` narrows who is offered (e.g. the bid estimator picker lists job role "estimator" only);
+  // the bid's current value always stays selectable so an existing assignment is never blanked.
+  function assignSelect(field, currentValue, only) {
     if (!canAssign) {
       const who = assignableUsers.find((u) => u.username === currentValue);
       return <span>{currentValue ? who?.displayName || currentValue : "— unassigned —"}</span>;
     }
+    const pool = only ? assignableUsers.filter(only) : assignableUsers;
     if (!assignableUsers.length) {
       return (
         <input
@@ -100,9 +103,9 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
         />
       );
     }
-    const options = assignableUsers.some((u) => u.username === currentValue) || !currentValue
-      ? assignableUsers
-      : [{ username: currentValue, displayName: currentValue }, ...assignableUsers];
+    const options = pool.some((u) => u.username === currentValue) || !currentValue
+      ? pool
+      : [{ username: currentValue, displayName: assignableUsers.find((u) => u.username === currentValue)?.displayName || currentValue }, ...pool];
     return (
       <select value={currentValue || ""} onChange={(e) => assignField(field, e.target.value)} style={{ fontSize: 12, padding: "2px 4px" }}>
         <option value="">— unassigned —</option>
@@ -187,7 +190,7 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
           <div className="kv"><span className="kv-label">Stage</span><span className="kv-value">{STAGE_LABELS[bid.stage]}</span></div>
           <div className="kv"><span className="kv-label">SCOUT Tier</span><span className="kv-value">{bid.scout_tier || "—"}{bid.hot_lead_applied ? " (hot-lead bump)" : ""}</span></div>
           <div className="kv"><span className="kv-label">Owner</span><span className="kv-value">{assignSelect("owner_username", bid.owner_username)}</span></div>
-          <div className="kv"><span className="kv-label">Estimator</span><span className="kv-value">{assignSelect("estimator_username", bid.estimator_username)}</span></div>
+          <div className="kv"><span className="kv-label">Estimator</span><span className="kv-value">{assignSelect("estimator_username", bid.estimator_username, (u) => u.jobRole === "estimator")}</span></div>
           <div className="kv"><span className="kv-label">Bid Due</span><span className="kv-value">{bid.bid_due_date || "—"}</span></div>
           <div className="kv"><span className="kv-label">Next Action</span><span className="kv-value">{bid.next_action ? `${bid.next_action} (${bid.next_action_date || "no date"})` : "—"}</span></div>
         </div>

@@ -2507,7 +2507,14 @@ async function handleAccess(env, user) {
     campaign_manager: hasCap(user, "campaign_manager"),
   };
   try {
-    const people = (await eligibleAssignees(env, user)).map((p) => ({ username: p.username, displayName: p.displayName, level: p.level }));
+    const people = (await eligibleAssignees(env, user)).map((p) => ({
+      username: p.username,
+      displayName: p.displayName,
+      level: p.level,
+      jobRole: p.jobRole || null,
+      department: p.department || null,
+      procoreUser: p.procoreUser || null,
+    }));
     return json({ mode: c.mode, level: c.level, can, caps: user._caps || [], people });
   } catch (e) {
     return json({ mode: c.mode, level: c.level, can, caps: user._caps || [], people: [], people_error: e.message });
