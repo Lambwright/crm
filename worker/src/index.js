@@ -130,23 +130,12 @@ async function requireLogin(request, env) {
       return { ok: false, reason: `"${data.user.username}" doesn't have CRM access (HELM apps list).` };
     }
 
-    // Role-matrix switch-over (auth-worker/README.md "Role matrix"): three
-    // states for appRoles.CRM, decided by resolveCrmAccess below.
-    //   live    -> a real level (admin/estimator/pm); the matrix is the gate
-    //   legacy  -> "access" (CRM's Live switch in HELM is still off): keep
-    //              today's checks exactly (ALLOWED_ROLES on user.role,
-    //              user.role === "admin", assignable_usernames) so deploying
-    //              this before Ben flips the switch changes nobody's access
-    //   denied  -> "no_access" or any value we don't recognise
+    // Access comes only from Einbau ID's role matrix (appRoles.CRM): a level CRM defines means in;
+    // anything else (no_access, a missing entry, an unknown value) means out. Every app is Live, so
+    // there is no fallback to the old per-person lists or user.role.
     const crm = resolveCrmAccess(data.user);
     if (crm.mode === "denied") {
-      return { ok: false, reason: `"${data.user.username}" has no CRM access in the role matrix.` };
-    }
-    if (crm.mode === "legacy") {
-      const allowedRoles = String(env.ALLOWED_ROLES || "admin,user").split(",").map((r) => r.trim());
-      if (!allowedRoles.includes(data.user.role)) {
-        return { ok: false, reason: `Logged in as "${data.user.username}" (role "${data.user.role}"), which isn't allowed in CRM.` };
-      }
+      return { ok: false, reason: `"${data.user.username}" has no CRM access in the role matrix (HELM).` };
     }
     // _crm / _token are internal: handlers read the resolved level and the
     // caller's own token (to look people up through auth-worker) from here.
@@ -179,58 +168,48 @@ function resolveCrmAccess(user) {
   const roles = user && user.appRoles && typeof user.appRoles === "object" ? user.appRoles : null;
   const level = roles ? roles.CRM : undefined;
   if (typeof level === "string" && CRM_LEVELS.includes(level)) return { mode: "live", level };
-  // "access" is the matrix's neutral "granted, app not switched yet". A
-  // missing appRoles / missing CRM key is treated the same way rather than
-  // as a denial: it can only mean an auth-worker that predates the matrix,
-  // and falling back to today's checks is no looser than what CRM already
-  // does — whereas denying would lock everyone out.
-  if (level === "access" || level === undefined) return { mode: "legacy", level: null };
-  return { mode: "denied", level: null }; // "no_access" or anything unrecognised
+  return { mode: "denied", level: null };
 }
 
 function crmOf(user) {
-  return (user && user._crm) || { mode: "legacy", level: null };
+  return (user && user._crm) || { mode: "denied", level: null };
 }
 
-// In legacy mode every one of these keeps today's behaviour: stage moves and
-// hot-lead edits were never restricted by role, and the admin check was the
-// legacy user.role.
 function canMoveStages(user) {
   const c = crmOf(user);
-  return c.mode === "live" ? isEstLevel(c.level) : true;
+  return isEstLevel(c.level);
 }
 function canSetHotLead(user) {
   const c = crmOf(user);
-  return c.mode === "live" ? isEstLevel(c.level) : true;
+  return isEstLevel(c.level);
 }
 function canAssignFollowups(user) {
   const c = crmOf(user);
-  return c.mode === "live" ? isEstLevel(c.level) || isFollowupManager(user) : true;
+  return isEstLevel(c.level) || isFollowupManager(user);
 }
-// Ben, 2026-10-05 (live mode only — legacy keeps today's no-restriction behaviour):
+// Ben, 2026-10-05:
 // blacklist designation = admin only; account segment and handoff_status =
 // estimator and admin.
 const BLACKLIST_SEGMENTS = ["do_not_pursue", "do_not_work_with"];
 function canManageBlacklist(user) {
   const c = crmOf(user);
-  return c.mode === "live" ? c.level === "admin" : true;
+  return c.level === "admin";
 }
 function canChangeSegment(user) {
   const c = crmOf(user);
-  return c.mode === "live" ? isEstLevel(c.level) : true;
+  return isEstLevel(c.level);
 }
 function canSetHandoffStatus(user) {
   const c = crmOf(user);
-  return c.mode === "live" ? isEstLevel(c.level) : true;
+  return isEstLevel(c.level);
 }
 function isCrmAdmin(user) {
   const c = crmOf(user);
-  return c.mode === "live" ? c.level === "admin" : user.role === "admin";
+  return c.level === "admin";
 }
 
 // Extra capabilities granted per person inside CRM (admin edits them under the
-// Access tab), on top of the Einbau ID level. admin implicitly has all; legacy
-// mode (matrix not switched) keeps today's no-restriction behaviour.
+// Access tab), on top of the Einbau ID level. admin implicitly has all.
 //   followup_manager - sees every follow-up, bulk-assigns, runs auto-assign rules
 //   campaign_manager - the Campaigns tab (import, dashboard, copilot)
 const CRM_CAPS = ["followup_manager", "campaign_manager"];
@@ -246,7 +225,7 @@ async function attachCaps(sql, user) {
   // Extras come from the Einbau ID token (HELM sets them per person per app).
   const raw = user && user.appExtras && typeof user.appExtras === "object" ? user.appExtras.CRM : null;
   user._extras = Array.isArray(raw) ? raw.map(String) : [];
-  if (c.mode !== "live" || c.level === "admin") user._caps = [...CRM_CAPS];
+  if (c.level === "admin") user._caps = [...CRM_CAPS];
   else {
     user._caps = ((await loadGrants(sql))[user.username] || []).filter((x) => CRM_CAPS.includes(x));
     if (isFollowupManager(user) && !user._caps.includes("followup_manager")) user._caps.push("followup_manager");
@@ -259,7 +238,7 @@ function hasCap(user, cap) {
 // nothing else (Ben, 2026-10-07). Everyone else sees every bid.
 function canSeeAllBids(user) {
   const c = crmOf(user);
-  return c.mode === "live" ? isEstLevel(c.level) : true;
+  return isEstLevel(c.level);
 }
 function ownsBid(user, bid) {
   return Boolean(bid) && (bid.owner_username === user.username || bid.estimator_username === user.username);
@@ -276,13 +255,13 @@ function scopeDenied(user) {
 // only a follow-up manager edits them without it.
 function canSeeFollowupDashboard(user) {
   const c = crmOf(user);
-  return c.mode === "live" ? isEstLevel(c.level) || isFollowupManager(user) : true;
+  return isEstLevel(c.level) || isFollowupManager(user);
 }
 // Only someone ticked as a follow-up manager edits the rules without the confirmation prompt
 // (admins don't, on purpose: the rules belong to the follow-up managers).
 function canEditRulesDirectly(user) {
   const c = crmOf(user);
-  return c.mode === "live" && isFollowupManager(user);
+  return isFollowupManager(user);
 }
 
 function forbidden(detail) {
@@ -320,19 +299,11 @@ async function eligibleAssignees(env, user) {
 async function checkAssignmentChange(env, settings, user, changes) {
   const real = changes.filter(([, next, prev]) => (next || null) !== (prev || null));
   if (!real.length) return null;
-  if (crmOf(user).mode === "live") {
-    if (!canAssignFollowups(user)) return forbidden("Only estimators and admins can assign follow-ups.");
-    const eligible = new Set((await eligibleAssignees(env, user)).map((p) => p.username));
-    for (const [field, next] of real) {
-      if (next && !eligible.has(next)) {
-        return json({ error: "not_assignable", detail: `"${next}" can't be assigned follow-ups — they need CRM access at PM level or above.` }, 422);
-      }
-    }
-    return null;
-  }
+  if (!canAssignFollowups(user)) return forbidden("Only estimators, admins and follow-up managers can assign follow-ups.");
+  const eligible = new Set((await eligibleAssignees(env, user)).map((p) => p.username));
   for (const [field, next] of real) {
-    if (!isAssignableUsername(settings, user, next)) {
-      return json({ error: "not_assignable", detail: `"${next}" isn't on the assignable-users list (HELM → CRM Options).` }, 422);
+    if (next && !eligible.has(next)) {
+      return json({ error: "not_assignable", detail: `"${next}" can't be assigned follow-ups; they need CRM access at PM level or above.` }, 422);
     }
   }
   return null;
@@ -446,29 +417,15 @@ function autoFollowUpDate(cadenceDays, stage, existingDateStr, { force = false }
 
 // One row, read-modify-write from HELM's CRM Options tab (GET/PATCH
 // /settings below) — see migration 008. `cadence` is the code defaults with
-// any per-stage override layered on top; `assignableUsernames` is
-// [{username, displayName}] and empty means "not configured yet, allow
-// anything" (see isAssignableUsername).
+// any per-stage override layered on top. Who can be assigned follow-ups comes
+// from the role matrix (PM level or above), not from a list stored here.
 async function getCrmSettings(sql) {
   const [row] = await sql`select * from crm_settings where singleton = 1`;
   return {
     cadence: { ...DEFAULT_CADENCE_DAYS, ...(row?.followup_cadence_days || {}) },
-    assignableUsernames: Array.isArray(row?.assignable_usernames) ? row.assignable_usernames : [],
     updated_at: row?.updated_at || null,
     updated_by: row?.updated_by || null,
   };
-}
-
-// Ben, 2026-09: "only estimators or admin people who can assign follow-ups."
-// Einbau ID itself only has admin/user roles (no "estimator"), so the
-// estimator/PM set is this configurable list instead; an admin-role user
-// always bypasses it. Clearing an assignment (username null/empty) is
-// always allowed.
-function isAssignableUsername(settings, actingUser, username) {
-  if (!username) return true;
-  if (actingUser.role === "admin") return true;
-  if (!settings.assignableUsernames.length) return true;
-  return settings.assignableUsernames.some((u) => u.username === username);
 }
 
 // ---------------------------------------------------------------------------
@@ -2549,7 +2506,6 @@ async function handleAccess(env, user) {
     followup_manager: isFollowupManager(user),
     campaign_manager: hasCap(user, "campaign_manager"),
   };
-  if (c.mode !== "live") return json({ mode: c.mode, level: c.level, can, caps: user._caps || [], people: null });
   try {
     const people = (await eligibleAssignees(env, user)).map((p) => ({ username: p.username, displayName: p.displayName, level: p.level }));
     return json({ mode: c.mode, level: c.level, can, caps: user._caps || [], people });
@@ -2588,11 +2544,9 @@ async function handleSettingsPatch(request, sql, user) {
   const body = await parseBody(request);
   const current = await getCrmSettings(sql);
   const cadence = body.followup_cadence_days !== undefined ? body.followup_cadence_days : current.cadence;
-  const assignable = body.assignable_usernames !== undefined ? body.assignable_usernames : current.assignableUsernames;
   await sql`
     update crm_settings set
       followup_cadence_days = ${JSON.stringify(cadence)}::jsonb,
-      assignable_usernames = ${JSON.stringify(assignable)}::jsonb,
       updated_at = now(), updated_by = ${user.username}
     where singleton = 1`;
   return json(await getCrmSettings(sql));

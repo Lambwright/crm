@@ -3,16 +3,10 @@ import { api } from "../api.js";
 import { BOARD_STAGES, STAGE_LABELS, STAGE_REQUIREMENTS } from "../stages.js";
 import BidDetail from "./BidDetail.jsx";
 
-// Ben, 2026-10-01: "if I'm an estimator, admin or super admin". Once CRM is
-// switched to the role matrix that's exactly access.can.move_stages
-// (estimator/admin). Until then (legacy mode) this keeps using the closest
-// equivalent: the HELM-curated assignable-users list or the legacy admin role.
+// Ben, 2026-10-01: "if I'm an estimator, admin or super admin": the same people who can move a bid
+// between stages, straight from the role matrix (HELM).
 function canStartHandoff(user, assignableUsers, access) {
-  if (!user) return false;
-  // Live (role matrix): same people who can move a bid between stages.
-  if (access && access.mode === "live") return Boolean(access.can?.move_stages);
-  if (user.role === "admin") return true;
-  return assignableUsers.some((u) => u.username === user.username);
+  return Boolean(user && access && access.can?.move_stages);
 }
 
 const HANDOFF_URL = (boardId) => `https://lambwright.github.io/handoff/#/bids?open=${encodeURIComponent(boardId)}`;

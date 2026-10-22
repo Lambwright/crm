@@ -18,12 +18,7 @@
 	],
 	"vars": {
 		"CURRENT_APP": "CRM",
-		// Comma list of Einbau ID usernames allowed to open this app at all,
-		// same gate shape as TALLY's ALLOWED_USERS. Confirm the real list with
-		// Ben before deploy — left broad (role-based) for now since the whole
-		// point of this app is wide internal use (estimating, BD/follow-up,
-		// leadership), unlike TALLY's small named list.
-		"ALLOWED_ROLES": "admin,user",
+		// Access is decided entirely by Einbau ID's role matrix (HELM); no username or role list lives here.
 		// TODO(ben): the exact NetSuite Customer custom-field script id that
 		// should receive the hot-lead flag/weight during the parallel-run
 		// period. Left unset means the NetSuite mirror push is skipped

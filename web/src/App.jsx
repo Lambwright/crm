@@ -35,14 +35,11 @@ function visibleTabs(access) {
   return tabs;
 }
 
-// Who gets Follow-ups first. Live (role matrix): the people who actually work
-// follow-ups — estimators and PMs; admins keep the default order. Legacy (CRM
-// not switched yet): unchanged — anyone on the HELM assignable-users list.
-function tabsFor(username, access, assignableUsernames) {
+// Who gets Follow-ups first: the people who actually work follow-ups, estimators and PMs;
+// admins keep the default order. Levels come from the role matrix (HELM).
+function tabsFor(access) {
   const base = visibleTabs(access);
-  const leadsWithFollowups = access && access.mode === "live"
-    ? access.level === "estimator" || access.level === "pm"
-    : (assignableUsernames || []).some((u) => u.username === username);
+  const leadsWithFollowups = access && (access.level === "estimator" || access.level === "pm");
   if (!leadsWithFollowups) return base;
   const followups = base.find((t) => t.key === "followups");
   return followups ? [followups, ...base.filter((t) => t.key !== "followups")] : base;
@@ -108,9 +105,7 @@ export default function App() {
   // Who can be picked as an owner/estimator. Live (role matrix): everyone with
   // CRM access at PM level or above, read from auth-worker via /access.
   // Legacy (CRM not switched yet): the HELM assignable-users list, as before.
-  const assignableUsers = access && access.mode === "live"
-    ? access.people || []
-    : settings?.assignableUsernames || [];
+  const assignableUsers = access ? access.people || [] : [];
 
   if (authState === "checking") {
     return (
@@ -128,7 +123,7 @@ export default function App() {
       <Header user={user} onLogout={handleLogout} />
       <div className="container">
         <div className="tabs">
-          {tabsFor(user.username, access, settings?.assignableUsernames).map((t) => (
+          {tabsFor(access).map((t) => (
             <button key={t.key} className={`tab ${tab === t.key ? "active" : ""}`} onClick={() => setTab(t.key)}>
               {t.label}
               {t.key === "pipeline" && notificationCount > 0 && <span className="tab-count">({notificationCount})</span>}
