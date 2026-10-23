@@ -764,12 +764,23 @@ async function handleCompanyLookup(url, sql) {
 const MIN_DECIDED_FOR_BAND = 3;
 const AT_AVERAGE_BAND = 0.05;
 async function companyWinStats(sql, companyId) {
+  // Dollar figures use estimated_value and skip bids without one (Ben, 2026-10-23: a decided bid with
+  // no value is a stray test); valued_* say how many bids each average rests on.
   const [mine] = await sql`
-    select count(*) filter (where stage = 'complete')::int as won, count(*) filter (where stage = 'lost')::int as lost
+    select count(*) filter (where stage = 'complete')::int as won, count(*) filter (where stage = 'lost')::int as lost,
+      coalesce(sum(estimated_value) filter (where stage = 'complete' and estimated_value > 0), 0)::float as value_won,
+      coalesce(sum(estimated_value) filter (where stage = 'lost' and estimated_value > 0), 0)::float as value_lost,
+      count(*) filter (where stage = 'complete' and estimated_value > 0)::int as valued_won,
+      count(*) filter (where stage = 'lost' and estimated_value > 0)::int as valued_lost
     from bids where company_id = ${companyId} and stage in ('complete', 'lost') and (source_archived = false or decided_at is not null)`;
   const [all] = await sql`
-    select count(*) filter (where stage = 'complete')::int as won, count(*) filter (where stage = 'lost')::int as lost
+    select count(*) filter (where stage = 'complete')::int as won, count(*) filter (where stage = 'lost')::int as lost,
+      coalesce(sum(estimated_value) filter (where stage = 'complete' and estimated_value > 0), 0)::float as value_won,
+      coalesce(sum(estimated_value) filter (where stage = 'lost' and estimated_value > 0), 0)::float as value_lost,
+      count(*) filter (where stage = 'complete' and estimated_value > 0)::int as valued_won,
+      count(*) filter (where stage = 'lost' and estimated_value > 0)::int as valued_lost
     from bids where stage in ('complete', 'lost') and (source_archived = false or decided_at is not null)`;
+  const avg = (sum, n) => (n > 0 ? sum / n : null);
   const decided = mine.won + mine.lost;
   const overall = all.won + all.lost > 0 ? all.won / (all.won + all.lost) : null;
   const rate = decided > 0 ? mine.won / decided : null;
@@ -778,7 +789,13 @@ async function companyWinStats(sql, companyId) {
     const diff = rate - overall;
     band = diff > AT_AVERAGE_BAND ? "over" : diff < -AT_AVERAGE_BAND ? "under" : "at";
   }
-  return { won: mine.won, lost: mine.lost, decided_count: decided, win_rate: rate, overall_win_rate: overall, band, min_decided_for_band: MIN_DECIDED_FOR_BAND };
+  return {
+    won: mine.won, lost: mine.lost, decided_count: decided, win_rate: rate, overall_win_rate: overall, band, min_decided_for_band: MIN_DECIDED_FOR_BAND,
+    value_won: mine.value_won, value_lost: mine.value_lost,
+    valued_won: mine.valued_won, valued_lost: mine.valued_lost,
+    avg_won_value: avg(mine.value_won, mine.valued_won), avg_lost_value: avg(mine.value_lost, mine.valued_lost),
+    overall_avg_won_value: avg(all.value_won, all.valued_won), overall_avg_lost_value: avg(all.value_lost, all.valued_lost),
+  };
 }
 
 async function handleCompaniesList(url, sql) {
