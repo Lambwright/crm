@@ -9,3 +9,8 @@ dist/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# customer data exports (never commit)
+customers_for_import.csv
+contacts_for_import.csv
+scout_history_import.csv
