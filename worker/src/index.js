@@ -780,7 +780,17 @@ async function companyWinStats(sql, companyId) {
       count(*) filter (where stage = 'complete' and estimated_value > 0)::int as valued_won,
       count(*) filter (where stage = 'lost' and estimated_value > 0)::int as valued_lost
     from bids where stage in ('complete', 'lost') and (source_archived = false or decided_at is not null)`;
+  // Undecided: submitted and still open, the same mid/late stages the dashboard's pipeline win rate counts.
+  const [myOpen] = await sql`
+    select count(*)::int as n, coalesce(sum(estimated_value) filter (where estimated_value > 0), 0)::float as value,
+      count(*) filter (where estimated_value > 0)::int as valued
+    from bids where company_id = ${companyId} and stage in ('bid_submitted', 'accepted', 'in_progress', 'to_do', 'delayed') and source_archived = false`;
+  const [allOpen] = await sql`
+    select count(*)::int as n, coalesce(sum(estimated_value) filter (where estimated_value > 0), 0)::float as value,
+      count(*) filter (where estimated_value > 0)::int as valued
+    from bids where stage in ('bid_submitted', 'accepted', 'in_progress', 'to_do', 'delayed') and source_archived = false`;
   const avg = (sum, n) => (n > 0 ? sum / n : null);
+  const pipelineRate = (w, l, o) => (w + l + o > 0 ? w / (w + l + o) : null);
   const decided = mine.won + mine.lost;
   const overall = all.won + all.lost > 0 ? all.won / (all.won + all.lost) : null;
   const rate = decided > 0 ? mine.won / decided : null;
@@ -795,6 +805,16 @@ async function companyWinStats(sql, companyId) {
     valued_won: mine.valued_won, valued_lost: mine.valued_lost,
     avg_won_value: avg(mine.value_won, mine.valued_won), avg_lost_value: avg(mine.value_lost, mine.valued_lost),
     overall_avg_won_value: avg(all.value_won, all.valued_won), overall_avg_lost_value: avg(all.value_lost, all.valued_lost),
+    open_count: myOpen.n, open_value: myOpen.value, valued_open: myOpen.valued, avg_open_value: avg(myOpen.value, myOpen.valued),
+    overall_avg_open_value: avg(allOpen.value, allOpen.valued),
+    // Pipeline basis (won + lost + open mid/late), as the dashboard's pipeline win rate; the per-client
+    // rate is left to the caller (won / (won + lost + open)), overall_* are the all-client rates.
+    pipeline: {
+      won: mine.won, lost: mine.lost, open_count: myOpen.n,
+      won_value: mine.value_won, lost_value: mine.value_lost, open_value: myOpen.value,
+      overall_rate: pipelineRate(all.won, all.lost, allOpen.n),
+      overall_rate_value: pipelineRate(all.value_won, all.value_lost, allOpen.value),
+    },
   };
 }
 
