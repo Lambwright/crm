@@ -113,7 +113,7 @@ async function requireLogin(request, env) {
     // *.workers.dev URL directly is blocked with Cloudflare error 1042.
     const res = await env.AUTH_WORKER.fetch("https://auth.ben-a90.workers.dev/auth/verify", {
       method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "X-Einbau-App": "CRM" },
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "X-Einbau-App": "CRM", ...clientHeaders(request) },
       body: "{}",
     });
     if (!res.ok) {
@@ -162,6 +162,20 @@ async function requireLogin(request, env) {
 // the fetch wrapper at the bottom turns any 401/403 into one event, sent
 // fire-and-forget so it never delays or fails the response. Nothing secret
 // goes in: no tokens, keys, bodies or query strings.
+// The visitor's details for auth-worker's own failed-verify rows: a service-binding call carries no
+// CF-Connecting-IP, so forward them (auth-worker trusts these only on binding calls). Only on /auth/verify.
+function clientHeaders(request) {
+  const cf = request.cf || {};
+  const h = {};
+  const put = (name, v) => { if (v) h[name] = String(v).slice(0, 200); };
+  put("X-Einbau-Client-IP", request.headers.get("CF-Connecting-IP"));
+  put("X-Einbau-Client-Country", cf.country);
+  put("X-Einbau-Client-City", cf.city);
+  put("X-Einbau-Client-Org", cf.asOrganization);
+  put("X-Einbau-Client-UA", request.headers.get("User-Agent"));
+  return h;
+}
+
 const refusalNotes = new WeakMap();
 function noteRefusal(request, outcome, username, detail) {
   refusalNotes.set(request, { ...(refusalNotes.get(request) || {}), outcome, username: username || null, detail });
