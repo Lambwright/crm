@@ -104,21 +104,28 @@ function isServiceCaller(request, env) {
 async function requireLogin(request, env) {
   const header = request.headers.get("Authorization") || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
-  if (!token) return { ok: false, reason: "No session token was sent with the request." };
+  if (!token) {
+    noteRefusal(request, "no_token", null, "no Authorization header");
+    return { ok: false, reason: "No session token was sent with the request." };
+  }
   try {
     // Service binding, not a public fetch — a Worker calling another Worker's
     // *.workers.dev URL directly is blocked with Cloudflare error 1042.
     const res = await env.AUTH_WORKER.fetch("https://auth.ben-a90.workers.dev/auth/verify", {
       method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "X-Einbau-App": "CRM" },
       body: "{}",
     });
     if (!res.ok) {
+      noteRefusal(request, res.status === 401 ? "bad_session" : "other", null, `auth-worker verify HTTP ${res.status}`);
       const bodyText = await res.text().catch(() => "(no body)");
       return { ok: false, reason: `auth-worker rejected the verify call (HTTP ${res.status}): ${bodyText.slice(0, 200)}` };
     }
     const data = await res.json();
-    if (!data.valid) return { ok: false, reason: "Session is invalid or expired — please log in again." };
+    if (!data.valid) {
+      noteRefusal(request, "bad_session", null, "session invalid, expired or revoked");
+      return { ok: false, reason: "Session is invalid or expired — please log in again." };
+    }
     if (!data.user) return { ok: false, reason: "auth-worker returned no user for this session." };
 
     // Per-app access list from HELM (auth-worker/README.md, "The user object,
@@ -127,6 +134,7 @@ async function requireLogin(request, env) {
     // access, full stop, not "unrestricted." Admin role does NOT bypass this
     // (matches every other suite app's post-2026-09-28 gate).
     if (!Array.isArray(data.user.apps) || !data.user.apps.includes("CRM")) {
+      noteRefusal(request, "forbidden", data.user.username, "CRM not in the user's apps list");
       return { ok: false, reason: `"${data.user.username}" doesn't have CRM access (HELM apps list).` };
     }
 
@@ -135,14 +143,71 @@ async function requireLogin(request, env) {
     // there is no fallback to the old per-person lists or user.role.
     const crm = resolveCrmAccess(data.user);
     if (crm.mode === "denied") {
+      noteRefusal(request, "forbidden", data.user.username, "no CRM level in the role matrix");
       return { ok: false, reason: `"${data.user.username}" has no CRM access in the role matrix (HELM).` };
     }
+    noteUser(request, data.user.username);
     // _crm / _token are internal: handlers read the resolved level and the
     // caller's own token (to look people up through auth-worker) from here.
     return { ok: true, user: { ...data.user, _crm: crm, _token: token }, refreshedToken: data.refreshedToken || null };
   } catch (e) {
+    noteRefusal(request, "other", null, "couldn't reach auth-worker");
     return { ok: false, reason: `Couldn't reach auth-worker: ${e.message}` };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Refused-request reporting for HELM's Security tab (auth-worker/README.md,
+// "Apps reporting refused requests"). requireLogin notes why a login failed;
+// the fetch wrapper at the bottom turns any 401/403 into one event, sent
+// fire-and-forget so it never delays or fails the response. Nothing secret
+// goes in: no tokens, keys, bodies or query strings.
+const refusalNotes = new WeakMap();
+function noteRefusal(request, outcome, username, detail) {
+  refusalNotes.set(request, { ...(refusalNotes.get(request) || {}), outcome, username: username || null, detail });
+}
+function noteUser(request, username) {
+  refusalNotes.set(request, { ...(refusalNotes.get(request) || {}), user: username });
+}
+
+// One event per ip + outcome + route per minute per isolate; repeats inside the minute are counted
+// and ride along on the next event for that key.
+const reportSeen = new Map();
+function reportRefusal(request, env, ctx, status) {
+  try {
+    if (!env.AUTH_SERVICE_KEY || !env.AUTH_WORKER) return;
+    const note = refusalNotes.get(request) || {};
+    // 401 with no note came from a key-only route (wrong or missing X-Crm-* key); 403 is a level/permission refusal.
+    const outcome = note.outcome || (status === 429 ? "rate_limited" : status === 403 ? "forbidden" : "bad_service_key");
+    const detail = note.detail || (status === 403 ? "refused by CRM permission check" : status === 429 ? "rate limited" : "service key missing or wrong");
+    const route = new URL(request.url).pathname;
+    const ip = request.headers.get("CF-Connecting-IP") || null;
+    const now = Date.now();
+    const key = `${ip}|${outcome}|${route}`;
+    const seen = reportSeen.get(key);
+    if (seen && now - seen.at < 60_000) { seen.suppressed++; return; }
+    const count = 1 + (seen ? seen.suppressed : 0);
+    reportSeen.set(key, { at: now, suppressed: 0 });
+    if (reportSeen.size > 500) for (const [k, v] of reportSeen) if (now - v.at >= 60_000) reportSeen.delete(k);
+    const cf = request.cf || {};
+    const event = {
+      outcome, route, method: request.method,
+      username: note.username || note.user || null,
+      ip, country: cf.country || null, city: cf.city || null, org: cf.asOrganization || null,
+      ua: (request.headers.get("User-Agent") || "").slice(0, 200) || null,
+      count, detail,
+    };
+    ctx.waitUntil((async () => {
+      try {
+        const rr = await env.AUTH_WORKER.fetch("https://auth.ben-a90.workers.dev/auth/security/report", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Auth-Service-Key": env.AUTH_SERVICE_KEY },
+          body: JSON.stringify({ events: [event] }),
+        });
+        if (!rr.ok) console.log("security report HTTP", rr.status);
+      } catch (e) { console.log("security report failed:", e.message); }
+    })());
+  } catch (e) { console.log("security report failed:", e.message); }
 }
 
 // ---------------------------------------------------------------------------
@@ -3289,7 +3354,21 @@ async function runStalenessSweep(env) {
 // ---------------------------------------------------------------------------
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
+    const res = await handleRequest(request, env);
+    if (request.method !== "OPTIONS" && (res.status === 401 || res.status === 403 || res.status === 429)) reportRefusal(request, env, ctx, res.status);
+    return res;
+  },
+
+  async scheduled(_event, env, ctx) {
+    ctx.waitUntil(runStalenessSweep(env));
+    ctx.waitUntil((async () => { try { await nsSyncNightly(env, sqlFor(env)); } catch (e) { console.log("netsuite sync failed:", e.message); } })());
+    ctx.waitUntil((async () => { try { await ensureSchema(sqlFor(env)); await refreshRegions(env, sqlFor(env)); } catch (e) { console.log("region refresh failed:", e.message); } })());
+  },
+};
+
+async function handleRequest(request, env) {
+  {
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders() });
 
     const url = new URL(request.url);
@@ -3587,11 +3666,5 @@ export default {
     } catch (e) {
       return json({ error: "internal_error", detail: e.message }, 500);
     }
-  },
-
-  async scheduled(_event, env, ctx) {
-    ctx.waitUntil(runStalenessSweep(env));
-    ctx.waitUntil((async () => { try { await nsSyncNightly(env, sqlFor(env)); } catch (e) { console.log("netsuite sync failed:", e.message); } })());
-    ctx.waitUntil((async () => { try { await ensureSchema(sqlFor(env)); await refreshRegions(env, sqlFor(env)); } catch (e) { console.log("region refresh failed:", e.message); } })());
-  },
-};
+  }
+}
