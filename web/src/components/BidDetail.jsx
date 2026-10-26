@@ -4,6 +4,9 @@ import ScoutRecord from "./ScoutRecord.jsx";
 import { buildFollowUpDraft, variantCount } from "../followupTemplates.js";
 import { HANDOFF_STATUS_LABELS, STAGE_LABELS, STAGE_ORDER, STAGE_REQUIREMENTS } from "../stages.js";
 
+const CONTACT_LABEL = { call: "Phone call", meeting: "In person", text: "Text / chat", other: "Other contact" };
+const CONTACT_ICON = { call: "📞", meeting: "🤝", text: "💬", other: "•" };
+
 export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, assignableUsers = [], initialToStage, autoHandoffOnComplete, can }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
@@ -20,6 +23,12 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
       : { direction: "outbound", subject: "", to_addresses: "", body: "" }
   );
   const [expandedEmailId, setExpandedEmailId] = useState(null);
+  // "Other contact" (call, in person, text...) stays folded away until asked for, to keep the screen clean.
+  const [otherOpen, setOtherOpen] = useState(false);
+  const [other, setOther] = useState({ contact_type: "call", direction: "outbound", spoke_with: "", body: "" });
+  // Moving the follow-up date because the client asked.
+  const [dateOpen, setDateOpen] = useState(false);
+  const [dateDraft, setDateDraft] = useState({ date: "", reason: "" });
   // Which wording the follow-up draft is on (the "Different wording" button cycles it).
   const [variant, setVariant] = useState(() => Math.floor(Math.random() * 1000));
   // Role matrix (GET /access). Cosmetic only — the worker enforces both of
@@ -116,6 +125,38 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
     );
   }
 
+  async function handleLogOther() {
+    setBusy(true);
+    setStageError(null);
+    try {
+      await api.logEmail(id, { ...other, from_address: other.direction === "outbound" ? user.username : undefined, sent_at: new Date().toISOString() });
+      setOther({ contact_type: "call", direction: "outbound", spoke_with: "", body: "" });
+      setOtherOpen(false);
+      load();
+      onChanged?.();
+    } catch (e) {
+      setStageError(e.data?.detail || e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSetDate() {
+    setBusy(true);
+    setStageError(null);
+    try {
+      await api.setFollowupDate(id, dateDraft.date, dateDraft.reason);
+      setDateOpen(false);
+      setDateDraft({ date: "", reason: "" });
+      load();
+      onChanged?.();
+    } catch (e) {
+      setStageError(e.data?.detail || e.data?.error || e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function handleMoveStage() {
     if (!toStage) return;
     setBusy(true);
@@ -192,8 +233,35 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
           <div className="kv"><span className="kv-label">Owner</span><span className="kv-value">{assignSelect("owner_username", bid.owner_username)}</span></div>
           <div className="kv"><span className="kv-label">Estimator</span><span className="kv-value">{assignSelect("estimator_username", bid.estimator_username, (u) => u.jobRole === "estimator")}</span></div>
           <div className="kv"><span className="kv-label">Bid Due</span><span className="kv-value">{bid.bid_due_date || "—"}</span></div>
+          <div className="kv">
+            <span className="kv-label">Follow-up date</span>
+            <span className="kv-value">
+              {bid.next_action_date ? String(bid.next_action_date).slice(0, 10) : "not set"}
+              {!["complete", "lost", "no_bid"].includes(bid.stage) && (
+                <button className="btn btn-ghost btn-sm" style={{ marginLeft: 8 }} onClick={() => setDateOpen((o) => !o)}>{dateOpen ? "Cancel" : "Change"}</button>
+              )}
+            </span>
+          </div>
           <div className="kv"><span className="kv-label">Next Action</span><span className="kv-value">{bid.next_action ? `${bid.next_action} (${bid.next_action_date || "no date"})` : "—"}</span></div>
         </div>
+
+        {dateOpen && (
+          <div className="card" style={{ marginBottom: 12 }}>
+            <div className="card-title">Move the follow-up date</div>
+            <div className="field-row" style={{ flexWrap: "wrap", gap: 10 }}>
+              <div className="field"><label>New date</label><input type="date" value={dateDraft.date} min={new Date().toISOString().slice(0, 10)} onChange={(e) => setDateDraft((d) => ({ ...d, date: e.target.value }))} /></div>
+              <div className="field" style={{ flex: 1, minWidth: 220 }}><label>Why (required)</label><input value={dateDraft.reason} onChange={(e) => setDateDraft((d) => ({ ...d, reason: e.target.value }))} placeholder="e.g. Client asked us to call after the 20th" /></div>
+              <div className="field" style={{ alignSelf: "flex-end" }}><button className="btn btn-accent btn-sm" onClick={handleSetDate} disabled={busy || !dateDraft.date || dateDraft.reason.trim().length < 3}>Save date</button></div>
+            </div>
+          </div>
+        )}
+        {(data.followup_events || []).length > 0 && (
+          <div className="field-help" style={{ marginBottom: 10 }}>
+            {data.followup_events.slice(0, 3).map((ev) => (
+              <div key={ev.id}>Follow-up date moved to {String(ev.to_date).slice(0, 10)} by {ev.by_username} on {new Date(ev.created_at).toLocaleDateString()}: {ev.reason}</div>
+            ))}
+          </div>
+        )}
 
         <ScoutRecord run={data.scout_latest} count={data.scout_run_count} />
 
@@ -269,7 +337,7 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
           </button>
         )}
 
-        <div className="card-title">Tender emails ({emails.length})</div>
+        <div className="card-title">Contact log ({emails.length})</div>
         <div className="row-list" style={{ marginBottom: 10, maxHeight: 260, overflowY: "auto", border: emails.length > 3 ? "1px solid var(--border-color)" : "none", borderRadius: "var(--radius-sm)", padding: emails.length > 3 ? 4 : 0 }}>
           {emails.map((e) => {
             const expanded = expandedEmailId === e.id;
@@ -281,23 +349,26 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
                 onClick={() => setExpandedEmailId(expanded ? null : e.id)}
               >
                 <div style={{ fontSize: 11, color: "var(--text-tertiary)" }}>
-                  {e.direction === "outbound" ? "→ sent" : "← received"} · {new Date(e.sent_at).toLocaleString()}
+                  {(e.contact_type || "email") === "email"
+                    ? (e.direction === "outbound" ? "→ sent" : "← received")
+                    : `${CONTACT_ICON[e.contact_type] || "•"} ${CONTACT_LABEL[e.contact_type] || e.contact_type} · ${e.direction === "outbound" ? "we reached out" : "they contacted us"}`} · {new Date(e.sent_at).toLocaleString()}
                   {e.logged_by ? ` · by ${e.logged_by}` : ""}
                   <span style={{ float: "right" }}>{expanded ? "▲ collapse" : "▼ view"}</span>
                 </div>
                 <div style={{ fontWeight: 600, fontSize: 13 }}>{e.subject || "(no subject)"}</div>
                 {expanded && (
                   <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--border-color)" }} onClick={(ev) => ev.stopPropagation()}>
+                    {e.spoke_with && <div style={{ fontSize: 11, color: "var(--text-secondary)", marginBottom: 4 }}>Spoke with: {e.spoke_with}</div>}
                     {e.to_addresses && <div style={{ fontSize: 11, color: "var(--text-secondary)", marginBottom: 4 }}>To: {e.to_addresses}</div>}
                     {e.from_address && <div style={{ fontSize: 11, color: "var(--text-secondary)", marginBottom: 4 }}>From: {e.from_address}</div>}
                     {e.cc_addresses && <div style={{ fontSize: 11, color: "var(--text-secondary)", marginBottom: 4 }}>Cc: {e.cc_addresses}</div>}
-                    <div style={{ fontSize: 13, whiteSpace: "pre-wrap", marginTop: 6 }}>{e.body || "(no body logged)"}</div>
+                    <div style={{ fontSize: 13, whiteSpace: "pre-wrap", marginTop: 6 }}>{e.body || ((e.contact_type || "email") === "email" ? "(no body logged)" : "(no note)")}</div>
                   </div>
                 )}
               </div>
             );
           })}
-          {emails.length === 0 && <div className="empty-state">No tender emails logged yet.</div>}
+          {emails.length === 0 && <div className="empty-state">No contact logged yet.</div>}
         </div>
         {emails.length > 3 && <div className="field-help" style={{ marginTop: -6, marginBottom: 10 }}>Scroll above to see all {emails.length}.</div>}
         <div className="field-row" style={{ marginBottom: 6 }}>
@@ -337,6 +408,50 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
         </div>
         <div className="field-help" style={{ marginTop: -10, marginBottom: 16 }}>
           Logs immediately, before you actually send — can't verify send from here (a mailto: link has no way to know).
+        </div>
+        <div style={{ marginBottom: 16 }}>
+          <button className="btn btn-ghost btn-sm" onClick={() => setOtherOpen((o) => !o)}>{otherOpen ? "− Other contact" : "+ Other contact (call, in person, text…)"}</button>
+          {otherOpen && (
+            <div className="card" style={{ marginTop: 8 }}>
+              <div className="field-help" style={{ marginBottom: 8 }}>For when you spoke with someone another way. It restarts the follow-up clock like an email does.</div>
+              <div className="field-row" style={{ flexWrap: "wrap", gap: 10, marginBottom: 6 }}>
+                <div className="field">
+                  <label>How</label>
+                  <select value={other.contact_type} onChange={(e) => setOther((o) => ({ ...o, contact_type: e.target.value }))}>
+                    <option value="call">Phone call</option>
+                    <option value="meeting">In-person conversation</option>
+                    <option value="text">Text / chat message</option>
+                    <option value="other">Other</option>
+                  </select>
+                </div>
+                <div className="field">
+                  <label>Who started it</label>
+                  <select value={other.direction} onChange={(e) => setOther((o) => ({ ...o, direction: e.target.value }))}>
+                    <option value="outbound">I reached out</option>
+                    <option value="inbound">They contacted me</option>
+                  </select>
+                </div>
+                <div className="field" style={{ flex: 1, minWidth: 180 }}>
+                  <label>Spoke with</label>
+                  <input value={other.spoke_with} onChange={(e) => setOther((o) => ({ ...o, spoke_with: e.target.value }))} placeholder="Name of the person" />
+                  {directory.length > 0 && (
+                    <select value="" onChange={(e) => e.target.value && setOther((o) => ({ ...o, spoke_with: e.target.value }))} style={{ marginTop: 4, fontSize: 12 }}>
+                      <option value="">+ Pick from {bid.company_name || "client"} directory…</option>
+                      {directory.map((c) => {
+                        const nm = [c.first_name, c.last_name].filter(Boolean).join(" ") || c.email;
+                        return <option key={c.id} value={nm}>{nm}{c.title ? ` — ${c.title}` : ""}</option>;
+                      })}
+                    </select>
+                  )}
+                </div>
+              </div>
+              <div className="field" style={{ marginBottom: 8 }}>
+                <label>What was discussed (a line or two)</label>
+                <textarea rows={2} value={other.body} onChange={(e) => setOther((o) => ({ ...o, body: e.target.value }))} />
+              </div>
+              <button className="btn btn-accent btn-sm" onClick={handleLogOther} disabled={busy || other.body.trim().length < 3}>Log contact</button>
+            </div>
+          )}
         </div>
 
         <div className="card-title">Stage history</div>

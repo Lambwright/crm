@@ -19,20 +19,20 @@ function describe(rule, people) {
   return <>Spread across <strong>{pool}</strong> by current workload</>;
 }
 
-function ConfirmEditModal({ managers, onCancel, onConfirm }) {
+function ConfirmEditModal({ managers, noun = "rules", onCancel, onConfirm }) {
   const list = managers.map((m) => m.displayName || m.username).join(", ");
   return (
     <div className="modal-backdrop" onClick={onCancel}>
       <div className="modal" style={{ width: 460 }} onClick={(e) => e.stopPropagation()}>
-        <h2 style={{ marginBottom: 8 }}>Edit the assignment rules?</h2>
+        <h2 style={{ marginBottom: 8 }}>{noun === "rules" ? "Edit the assignment rules?" : "Change the follow-up cadence?"}</h2>
         <p style={{ fontSize: 14, marginBottom: 14 }}>
           {managers.length > 0
-            ? <>These rules are managed by <strong>{list}</strong>. Confirm you want to proceed with adjusting these rules.</>
-            : <>These rules are managed by the Follow-up Manager role, and nobody has it yet. Confirm you want to proceed with adjusting these rules.</>}
+            ? <>The {noun === "rules" ? "rules are" : "cadence is"} managed by <strong>{list}</strong>. Confirm you want to proceed with adjusting {noun === "rules" ? "these rules" : "the cadence"}.</>
+            : <>The {noun === "rules" ? "rules are" : "cadence is"} managed by the Follow-up Manager role, and nobody has it yet. Confirm you want to proceed with adjusting {noun === "rules" ? "these rules" : "the cadence"}.</>}
         </p>
         <div className="modal-actions">
           <button className="btn btn-ghost" onClick={onCancel}>Cancel</button>
-          <button className="btn btn-accent" onClick={onConfirm}>Yes, edit the rules</button>
+          <button className="btn btn-accent" onClick={onConfirm}>{noun === "rules" ? "Yes, edit the rules" : "Yes, change the cadence"}</button>
         </div>
       </div>
     </div>
@@ -122,6 +122,58 @@ function AddRule({ people, onAdded }) {
   );
 }
 
+const CADENCE_STAGES = ["rfq", "invitation", "estimating", "bid_submitted", "to_do", "accepted", "in_progress", "delayed"];
+
+function CadenceEditor({ cadence, canEditDirectly, managers, onSaved }) {
+  const [editing, setEditing] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [draft, setDraft] = useState({});
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const start = () => { setDraft(Object.fromEntries(CADENCE_STAGES.map((k) => [k, String(cadence[k] ?? "")]))); setError(null); setEditing(true); };
+  async function save() {
+    setBusy(true); setError(null);
+    try {
+      await api.saveCadence(Object.fromEntries(CADENCE_STAGES.map((k) => [k, Number(draft[k])])));
+      setEditing(false);
+      await onSaved();
+    } catch (e) { setError(e.data?.detail || e.data?.error || e.message); } finally { setBusy(false); }
+  }
+  return (
+    <div style={{ marginBottom: 24 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+        <div className="card-title">Follow-up cadence</div>
+        {!editing && <button className="btn btn-ghost btn-sm" onClick={() => (canEditDirectly ? start() : setConfirming(true))}>{canEditDirectly ? "Edit cadence" : "🔒 Edit cadence…"}</button>}
+        {editing && <button className="btn btn-ghost btn-sm" onClick={() => setEditing(false)}>Cancel</button>}
+      </div>
+      <p className="field-help" style={{ marginBottom: 8, maxWidth: 720 }}>
+        Days between follow-ups on an open bid, by stage. Logging a contact restarts the clock using these numbers. Changes apply to dates set from now on; dates already on bids stay as they are. 0 means no follow-ups at that stage.
+      </p>
+      <table className="data-table">
+        <thead><tr>{CADENCE_STAGES.map((k) => <th key={k} className="num">{STAGE_LABELS[k] || k}</th>)}</tr></thead>
+        <tbody>
+          <tr>
+            {CADENCE_STAGES.map((k) => (
+              <td key={k} className="num">
+                {editing
+                  ? <input type="number" min="0" max="90" value={draft[k]} onChange={(e) => setDraft((d) => ({ ...d, [k]: e.target.value }))} style={{ width: 56 }} />
+                  : cadence[k] ?? "—"}
+              </td>
+            ))}
+          </tr>
+        </tbody>
+      </table>
+      {editing && (
+        <div style={{ marginTop: 8 }}>
+          <button className="btn btn-accent btn-sm" disabled={busy} onClick={save}>{busy ? "Saving…" : "Save cadence"}</button>
+          {error && <span className="login-error" style={{ marginLeft: 10 }}>{error}</span>}
+        </div>
+      )}
+      {confirming && <ConfirmEditModal noun="cadence" managers={managers} onCancel={() => setConfirming(false)} onConfirm={() => { setConfirming(false); start(); }} />}
+    </div>
+  );
+}
+
 export default function FollowupManager() {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
@@ -183,9 +235,9 @@ export default function FollowupManager() {
       </div>
 
       <div className="card-title">Team progress</div>
-      <p className="field-help" style={{ marginBottom: 8 }}>Open bids assigned to each person, how many are overdue, and the follow-up emails they logged recently.</p>
+      <p className="field-help" style={{ marginBottom: 8 }}>Open bids assigned to each person, how many are overdue, and the contacts (emails, calls, meetings) they logged recently.</p>
       <table className="data-table" style={{ marginBottom: 24 }}>
-        <thead><tr><th>Person</th><th className="num">Open</th><th className="num">Overdue</th><th className="num">Due today</th><th className="num">Emails logged (7 days)</th><th className="num">(30 days)</th></tr></thead>
+        <thead><tr><th>Person</th><th className="num">Open</th><th className="num">Overdue</th><th className="num">Due today</th><th className="num">Contacts logged (7 days)</th><th className="num">(30 days)</th></tr></thead>
         <tbody>
           {team.map((t) => (
             <tr key={t.username}><td>{t.displayName || t.username} <span className="row-secondary">{t.level}</span></td><td className="num">{t.open}</td><td className="num" style={{ color: t.overdue ? "var(--red)" : undefined }}>{t.overdue}</td><td className="num">{t.due_today}</td><td className="num">{t.logged_7d}</td><td className="num">{t.logged_30d}</td></tr>
@@ -227,6 +279,8 @@ export default function FollowupManager() {
           </tbody>
         </table>
       </div>
+
+      {data.cadence && <CadenceEditor cadence={data.cadence} canEditDirectly={data.can.edit_rules_directly} managers={managers} onSaved={load} />}
 
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
         <div className="card-title">Auto-assignment rules</div>

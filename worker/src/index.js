@@ -1913,7 +1913,7 @@ async function handleFollowupDashboard(env, sql, user) {
   }
   const logged = await sql`
     select logged_by, count(*) filter (where sent_at > now() - interval '7 days')::int as d7, count(*) filter (where sent_at > now() - interval '30 days')::int as d30
-    from bid_emails where direction = 'outbound' and sent_at > now() - interval '30 days' group by logged_by`;
+    from bid_emails where (direction = 'outbound' or contact_type <> 'email') and sent_at > now() - interval '30 days' group by logged_by`;
   for (const l of logged) if (stats.has(l.logged_by)) { const st = stats.get(l.logged_by); st.logged_7d = l.d7; st.logged_30d = l.d30; }
   const team = [...stats.values()].map((x) => ({ ...x, logged_7d: x.logged_7d || 0, logged_30d: x.logged_30d || 0 })).sort((a, b) => b.overdue - a.overdue || b.open - a.open);
 
@@ -1931,8 +1931,9 @@ async function handleFollowupDashboard(env, sql, user) {
     select r.id, r.position, r.kind, r.company_id, r.value, r.assignee_username, r.pool, r.active, r.note, r.updated_by, r.updated_at, c.name as company_name
     from followup_rules r left join companies c on c.id = r.company_id order by r.position, r.updated_at`;
   const managers = people.filter((p) => p.extras.includes(EXTRA_FOLLOWUP_MANAGER));
+  const settings = await getCrmSettings(sql);
   return json({
-    summary, team, work, rules, managers, people,
+    summary, team, work, rules, managers, people, cadence: settings.cadence,
     can: { assign: canAssignFollowups(user), edit_rules_directly: canEditRulesDirectly(user) },
   });
 }
@@ -2307,7 +2308,8 @@ async function handleBidDetail(id, sql, user) {
   // SCOUT's latest complete record for this bid, plus how many pushes there were.
   const runs = await sql`select * from scout_runs where bid_id = ${id} order by coalesce(submitted_at, received_at) desc limit 1`;
   const [{ n: runCount }] = await sql`select count(*)::int as n from scout_runs where bid_id = ${id}`;
-  return json({ bid: rows[0], stage_history: history, emails, company_contacts: contacts, scout_latest: runs[0] || null, scout_run_count: runCount });
+  const followupEvents = await sql`select id, kind, from_date, to_date, reason, by_username, created_at from bid_followup_events where bid_id = ${id} order by created_at desc limit 10`;
+  return json({ bid: rows[0], stage_history: history, emails, followup_events: followupEvents, company_contacts: contacts, scout_latest: runs[0] || null, scout_run_count: runCount });
 }
 
 const BID_PATCHABLE = [
@@ -2429,6 +2431,11 @@ async function handleEmailsList(bidId, sql, user) {
   return json({ emails: rows });
 }
 
+const CONTACT_TYPES = { email: "Email", call: "Phone call", meeting: "In-person conversation", text: "Text / chat message", other: "Other contact" };
+
+// Logs one contact with the client against a bid: an email (the default) or a call, meeting, text or
+// other contact, which carry a short note instead of a message. Any logged contact, sent or received,
+// restarts the follow-up clock.
 async function handleEmailCreate(bidId, request, sql, user) {
   const body = await parseBody(request);
   const bidRows = await sql`select * from bids where id = ${bidId}`;
@@ -2438,17 +2445,48 @@ async function handleEmailCreate(bidId, request, sql, user) {
   if (!body.direction || !["outbound", "inbound"].includes(body.direction)) {
     return json({ error: "direction must be 'outbound' or 'inbound'" }, 400);
   }
+  const contactType = body.contact_type || "email";
+  if (!Object.keys(CONTACT_TYPES).includes(contactType)) return json({ error: "contact_type must be one of " + Object.keys(CONTACT_TYPES).join(", ") }, 400);
+  const note = String(body.body || "").trim();
+  if (contactType !== "email" && note.length < 3) return json({ error: "note_required", detail: "Add a short note on what was discussed." }, 400);
+  const subject = body.subject || (contactType === "email" ? null : CONTACT_TYPES[contactType]);
   const [email] = await sql`
-    insert into bid_emails (bid_id, company_id, direction, subject, from_address, to_addresses, cc_addresses, body, sent_at, logged_by, source)
-    values (${bidId}, ${bidRows[0].company_id}, ${body.direction}, ${body.subject || null}, ${body.from_address || null}, ${body.to_addresses || null}, ${body.cc_addresses || null}, ${body.body || null}, ${body.sent_at || new Date().toISOString()}, ${user.username}, ${body.source || "manual"})
+    insert into bid_emails (bid_id, company_id, direction, subject, from_address, to_addresses, cc_addresses, body, sent_at, logged_by, source, contact_type, spoke_with)
+    values (${bidId}, ${bidRows[0].company_id}, ${body.direction}, ${subject}, ${body.from_address || null}, ${body.to_addresses || null}, ${body.cc_addresses || null}, ${contactType === "email" ? body.body || null : note}, ${body.sent_at || new Date().toISOString()}, ${user.username}, ${body.source || "manual"}, ${contactType}, ${body.spoke_with ? String(body.spoke_with).slice(0, 200) : null})
     returning *`;
 
   // A follow-up just happened — reset the cadence clock rather than waiting
   // for it to lapse again on its own. Inbound (a client wrote back) counts too.
+  // The exception is a date the owner set deliberately at the client's request
+  // and that is still ahead: logging a contact doesn't pull that back.
   const settings = await getCrmSettings(sql);
-  await sql`update bids set next_action_date = ${autoFollowUpDate(settings.cadence, bidRows[0].stage, null, { force: true })}, updated_at = now() where id = ${bidId}`;
+  const current = bidRows[0].next_action_date ? dayOf(bidRows[0].next_action_date) : null;
+  const [lastSet] = await sql`select to_date from bid_followup_events where bid_id = ${bidId} and kind = 'postpone' order by created_at desc limit 1`;
+  const keepDeliberate = current && lastSet && dayOf(lastSet.to_date) === current && current > todayIso();
+  const next = keepDeliberate ? current : autoFollowUpDate(settings.cadence, bidRows[0].stage, null, { force: true });
+  await sql`update bids set next_action_date = ${next}, updated_at = now() where id = ${bidId}`;
 
   return json({ email }, 201);
+}
+
+// An owner moves a bid's follow-up date because the client asked (Ben, 2026-10-26). A reason is
+// required and every change is recorded with who made it, so repeated postponing is visible to the
+// follow-up manager.
+async function handleFollowupDateSet(bidId, request, sql, user) {
+  const body = await parseBody(request);
+  const [bid] = await sql`select id, next_action_date, stage from bids where id = ${bidId}`;
+  if (!bid) return json({ error: "bid_not_found" }, 404);
+  const denied = bidAccessDenied(user, bid);
+  if (denied) return denied;
+  const date = String(body.date || "");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(new Date(date + "T00:00:00Z").getTime())) return json({ error: "date must be YYYY-MM-DD" }, 400);
+  if (date < todayIso()) return json({ error: "date_in_past", detail: "Pick today or a later date." }, 400);
+  const reason = String(body.reason || "").trim();
+  if (reason.length < 3) return json({ error: "reason_required", detail: "Add a short reason, for example what the client asked for." }, 400);
+  if (["complete", "lost", "no_bid"].includes(bid.stage)) return json({ error: "closed_bid", detail: "This bid is closed, so it has no follow-up date." }, 400);
+  await sql`update bids set next_action_date = ${date}, updated_at = now() where id = ${bidId}`;
+  await sql`insert into bid_followup_events (bid_id, kind, from_date, to_date, reason, by_username) values (${bidId}, 'postpone', ${bid.next_action_date ? dayOf(bid.next_action_date) : null}, ${date}, ${reason.slice(0, 500)}, ${user.username})`;
+  return json({ ok: true, next_action_date: date });
 }
 
 // ---------------------------------------------------------------------------
@@ -2663,10 +2701,22 @@ async function handleSettingsGet(sql) {
 }
 
 async function handleSettingsPatch(request, sql, user) {
-  if (!isCrmAdmin(user)) return forbidden("Admin access required.");
+  // The cadence belongs to the follow-up managers as well as admins (Ben, 2026-10-26).
+  if (!isCrmAdmin(user) && !isFollowupManager(user)) return forbidden("Only admins and follow-up managers can change the follow-up cadence.");
   const body = await parseBody(request);
   const current = await getCrmSettings(sql);
-  const cadence = body.followup_cadence_days !== undefined ? body.followup_cadence_days : current.cadence;
+  let cadence = current.cadence;
+  if (body.followup_cadence_days !== undefined) {
+    const incoming = body.followup_cadence_days;
+    if (!incoming || typeof incoming !== "object" || Array.isArray(incoming)) return json({ error: "followup_cadence_days must be an object of stage: days" }, 400);
+    cadence = { ...current.cadence };
+    for (const stage of Object.keys(DEFAULT_CADENCE_DAYS)) {
+      if (incoming[stage] === undefined) continue;
+      const days = Number(incoming[stage]);
+      if (!Number.isInteger(days) || days < 0 || days > 90) return json({ error: "bad_cadence", detail: `${stage}: days must be a whole number from 0 to 90 (0 means no follow-up).` }, 400);
+      cadence[stage] = days;
+    }
+  }
   await sql`
     update crm_settings set
       followup_cadence_days = ${JSON.stringify(cadence)}::jsonb,
@@ -2966,6 +3016,28 @@ SELF_MIGRATIONS.push({
     )`,
   ],
 });
+// Other ways of contacting a client besides email (Ben, 2026-10-26), and a record of each time an owner
+// deliberately moves a bid's follow-up date at the client's request.
+SELF_MIGRATIONS.push({
+  id: "023_contact_types_followup_events",
+  statements: [
+    `alter table bid_emails add column if not exists contact_type text not null default 'email'`,
+    `alter table bid_emails add column if not exists spoke_with text`,
+    `alter table bid_emails drop constraint if exists bid_emails_contact_type_check`,
+    `alter table bid_emails add constraint bid_emails_contact_type_check check (contact_type in ('email', 'call', 'meeting', 'text', 'other'))`,
+    `create table if not exists bid_followup_events (
+      id uuid primary key default gen_random_uuid(),
+      bid_id uuid not null references bids(id) on delete cascade,
+      kind text not null default 'postpone',
+      from_date date,
+      to_date date,
+      reason text,
+      by_username text,
+      created_at timestamptz not null default now()
+    )`,
+    `create index if not exists bid_followup_events_bid on bid_followup_events (bid_id, created_at desc)`,
+  ],
+});
 let schemaReady = null;
 function ensureSchema(sql) {
   if (!schemaReady) {
@@ -3223,7 +3295,7 @@ async function handleDashboardSummary(sql, range, { includeArchived = INCLUDE_AR
   // — the tab and the Pipeline's own compose-and-log box write to the same
   // table, and distinguishing "was this technically overdue" isn't tracked.
   const followupsCompleted = await sql`
-    select count(*)::int as count from bid_emails where direction = 'outbound' and sent_at >= ${cutoffIso} and sent_at < ${endIso}`;
+    select count(*)::int as count from bid_emails where (direction = 'outbound' or contact_type <> 'email') and sent_at >= ${cutoffIso} and sent_at < ${endIso}`;
 
   // Per-customer breakdown for the period (Ben, 2026-10-06), on the same
   // status-change basis as the headline figures so the two reconcile exactly:
@@ -3647,6 +3719,7 @@ async function handleRequest(request, env) {
         if (isUuid(parts[1]) && parts[2] === "stage" && request.method === "POST") return withRefresh(await handleBidStageChange(parts[1], request, sql, env, auth.user));
         if (isUuid(parts[1]) && parts[2] === "emails" && request.method === "GET") return withRefresh(await handleEmailsList(parts[1], sql, auth.user));
         if (isUuid(parts[1]) && parts[2] === "emails" && request.method === "POST") return withRefresh(await handleEmailCreate(parts[1], request, sql, auth.user));
+        if (isUuid(parts[1]) && parts[2] === "followup-date" && request.method === "POST") return withRefresh(await handleFollowupDateSet(parts[1], request, sql, auth.user));
       }
 
       if (parts[0] === "notifications") {

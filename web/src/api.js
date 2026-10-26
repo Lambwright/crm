@@ -130,6 +130,10 @@ export const api = {
 
   // Settings — cadence + assignable-users list, edited from HELM's CRM Options tab
   getSettings: () => request(`/settings`),
+  // The follow-up managers (and admins) change the cadence from the Follow-up manager tab as well
+  saveCadence: (cadence) => request(`/settings`, { method: "PATCH", body: { followup_cadence_days: cadence } }),
+  // An owner moves a bid's follow-up date because the client asked (a reason is required)
+  setFollowupDate: (bidId, date, reason) => request(`/bids/${bidId}/followup-date`, { method: "POST", body: { date, reason } }),
 
   // What the signed-in user can do in CRM (role matrix) + who they can assign follow-ups to
   getAccess: () => request(`/access`),
