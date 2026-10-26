@@ -325,6 +325,13 @@ function ownsBid(user, bid) {
 function bidAccessDenied(user, bid) {
   return canSeeAllBids(user) || ownsBid(user, bid) ? null : forbidden("This bid isn't assigned to you.");
 }
+// Same as bidAccessDenied, plus anyone a colleague has asked to try this client (an open help request).
+async function bidAccess(sql, user, bid) {
+  const denied = bidAccessDenied(user, bid);
+  if (!denied) return null;
+  const [h] = await sql`select 1 as ok from bid_help_requests where bid_id = ${bid.id} and to_user = ${user.username} and status = 'open' limit 1`;
+  return h ? null : denied;
+}
 function scopeDenied(user) {
   return canSeeAllBids(user) ? null : forbidden("Your role can only see the dashboard and the follow-ups assigned to you.");
 }
@@ -474,37 +481,78 @@ const DEFAULT_CADENCE_DAYS = {
   delayed: 14,
 };
 
-function todayIso() {
-  return new Date().toISOString().slice(0, 10);
+// "Today" is a calendar day in someone's time zone, not in UTC: after about 8 pm Eastern the UTC date is
+// already tomorrow. Einbau ID (HELM) holds each person's zone as user.timezone; with none, and for system
+// work like syncs, it is Eastern. Stored follow-up dates stay plain calendar dates for everyone.
+const DEFAULT_TIMEZONE = "America/Toronto";
+function todayIn(tz) {
+  try {
+    return new Intl.DateTimeFormat("en-CA", { timeZone: tz || DEFAULT_TIMEZONE, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+  } catch (e) {
+    return new Intl.DateTimeFormat("en-CA", { timeZone: DEFAULT_TIMEZONE, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+  }
 }
+const todayIso = () => todayIn(null);
+const userToday = (user) => todayIn(user && user.timezone);
 
 // Only pushes the date forward when there isn't already a sensible future
 // one sitting there — so a manual pick always wins until it itself goes
-// stale. `force` (used right after logging an outbound follow-up) always
-// resets the clock, since contact just happened. `cadenceDays` is the
-// merged (settings-over-defaults) map from getCrmSettings, not the constant
+// stale. `force` (used right after logging a contact) always resets the
+// clock, since contact just happened. `factor` stretches the gap for a client
+// who has stopped answering (see handleChase). `cadenceDays` is the merged
+// (settings-over-defaults) map from getCrmSettings, not the constant
 // directly, so this stays runtime-tunable.
-function autoFollowUpDate(cadenceDays, stage, existingDateStr, { force = false } = {}) {
+function autoFollowUpDate(cadenceDays, stage, existingDateStr, { force = false, factor = 1, today = todayIso() } = {}) {
   const cadence = cadenceDays[stage];
   if (!cadence) return existingDateStr ?? null;
-  const today = todayIso();
   if (!force && existingDateStr && existingDateStr >= today) return existingDateStr;
-  const next = new Date();
-  next.setUTCDate(next.getUTCDate() + cadence);
+  const next = new Date(today + "T00:00:00Z");
+  next.setUTCDate(next.getUTCDate() + Math.ceil(cadence * factor));
   return next.toISOString().slice(0, 10);
 }
 
-// One row, read-modify-write from HELM's CRM Options tab (GET/PATCH
-// /settings below) — see migration 008. `cadence` is the code defaults with
-// any per-stage override layered on top. Who can be assigned follow-ups comes
-// from the role matrix (PM level or above), not from a list stored here.
+const CADENCE_STAGE_KEYS = Object.keys(DEFAULT_CADENCE_DAYS);
+
+// One row, read-modify-write from the Follow-up manager tab (GET/PATCH
+// /settings below). `cadence` is the code defaults with any per-stage override
+// layered on top; `priorityCadence` is the shorter cadence for priority bids
+// (half the normal days until someone sets it). `estimatingHoldDays` is how
+// long a new bid belongs to estimating alone before it needs a follow-up owner.
+// Who can be assigned follow-ups comes from the role matrix (PM level or
+// above), not from a list stored here.
 async function getCrmSettings(sql) {
   const [row] = await sql`select * from crm_settings where singleton = 1`;
+  const cadence = { ...DEFAULT_CADENCE_DAYS, ...(row?.followup_cadence_days || {}) };
+  const stored = row?.followup_cadence_priority || {};
+  const priorityCadence = {};
+  for (const k of CADENCE_STAGE_KEYS) priorityCadence[k] = stored[k] !== undefined ? stored[k] : cadence[k] ? Math.max(1, Math.ceil(cadence[k] / 2)) : 0;
   return {
-    cadence: { ...DEFAULT_CADENCE_DAYS, ...(row?.followup_cadence_days || {}) },
+    cadence,
+    priorityCadence,
+    estimatingHoldDays: row?.estimating_hold_days ?? 15,
     updated_at: row?.updated_at || null,
     updated_by: row?.updated_by || null,
   };
+}
+
+// A priority bid (Ben, 2026-10-26): SCOUT scored it Tier A, or its client is a priority client, or
+// someone flagged this bid by hand. Priority bids are chased on the shorter cadence.
+function isPriorityBid(bid, companyHotLead) {
+  return Boolean(bid.priority_bid) || bid.scout_tier === "A" || Boolean(companyHotLead);
+}
+async function bidPriority(sql, bid) {
+  if (bid.priority_bid || bid.scout_tier === "A") return true;
+  if (!bid.company_id) return false;
+  const [c] = await sql`select hot_lead, blacklisted from companies where id = ${bid.company_id}`;
+  return Boolean(c && c.hot_lead && !c.blacklisted);
+}
+const cadenceFor = (settings, priority) => (priority ? settings.priorityCadence : settings.cadence);
+
+// Who owned a bid before and after, for the follow-up manager's review. `rule` names the
+// auto-assignment rule kind when a rule did it.
+async function logAssignment(sql, bidId, fromUser, toUser, byUser, rule) {
+  await sql`insert into bid_followup_events (bid_id, kind, from_user, to_user, reason, by_username)
+    values (${bidId}, 'assign', ${fromUser || null}, ${toUser || null}, ${rule ? "Auto-assignment rule: " + rule : null}, ${byUser})`;
 }
 
 // ---------------------------------------------------------------------------
@@ -666,7 +714,7 @@ async function handleScoutIntake(request, sql) {
       ) values (
         ${rfq_ref}, ${project_name}, ${company.id}, ${contactRow ? contactRow.id : null}, ${qualification_result || "pending_review"},
         ${scout_score ?? null}, ${scout_tier ?? null}, ${Boolean(hot_lead_applied)}, ${no_bid_reason ?? null}, ${bid_due_date ?? null}, ${initialStage},
-        ${procore_bid_board_id ?? null}, ${autoFollowUpDate(settings.cadence, initialStage, null)},
+        ${procore_bid_board_id ?? null}, ${autoFollowUpDate(cadenceFor(settings, scout_tier === "A" || Boolean(company.hot_lead && !company.blacklisted)), initialStage, null)},
         ${overrideReason}, ${overrideApprover}, coalesce(${disqualifiers}::jsonb, '[]'::jsonb)
       ) returning *`;
     await sql`insert into bid_stage_history (bid_id, from_stage, to_stage, changed_by, note)
@@ -1890,16 +1938,23 @@ async function loadFollowupPeople(env, user) {
 async function handleFollowupDashboard(env, sql, user) {
   if (!canSeeFollowupDashboard(user)) return forbidden("The follow-up dashboard isn't available to your role.");
   const people = await loadFollowupPeople(env, user);
+  const settings = await getCrmSettings(sql);
+  const hold = settings.estimatingHoldDays;
   const bids = await sql`
     select b.id, b.project_name, b.stage, b.owner_username, b.estimator_username, b.next_action_date, b.created_at,
+      b.chase_slowed, (b.priority_bid or b.scout_tier = 'A' or (coalesce(c.hot_lead, false) and not coalesce(c.blacklisted, false))) as priority,
+      (b.created_at >= now() - make_interval(days => ${hold})) as estimating_hold,
       c.name as company_name, c.region as company_region, c.province as company_province
     from bids b left join companies c on c.id = b.company_id
     where b.stage in ('rfq', 'invitation', 'accepted', 'estimating', 'bid_submitted', 'to_do', 'delayed', 'in_progress')
+      and b.source_archived = false
     order by b.next_action_date nulls first limit 1500`;
-  const t = today();
-  const assignedTo = (b) => b.owner_username || b.estimator_username || null;
+  const t = userToday(user);
+  // Estimating alone looks after a new bid for its first days; after that the bid needs an owner.
+  const assignedTo = (b) => b.owner_username || (b.estimating_hold ? b.estimator_username : null);
+  const isUnassigned = (b) => !b.owner_username && !b.estimating_hold;
   const daysOver = (b) => (b.next_action_date ? Math.floor((new Date(t) - new Date(dayOf(b.next_action_date))) / 86400000) : null);
-  const summary = { open_bids: bids.length, overdue: 0, due_today: 0, never_set: 0, unassigned: 0, unassigned_overdue: 0 };
+  const summary = { open_bids: bids.length, overdue: 0, due_today: 0, never_set: 0, unassigned: 0, unassigned_overdue: 0, estimating_hold: 0 };
   const stats = new Map(people.map((p) => [p.username, { ...p, open: 0, overdue: 0, due_today: 0 }]));
   for (const b of bids) {
     const d = daysOver(b);
@@ -1907,8 +1962,9 @@ async function handleFollowupDashboard(env, sql, user) {
     if (overdue) summary.overdue++;
     else if (d === 0) summary.due_today++;
     else if (d == null) summary.never_set++;
+    if (isUnassigned(b)) { summary.unassigned++; if (overdue || d == null) summary.unassigned_overdue++; }
+    else if (!b.owner_username) summary.estimating_hold++;
     const who = assignedTo(b);
-    if (!who) { summary.unassigned++; if (overdue || d == null) summary.unassigned_overdue++; }
     if (who && stats.has(who)) { const st = stats.get(who); st.open++; if (overdue) st.overdue++; else if (d === 0) st.due_today++; }
   }
   const logged = await sql`
@@ -1917,13 +1973,15 @@ async function handleFollowupDashboard(env, sql, user) {
   for (const l of logged) if (stats.has(l.logged_by)) { const st = stats.get(l.logged_by); st.logged_7d = l.d7; st.logged_30d = l.d30; }
   const team = [...stats.values()].map((x) => ({ ...x, logged_7d: x.logged_7d || 0, logged_30d: x.logged_30d || 0 })).sort((a, b) => b.overdue - a.overdue || b.open - a.open);
 
-  // The bids worth acting on: overdue, never given a date, or unassigned.
+  // The bids worth acting on: overdue, never given a date, or without an owner once past the estimating hold.
   const work = bids
-    .filter((b) => !assignedTo(b) || daysOver(b) == null || daysOver(b) > 0)
+    .filter((b) => isUnassigned(b) || daysOver(b) == null || daysOver(b) > 0)
     .slice(0, 400)
     .map((b) => ({
       id: b.id, project_name: b.project_name, company_name: b.company_name, stage: b.stage,
       owner_username: b.owner_username, estimator_username: b.estimator_username,
+      unassigned: isUnassigned(b), estimating_hold: Boolean(b.estimating_hold && !b.owner_username),
+      priority: Boolean(b.priority), slowed: Boolean(b.chase_slowed),
       next_action_date: dayOf(b.next_action_date), days_overdue: daysOver(b),
       province: provinceOfProject(b.project_name) || b.company_province || null, region: b.company_region || null,
     }));
@@ -1931,9 +1989,9 @@ async function handleFollowupDashboard(env, sql, user) {
     select r.id, r.position, r.kind, r.company_id, r.value, r.assignee_username, r.pool, r.active, r.note, r.updated_by, r.updated_at, c.name as company_name
     from followup_rules r left join companies c on c.id = r.company_id order by r.position, r.updated_at`;
   const managers = people.filter((p) => p.extras.includes(EXTRA_FOLLOWUP_MANAGER));
-  const settings = await getCrmSettings(sql);
   return json({
-    summary, team, work, rules, managers, people, cadence: settings.cadence,
+    summary, team, work, rules, managers, people,
+    cadence: settings.cadence, priority_cadence: settings.priorityCadence, estimating_hold_days: settings.estimatingHoldDays,
     can: { assign: canAssignFollowups(user), edit_rules_directly: canEditRulesDirectly(user) },
   });
 }
@@ -1950,34 +2008,41 @@ async function handleBulkAssign(request, env, sql, user) {
   }
   let n = 0;
   for (const id of ids) {
-    const r = await sql`update bids set owner_username = ${target}, updated_at = now() where id = ${id} and stage in ('rfq', 'invitation', 'accepted', 'estimating', 'bid_submitted', 'to_do', 'delayed', 'in_progress') returning id`;
-    n += r.length;
+    const [prev] = await sql`select owner_username from bids where id = ${id} and stage in ('rfq', 'invitation', 'accepted', 'estimating', 'bid_submitted', 'to_do', 'delayed', 'in_progress')`;
+    if (!prev || (prev.owner_username || null) === target) continue;
+    await sql`update bids set owner_username = ${target}, updated_at = now() where id = ${id}`;
+    await logAssignment(sql, id, prev.owner_username, target, user.username, null);
+    n++;
   }
   return json({ ok: true, assigned: n });
 }
 
-// The rules, in order; the first one that gives a bid an assignee wins.
+// The rules, in order; the first one that gives a bid an owner wins. Only bids with no owner that are
+// past the estimating hold are considered: a new bid belongs to estimating alone for its first days.
 async function planRuleAssignments(env, sql, user) {
   const people = await eligibleAssignees(env, user);
   const eligible = new Set(people.map((p) => p.username));
+  const { estimatingHoldDays: hold } = await getCrmSettings(sql);
   const rules = (await sql`select * from followup_rules where active order by position, updated_at`);
   const bids = await sql`
     select b.id, b.project_name, b.company_id, b.owner_username, b.estimator_username, b.created_at,
+      (b.created_at >= now() - make_interval(days => ${hold})) as estimating_hold,
       c.name as company_name, c.region as company_region, c.province as company_province
     from bids b left join companies c on c.id = b.company_id
-    where b.stage in ('rfq', 'invitation', 'accepted', 'estimating', 'bid_submitted', 'to_do', 'delayed', 'in_progress')`;
+    where b.stage in ('rfq', 'invitation', 'accepted', 'estimating', 'bid_submitted', 'to_do', 'delayed', 'in_progress')
+      and b.source_archived = false`;
   const load = new Map();
-  for (const b of bids) { const w = b.owner_username || b.estimator_username; if (w) load.set(w, (load.get(w) || 0) + 1); }
+  for (const b of bids) { const w = b.owner_username || (b.estimating_hold ? b.estimator_username : null); if (w) load.set(w, (load.get(w) || 0) + 1); }
   // relationship: the person who most recently owned a bid for the same company
   const lastOwner = new Map();
   for (const b of [...bids].sort((x, y) => new Date(y.created_at) - new Date(x.created_at))) {
-    const w = b.owner_username || b.estimator_username;
+    const w = b.owner_username;
     if (w && b.company_id && eligible.has(w) && !lastOwner.has(b.company_id)) lastOwner.set(b.company_id, w);
   }
   const out = [];
   let unmatched = 0;
   for (const b of bids) {
-    if (b.owner_username || b.estimator_username) continue;
+    if (b.owner_username || b.estimating_hold) continue;
     let pick = null, why = null;
     for (const r of rules) {
       let who = null;
@@ -2007,8 +2072,8 @@ async function handleFollowupRules(request, url, env, sql, user) {
     const plan = await planRuleAssignments(env, sql, user);
     let n = 0;
     for (const a of plan.assignments) {
-      const r = await sql`update bids set owner_username = ${a.assignee}, updated_at = now() where id = ${a.bid_id} and owner_username is null and estimator_username is null returning id`;
-      n += r.length;
+      const r = await sql`update bids set owner_username = ${a.assignee}, updated_at = now() where id = ${a.bid_id} and owner_username is null returning id`;
+      if (r.length) { n++; await logAssignment(sql, a.bid_id, null, a.assignee, user.username, a.rule_kind); }
     }
     return json({ ok: true, assigned: n, unmatched: plan.unmatched });
   }
@@ -2292,11 +2357,12 @@ async function handleBidsList(url, sql, user) {
 
 async function handleBidDetail(id, sql, user) {
   const rows = await sql`
-    select b.*, c.name as company_name, ct.email as contact_email, ct.first_name as contact_first_name, ct.last_name as contact_last_name
+    select b.*, c.name as company_name, c.hot_lead as company_hot_lead, c.blacklisted as company_blacklisted,
+      ct.email as contact_email, ct.first_name as contact_first_name, ct.last_name as contact_last_name
     from bids b left join companies c on c.id = b.company_id left join contacts ct on ct.id = b.contact_id
     where b.id = ${id}`;
   if (!rows.length) return json({ error: "not_found" }, 404);
-  const denied = bidAccessDenied(user, rows[0]);
+  const denied = await bidAccess(sql, user, rows[0]);
   if (denied) return denied;
   const history = await sql`select * from bid_stage_history where bid_id = ${id} order by changed_at desc`;
   const emails = await sql`select * from bid_emails where bid_id = ${id} order by sent_at desc`;
@@ -2308,8 +2374,17 @@ async function handleBidDetail(id, sql, user) {
   // SCOUT's latest complete record for this bid, plus how many pushes there were.
   const runs = await sql`select * from scout_runs where bid_id = ${id} order by coalesce(submitted_at, received_at) desc limit 1`;
   const [{ n: runCount }] = await sql`select count(*)::int as n from scout_runs where bid_id = ${id}`;
-  const followupEvents = await sql`select id, kind, from_date, to_date, reason, by_username, created_at from bid_followup_events where bid_id = ${id} order by created_at desc limit 10`;
-  return json({ bid: rows[0], stage_history: history, emails, followup_events: followupEvents, company_contacts: contacts, scout_latest: runs[0] || null, scout_run_count: runCount });
+  const followupEvents = await sql`select id, kind, from_date, to_date, from_user, to_user, reason, by_username, created_at from bid_followup_events where bid_id = ${id} order by created_at desc limit 20`;
+  const helpRequests = await sql`select id, from_user, to_user, note, status, created_at from bid_help_requests where bid_id = ${id} and status = 'open' order by created_at`;
+  const priorityReasons = [];
+  if (rows[0].scout_tier === "A") priorityReasons.push("SCOUT scored it Tier A");
+  if (rows[0].company_hot_lead && !rows[0].company_blacklisted) priorityReasons.push("the client is a priority client");
+  if (rows[0].priority_bid) priorityReasons.push("flagged as a priority bid");
+  return json({
+    bid: { ...rows[0], priority_reasons: priorityReasons },
+    stage_history: history, emails, followup_events: followupEvents, help_requests: helpRequests,
+    company_contacts: contacts, scout_latest: runs[0] || null, scout_run_count: runCount,
+  });
 }
 
 const BID_PATCHABLE = [
@@ -2357,6 +2432,9 @@ async function handleBidPatch(id, request, sql, env, user) {
       updated_at = now()
     where id = ${id}
     returning *`;
+  if (body.owner_username !== undefined && (body.owner_username || null) !== (existing[0].owner_username || null)) {
+    await logAssignment(sql, id, existing[0].owner_username, body.owner_username || null, user.username, null);
+  }
   return json({ bid });
 }
 
@@ -2388,7 +2466,7 @@ async function handleBidStageChange(id, request, sql, env, user) {
   // wins over the generic default.
   const merged = { ...bid, ...body, stage: to_stage };
   if (body.next_action_date === undefined) {
-    merged.next_action_date = autoFollowUpDate(settings.cadence, to_stage, bid.next_action_date);
+    merged.next_action_date = autoFollowUpDate(cadenceFor(settings, await bidPriority(sql, bid)), to_stage, bid.next_action_date);
   }
   const [updated] = await sql`
     update bids set
@@ -2411,6 +2489,10 @@ async function handleBidStageChange(id, request, sql, env, user) {
   await sql`insert into bid_stage_history (bid_id, from_stage, to_stage, changed_by, note)
     values (${id}, ${bid.stage}, ${to_stage}, ${user.username}, ${body.note || null})`;
 
+  if (body.owner_username !== undefined && (body.owner_username || null) !== (bid.owner_username || null)) {
+    await logAssignment(sql, id, bid.owner_username, body.owner_username || null, user.username, null);
+  }
+
   // Awarded/Lost close out any pending follow-up notifications (Playbook §5.2).
   if (to_stage === "complete" || to_stage === "lost") {
     await sql`update notifications set status = 'closed' where bid_id = ${id} and status = 'pending'`;
@@ -2424,14 +2506,28 @@ async function handleBidStageChange(id, request, sql, env, user) {
 // ---------------------------------------------------------------------------
 
 async function handleEmailsList(bidId, sql, user) {
-  const [b] = await sql`select owner_username, estimator_username from bids where id = ${bidId}`;
-  const denied = b ? bidAccessDenied(user, b) : null;
+  const [b] = await sql`select id, owner_username, estimator_username from bids where id = ${bidId}`;
+  const denied = b ? await bidAccess(sql, user, b) : null;
   if (denied) return denied;
   const rows = await sql`select * from bid_emails where bid_id = ${bidId} order by sent_at desc`;
   return json({ emails: rows });
 }
 
 const CONTACT_TYPES = { email: "Email", call: "Phone call", meeting: "In-person conversation", text: "Text / chat message", other: "Other contact" };
+const isIsoDay = (d) => /^\d{4}-\d{2}-\d{2}$/.test(d || "") && !Number.isNaN(new Date(d + "T00:00:00Z").getTime());
+
+// Contacts logged since the client last wrote or spoke to us.
+async function unansweredContacts(sql, bidId) {
+  const [{ n }] = await sql`
+    select count(*)::int as n from bid_emails
+    where bid_id = ${bidId} and direction = 'outbound'
+      and sent_at > coalesce((select max(sent_at) from bid_emails where bid_id = ${bidId} and direction = 'inbound'), 'epoch'::timestamptz)`;
+  return n;
+}
+
+// How much longer than normal to wait for a client who isn't answering (Ben, 2026-10-26): once the
+// owner has said so, 1.5 times the usual gap, and double from the 7th unanswered contact.
+const slowFactor = (unanswered) => (unanswered >= 7 ? 2 : 1.5);
 
 // Logs one contact with the client against a bid: an email (the default) or a call, meeting, text or
 // other contact, which carry a short note instead of a message. Any logged contact, sent or received,
@@ -2440,7 +2536,7 @@ async function handleEmailCreate(bidId, request, sql, user) {
   const body = await parseBody(request);
   const bidRows = await sql`select * from bids where id = ${bidId}`;
   if (!bidRows.length) return json({ error: "bid_not_found" }, 404);
-  const accessDenied = bidAccessDenied(user, bidRows[0]);
+  const accessDenied = await bidAccess(sql, user, bidRows[0]);
   if (accessDenied) return accessDenied;
   if (!body.direction || !["outbound", "inbound"].includes(body.direction)) {
     return json({ error: "direction must be 'outbound' or 'inbound'" }, 400);
@@ -2449,24 +2545,104 @@ async function handleEmailCreate(bidId, request, sql, user) {
   if (!Object.keys(CONTACT_TYPES).includes(contactType)) return json({ error: "contact_type must be one of " + Object.keys(CONTACT_TYPES).join(", ") }, 400);
   const note = String(body.body || "").trim();
   if (contactType !== "email" && note.length < 3) return json({ error: "note_required", detail: "Add a short note on what was discussed." }, 400);
+  if (body.next_date && (!isIsoDay(body.next_date) || body.next_date < userToday(user))) return json({ error: "bad_next_date", detail: "The next follow-up date must be today or later." }, 400);
   const subject = body.subject || (contactType === "email" ? null : CONTACT_TYPES[contactType]);
   const [email] = await sql`
     insert into bid_emails (bid_id, company_id, direction, subject, from_address, to_addresses, cc_addresses, body, sent_at, logged_by, source, contact_type, spoke_with)
     values (${bidId}, ${bidRows[0].company_id}, ${body.direction}, ${subject}, ${body.from_address || null}, ${body.to_addresses || null}, ${body.cc_addresses || null}, ${contactType === "email" ? body.body || null : note}, ${body.sent_at || new Date().toISOString()}, ${user.username}, ${body.source || "manual"}, ${contactType}, ${body.spoke_with ? String(body.spoke_with).slice(0, 200) : null})
     returning *`;
 
-  // A follow-up just happened — reset the cadence clock rather than waiting
-  // for it to lapse again on its own. Inbound (a client wrote back) counts too.
-  // The exception is a date the owner set deliberately at the client's request
-  // and that is still ahead: logging a contact doesn't pull that back.
+  // A follow-up just happened — reset the cadence clock rather than waiting for it to lapse again on
+  // its own. Inbound (a client wrote back) counts too, and puts a slowed-down client back to normal.
+  // A date the owner set deliberately at the client's request and that is still ahead is kept, and
+  // so is one chosen right here with "next follow-up".
+  const inbound = body.direction === "inbound";
   const settings = await getCrmSettings(sql);
+  const cad = cadenceFor(settings, await bidPriority(sql, bidRows[0]));
+  let slowed = Boolean(bidRows[0].chase_slowed);
+  if (inbound && slowed) { slowed = false; await sql`update bids set chase_slowed = false where id = ${bidId}`; }
+  const unanswered = inbound ? 0 : await unansweredContacts(sql, bidId);
   const current = bidRows[0].next_action_date ? dayOf(bidRows[0].next_action_date) : null;
   const [lastSet] = await sql`select to_date from bid_followup_events where bid_id = ${bidId} and kind = 'postpone' order by created_at desc limit 1`;
-  const keepDeliberate = current && lastSet && dayOf(lastSet.to_date) === current && current > todayIso();
-  const next = keepDeliberate ? current : autoFollowUpDate(settings.cadence, bidRows[0].stage, null, { force: true });
+  const keepDeliberate = current && lastSet && dayOf(lastSet.to_date) === current && current > userToday(user);
+  let next = keepDeliberate ? current : autoFollowUpDate(cad, bidRows[0].stage, null, { force: true, factor: slowed ? slowFactor(unanswered) : 1, today: userToday(user) });
+  if (body.next_date) {
+    next = body.next_date;
+    await sql`insert into bid_followup_events (bid_id, kind, from_date, to_date, reason, by_username)
+      values (${bidId}, 'postpone', ${current}, ${next}, ${"Set while logging a " + CONTACT_TYPES[contactType].toLowerCase()}, ${user.username})`;
+  }
   await sql`update bids set next_action_date = ${next}, updated_at = now() where id = ${bidId}`;
+  // Anyone who was asked to try this client has now done so.
+  await sql`update bid_help_requests set status = 'done', resolved_at = now(), resolved_by = ${user.username}
+    where bid_id = ${bidId} and to_user = ${user.username} and status = 'open'`;
 
-  return json({ email }, 201);
+  // The 4th unanswered contact (and every 4th after) asks the owner whether the client is responding.
+  const prompt = !inbound && !slowed && unanswered >= 4 && unanswered % 4 === 0;
+  return json({ email, chase: { unanswered, prompt } }, 201);
+}
+
+// The owner's answer to "is this client actively responding?", and optionally a request for a
+// colleague to have a go (Ben, 2026-10-26). Not responding = reminders for this bid slow down until the
+// client writes back.
+async function handleChase(bidId, request, env, sql, user) {
+  const body = await parseBody(request);
+  const [bid] = await sql`select * from bids where id = ${bidId}`;
+  if (!bid) return json({ error: "bid_not_found" }, 404);
+  const denied = await bidAccess(sql, user, bid);
+  if (denied) return denied;
+  const unanswered = await unansweredContacts(sql, bidId);
+  let nextDate = bid.next_action_date ? dayOf(bid.next_action_date) : null;
+  if (body.responsive === false) {
+    const settings = await getCrmSettings(sql);
+    const factor = slowFactor(unanswered);
+    nextDate = autoFollowUpDate(cadenceFor(settings, await bidPriority(sql, bid)), bid.stage, null, { force: true, factor, today: userToday(user) });
+    await sql`update bids set chase_slowed = true, next_action_date = ${nextDate}, updated_at = now() where id = ${bidId}`;
+    await sql`insert into bid_followup_events (bid_id, kind, from_date, to_date, reason, by_username)
+      values (${bidId}, 'slowdown', ${bid.next_action_date ? dayOf(bid.next_action_date) : null}, ${nextDate}, ${`Client not responding after ${unanswered} follow-ups: reminders slowed to ${factor}x the usual gap`}, ${user.username})`;
+  }
+  if (body.help_to) {
+    const helper = String(body.help_to);
+    const eligible = new Set((await eligibleAssignees(env, user)).map((p) => p.username));
+    if (helper === user.username || !eligible.has(helper)) return json({ error: "not_assignable", detail: "Pick a colleague with CRM access." }, 422);
+    const note = String(body.help_note || "").trim().slice(0, 500) || null;
+    await sql`insert into bid_help_requests (bid_id, from_user, to_user, note) values (${bidId}, ${user.username}, ${helper}, ${note})`;
+    await sql`insert into bid_followup_events (bid_id, kind, to_user, reason, by_username) values (${bidId}, 'help', ${helper}, ${note}, ${user.username})`;
+  }
+  return json({ ok: true, next_action_date: nextDate, unanswered });
+}
+
+// Closing a colleague's request without logging a contact ("not needed", or already handled).
+async function handleHelpResolve(id, request, sql, user) {
+  const body = await parseBody(request);
+  const status = body.status === "dismissed" ? "dismissed" : "done";
+  const rows = await sql`update bid_help_requests set status = ${status}, resolved_at = now(), resolved_by = ${user.username}
+    where id = ${id} and status = 'open' and (to_user = ${user.username} or from_user = ${user.username} or ${canSeeFollowupDashboard(user)}::boolean) returning id`;
+  if (!rows.length) return json({ error: "not_found" }, 404);
+  return json({ ok: true });
+}
+
+// A priority bid by hand (Ben, 2026-10-26): chased on the shorter priority cadence until the flag is cleared.
+async function handlePriorityToggle(bidId, request, sql, user) {
+  const body = await parseBody(request);
+  const [bid] = await sql`select * from bids where id = ${bidId}`;
+  if (!bid) return json({ error: "bid_not_found" }, 404);
+  const denied = await bidAccess(sql, user, bid);
+  if (denied) return denied;
+  const flag = Boolean(body.priority_bid);
+  let next = bid.next_action_date ? dayOf(bid.next_action_date) : null;
+  if (flag && !["complete", "lost", "no_bid"].includes(bid.stage)) {
+    const settings = await getCrmSettings(sql);
+    const days = settings.priorityCadence[bid.stage];
+    if (days) {
+      const soonest = new Date(userToday(user) + "T00:00:00Z");
+      soonest.setUTCDate(soonest.getUTCDate() + days);
+      const soon = soonest.toISOString().slice(0, 10);
+      if (!next || next > soon) next = soon;
+    }
+  }
+  await sql`update bids set priority_bid = ${flag}, next_action_date = ${next}, updated_at = now() where id = ${bidId}`;
+  await sql`insert into bid_followup_events (bid_id, kind, reason, by_username) values (${bidId}, 'priority', ${flag ? "Flagged as a priority bid" : "Priority flag removed"}, ${user.username})`;
+  return json({ ok: true, priority_bid: flag, next_action_date: next });
 }
 
 // An owner moves a bid's follow-up date because the client asked (Ben, 2026-10-26). A reason is
@@ -2474,13 +2650,13 @@ async function handleEmailCreate(bidId, request, sql, user) {
 // follow-up manager.
 async function handleFollowupDateSet(bidId, request, sql, user) {
   const body = await parseBody(request);
-  const [bid] = await sql`select id, next_action_date, stage from bids where id = ${bidId}`;
+  const [bid] = await sql`select id, owner_username, estimator_username, next_action_date, stage from bids where id = ${bidId}`;
   if (!bid) return json({ error: "bid_not_found" }, 404);
-  const denied = bidAccessDenied(user, bid);
+  const denied = await bidAccess(sql, user, bid);
   if (denied) return denied;
   const date = String(body.date || "");
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(new Date(date + "T00:00:00Z").getTime())) return json({ error: "date must be YYYY-MM-DD" }, 400);
-  if (date < todayIso()) return json({ error: "date_in_past", detail: "Pick today or a later date." }, 400);
+  if (!isIsoDay(date)) return json({ error: "date must be YYYY-MM-DD" }, 400);
+  if (date < userToday(user)) return json({ error: "date_in_past", detail: "Pick today or a later date." }, 400);
   const reason = String(body.reason || "").trim();
   if (reason.length < 3) return json({ error: "reason_required", detail: "Add a short reason, for example what the client asked for." }, 400);
   if (["complete", "lost", "no_bid"].includes(bid.stage)) return json({ error: "closed_bid", detail: "This bid is closed, so it has no follow-up date." }, 400);
@@ -2527,16 +2703,48 @@ async function handleFollowupsList(url, sql, user) {
   // manager capability who didn't ask for everything (estimators keep the
   // "My bids only" toggle they had).
   const mine = url.searchParams.get("mine") === "1" || !canSeeAllBids(user);
+  const { estimatingHoldDays: hold } = await getCrmSettings(sql);
+  // "Mine" = bids I own, plus bids I'm the estimator on while they're still new (estimating alone
+  // looks after a bid's first follow-ups). Archived-in-Procore bids are off the board and stay off.
   const rows = await sql`
     select b.*, c.name as company_name, c.hot_lead as company_hot_lead, ct.email as contact_email,
-      ct.first_name as contact_first_name, ct.last_name as contact_last_name
+      ct.first_name as contact_first_name, ct.last_name as contact_last_name,
+      (b.priority_bid or b.scout_tier = 'A' or (coalesce(c.hot_lead, false) and not coalesce(c.blacklisted, false))) as priority,
+      (b.created_at >= now() - make_interval(days => ${hold})) as estimating_hold
     from bids b left join companies c on c.id = b.company_id left join contacts ct on ct.id = b.contact_id
-    where b.stage not in ('complete', 'lost', 'no_bid')
-      and (b.next_action_date is null or b.next_action_date <= current_date)
-      and (${mine} = false or b.owner_username = ${user.username} or b.estimator_username = ${user.username})
+    where b.stage not in ('complete', 'lost', 'no_bid') and b.source_archived = false
+      and (b.next_action_date is null or b.next_action_date <= ${userToday(user)}::date)
+      and (${mine} = false or b.owner_username = ${user.username}
+        or (b.estimator_username = ${user.username} and b.created_at >= now() - make_interval(days => ${hold})))
     order by (b.next_action_date is null) desc, b.next_action_date asc
     limit 500`;
-  return json({ bids: rows });
+  // Colleagues' requests to have a go at a client who isn't answering them.
+  const help = await sql`
+    select h.id, h.bid_id, h.from_user, h.note, h.created_at, b.project_name, c.name as company_name
+    from bid_help_requests h join bids b on b.id = h.bid_id left join companies c on c.id = b.company_id
+    where h.to_user = ${user.username} and h.status = 'open' order by h.created_at`;
+  return json({ bids: rows, help });
+}
+
+// Numbers for the badges on the Follow-ups and Follow-up manager tabs.
+async function handleFollowupCounts(sql, user) {
+  const { estimatingHoldDays: hold } = await getCrmSettings(sql);
+  const [mine] = await sql`
+    select count(*)::int as due, count(*) filter (where next_action_date < ${userToday(user)}::date)::int as overdue
+    from bids where stage not in ('complete', 'lost', 'no_bid') and source_archived = false
+      and (next_action_date is null or next_action_date <= ${userToday(user)}::date)
+      and (owner_username = ${user.username} or (estimator_username = ${user.username} and created_at >= now() - make_interval(days => ${hold})))`;
+  const [{ n: help }] = await sql`select count(*)::int as n from bid_help_requests where to_user = ${user.username} and status = 'open'`;
+  const out = { mine_due: mine.due + help, mine_overdue: mine.overdue, help_requests: help };
+  if (canSeeFollowupDashboard(user)) {
+    const [all] = await sql`
+      select count(*) filter (where next_action_date < ${userToday(user)}::date)::int as overdue,
+        count(*) filter (where owner_username is null and created_at < now() - make_interval(days => ${hold}))::int as unassigned
+      from bids where stage in ('rfq', 'invitation', 'accepted', 'estimating', 'bid_submitted', 'to_do', 'delayed', 'in_progress') and source_archived = false`;
+    out.all_overdue = all.overdue;
+    out.unassigned = all.unassigned;
+  }
+  return json(out);
 }
 
 // ---------------------------------------------------------------------------
@@ -2597,12 +2805,13 @@ async function handleProcoreSync(request, sql) {
     const nowArchived = Boolean(row.archived);
     if (!stageChanged && row.status === bid.source_status && !archivedChanged) continue;
 
+    const syncPriority = stageChanged ? await bidPriority(sql, bid) : false;
     const [after] = await sql`
       update bids set
         stage = ${stageKnown ? newStage : bid.stage},
         source_status = ${row.status || null},
         source_archived = ${Boolean(row.archived)},
-        next_action_date = ${stageChanged ? autoFollowUpDate(settings.cadence, newStage, bid.next_action_date) : bid.next_action_date},
+        next_action_date = ${stageChanged ? autoFollowUpDate(cadenceFor(settings, syncPriority), newStage, bid.next_action_date) : bid.next_action_date},
         handoff_triggered_at = ${stageChanged && newStage === "complete" ? bid.handoff_triggered_at || new Date().toISOString() : bid.handoff_triggered_at},
         handoff_status = ${stageChanged && newStage === "complete" ? bid.handoff_status || "pending" : bid.handoff_status},
         decided_at = ${stageChanged ? (newStage === "complete" || newStage === "lost" ? new Date().toISOString() : null) : bid.decided_at},
@@ -2702,24 +2911,43 @@ async function handleSettingsGet(sql) {
 
 async function handleSettingsPatch(request, sql, user) {
   // The cadence belongs to the follow-up managers as well as admins (Ben, 2026-10-26).
-  if (!isCrmAdmin(user) && !isFollowupManager(user)) return forbidden("Only admins and follow-up managers can change the follow-up cadence.");
+  if (!isCrmAdmin(user) && !isFollowupManager(user)) return forbidden("Only admins and follow-up managers can change the follow-up settings.");
   const body = await parseBody(request);
   const current = await getCrmSettings(sql);
-  let cadence = current.cadence;
-  if (body.followup_cadence_days !== undefined) {
-    const incoming = body.followup_cadence_days;
-    if (!incoming || typeof incoming !== "object" || Array.isArray(incoming)) return json({ error: "followup_cadence_days must be an object of stage: days" }, 400);
-    cadence = { ...current.cadence };
-    for (const stage of Object.keys(DEFAULT_CADENCE_DAYS)) {
+  const merge = (base, incoming, label) => {
+    if (!incoming || typeof incoming !== "object" || Array.isArray(incoming)) return { error: json({ error: `${label} must be an object of stage: days` }, 400) };
+    const out = { ...base };
+    for (const stage of CADENCE_STAGE_KEYS) {
       if (incoming[stage] === undefined) continue;
       const days = Number(incoming[stage]);
-      if (!Number.isInteger(days) || days < 0 || days > 90) return json({ error: "bad_cadence", detail: `${stage}: days must be a whole number from 0 to 90 (0 means no follow-up).` }, 400);
-      cadence[stage] = days;
+      if (!Number.isInteger(days) || days < 0 || days > 90) return { error: json({ error: "bad_cadence", detail: `${stage}: days must be a whole number from 0 to 90 (0 means no follow-up).` }, 400) };
+      out[stage] = days;
     }
+    return { value: out };
+  };
+  let cadence = current.cadence;
+  let priority = current.priorityCadence;
+  let hold = current.estimatingHoldDays;
+  if (body.followup_cadence_days !== undefined) {
+    const r = merge(current.cadence, body.followup_cadence_days, "followup_cadence_days");
+    if (r.error) return r.error;
+    cadence = r.value;
+  }
+  if (body.followup_cadence_priority !== undefined) {
+    const r = merge(current.priorityCadence, body.followup_cadence_priority, "followup_cadence_priority");
+    if (r.error) return r.error;
+    priority = r.value;
+  }
+  if (body.estimating_hold_days !== undefined) {
+    const d = Number(body.estimating_hold_days);
+    if (!Number.isInteger(d) || d < 0 || d > 60) return json({ error: "bad_hold", detail: "Estimating hold must be a whole number of days from 0 to 60." }, 400);
+    hold = d;
   }
   await sql`
     update crm_settings set
       followup_cadence_days = ${JSON.stringify(cadence)}::jsonb,
+      followup_cadence_priority = ${JSON.stringify(priority)}::jsonb,
+      estimating_hold_days = ${hold},
       updated_at = now(), updated_by = ${user.username}
     where singleton = 1`;
   return json(await getCrmSettings(sql));
@@ -3036,6 +3264,31 @@ SELF_MIGRATIONS.push({
       created_at timestamptz not null default now()
     )`,
     `create index if not exists bid_followup_events_bid on bid_followup_events (bid_id, created_at desc)`,
+  ],
+});
+// Priority cadence, the estimating hold, slowed-down chasing, colleague help requests and a fuller
+// record of who changed what (Ben, 2026-10-26).
+SELF_MIGRATIONS.push({
+  id: "024_followup_priority_chase_help",
+  statements: [
+    `alter table crm_settings add column if not exists followup_cadence_priority jsonb not null default '{}'::jsonb`,
+    `alter table crm_settings add column if not exists estimating_hold_days int not null default 15`,
+    `alter table bids add column if not exists priority_bid boolean not null default false`,
+    `alter table bids add column if not exists chase_slowed boolean not null default false`,
+    `alter table bid_followup_events add column if not exists from_user text`,
+    `alter table bid_followup_events add column if not exists to_user text`,
+    `create table if not exists bid_help_requests (
+      id uuid primary key default gen_random_uuid(),
+      bid_id uuid not null references bids(id) on delete cascade,
+      from_user text not null,
+      to_user text not null,
+      note text,
+      status text not null default 'open' check (status in ('open', 'done', 'dismissed')),
+      created_at timestamptz not null default now(),
+      resolved_at timestamptz,
+      resolved_by text
+    )`,
+    `create index if not exists bid_help_requests_to on bid_help_requests (to_user, status)`,
   ],
 });
 let schemaReady = null;
@@ -3395,24 +3648,9 @@ async function handleDashboardSummary(sql, range, { includeArchived = INCLUDE_AR
 async function runStalenessSweep(env) {
   const sql = sqlFor(env);
 
-  const overdue = await sql`
-    select id, project_name, next_action_date from bids
-    where stage not in ('complete', 'lost', 'no_bid')
-      and next_action_date is not null and next_action_date < current_date
-      and id not in (select bid_id from notifications where type = 'stale_followup' and status = 'pending')`;
-  for (const bid of overdue) {
-    await sql`insert into notifications (bid_id, type, message)
-      values (${bid.id}, 'stale_followup', ${`Follow-up on "${bid.project_name}" was due ${bid.next_action_date} and hasn't been actioned.`})`;
-  }
-
-  const noOwner = await sql`
-    select id, project_name from bids
-    where stage not in ('complete', 'lost', 'no_bid') and owner_username is null
-      and id not in (select bid_id from notifications where type = 'no_owner' and status = 'pending')`;
-  for (const bid of noOwner) {
-    await sql`insert into notifications (bid_id, type, message)
-      values (${bid.id}, 'no_owner', ${`"${bid.project_name}" is open with no assigned owner.`})`;
-  }
+  // The "overdue" and "no owner" alerts were retired (Ben, 2026-10-26): the Follow-ups tab and the
+  // Follow-up manager tab show the same facts. Close any still pending so no stale count lingers.
+  await sql`update notifications set status = 'closed' where status = 'pending' and type in ('stale_followup', 'no_owner')`;
 
   // Hot-lead expiry (Ben, 2026-09): a hot-lead flag prompts for renewal at 30
   // days old, then auto-clears at 37 days if nobody renewed it — renewing
@@ -3432,7 +3670,7 @@ async function runStalenessSweep(env) {
     where hot_lead = true and not priority_permanent and hot_lead_set_at < now() - interval '37 days'
     returning id`;
 
-  return { flagged_overdue: overdue.length, flagged_no_owner: noOwner.length, flagged_hot_lead_expiring: expiringSoon.length, auto_expired_hot_leads: autoExpired.length };
+  return { flagged_hot_lead_expiring: expiringSoon.length, auto_expired_hot_leads: autoExpired.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -3720,6 +3958,8 @@ async function handleRequest(request, env) {
         if (isUuid(parts[1]) && parts[2] === "emails" && request.method === "GET") return withRefresh(await handleEmailsList(parts[1], sql, auth.user));
         if (isUuid(parts[1]) && parts[2] === "emails" && request.method === "POST") return withRefresh(await handleEmailCreate(parts[1], request, sql, auth.user));
         if (isUuid(parts[1]) && parts[2] === "followup-date" && request.method === "POST") return withRefresh(await handleFollowupDateSet(parts[1], request, sql, auth.user));
+        if (isUuid(parts[1]) && parts[2] === "chase" && request.method === "POST") return withRefresh(await handleChase(parts[1], request, env, sql, auth.user));
+        if (isUuid(parts[1]) && parts[2] === "priority" && request.method === "POST") return withRefresh(await handlePriorityToggle(parts[1], request, sql, auth.user));
       }
 
       if (parts[0] === "notifications") {
@@ -3738,6 +3978,8 @@ async function handleRequest(request, env) {
       if (url.pathname.startsWith("/admin/contacts-import") && request.method === "POST") return withRefresh(await handleContactsImport(request, url, sql, auth.user));
       if (url.pathname.startsWith("/admin/companies/merge")) return withRefresh(await handleCompanyMerge(request, url, sql, auth.user));
       if (url.pathname.startsWith("/admin/netsuite-sync")) return withRefresh(await handleNsSyncRoute(request, url, sql, env, auth.user));
+      if (url.pathname === "/followups/counts" && request.method === "GET") return withRefresh(await handleFollowupCounts(sql, auth.user));
+      if (parts[0] === "followups" && parts[1] === "help" && isUuid(parts[2]) && parts[3] === "resolve" && request.method === "POST") return withRefresh(await handleHelpResolve(parts[2], request, sql, auth.user));
       if (url.pathname === "/followups/dashboard" && request.method === "GET") return withRefresh(await handleFollowupDashboard(env, sql, auth.user));
       if (url.pathname === "/followups/bulk-assign" && request.method === "POST") return withRefresh(await handleBulkAssign(request, env, sql, auth.user));
       if (url.pathname.startsWith("/followups/rules")) return withRefresh(await handleFollowupRules(request, url, env, sql, auth.user));

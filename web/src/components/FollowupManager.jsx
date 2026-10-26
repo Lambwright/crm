@@ -124,21 +124,36 @@ function AddRule({ people, onAdded }) {
 
 const CADENCE_STAGES = ["rfq", "invitation", "estimating", "bid_submitted", "to_do", "accepted", "in_progress", "delayed"];
 
-function CadenceEditor({ cadence, canEditDirectly, managers, onSaved }) {
+function CadenceEditor({ cadence, priorityCadence, holdDays, canEditDirectly, managers, onSaved }) {
   const [editing, setEditing] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [draft, setDraft] = useState({});
+  const [draftPriority, setDraftPriority] = useState({});
+  const [draftHold, setDraftHold] = useState("15");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
-  const start = () => { setDraft(Object.fromEntries(CADENCE_STAGES.map((k) => [k, String(cadence[k] ?? "")]))); setError(null); setEditing(true); };
+  const start = () => {
+    setDraft(Object.fromEntries(CADENCE_STAGES.map((k) => [k, String(cadence[k] ?? "")])));
+    setDraftPriority(Object.fromEntries(CADENCE_STAGES.map((k) => [k, String((priorityCadence || {})[k] ?? "")])));
+    setDraftHold(String(holdDays ?? 15));
+    setError(null);
+    setEditing(true);
+  };
   async function save() {
     setBusy(true); setError(null);
     try {
-      await api.saveCadence(Object.fromEntries(CADENCE_STAGES.map((k) => [k, Number(draft[k])])));
+      await api.saveCadence(
+        Object.fromEntries(CADENCE_STAGES.map((k) => [k, Number(draft[k])])),
+        Object.fromEntries(CADENCE_STAGES.map((k) => [k, Number(draftPriority[k])])),
+        Number(draftHold),
+      );
       setEditing(false);
       await onSaved();
     } catch (e) { setError(e.data?.detail || e.data?.error || e.message); } finally { setBusy(false); }
   }
+  const cell = (draftMap, setMap, source, k) => (editing
+    ? <input type="number" min="0" max="90" value={draftMap[k]} onChange={(e) => setMap((d) => ({ ...d, [k]: e.target.value }))} style={{ width: 56 }} />
+    : (source || {})[k] ?? "—");
   return (
     <div style={{ marginBottom: 24 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
@@ -148,24 +163,23 @@ function CadenceEditor({ cadence, canEditDirectly, managers, onSaved }) {
       </div>
       <p className="field-help" style={{ marginBottom: 8, maxWidth: 720 }}>
         Days between follow-ups on an open bid, by stage. Logging a contact restarts the clock using these numbers. Changes apply to dates set from now on; dates already on bids stay as they are. 0 means no follow-ups at that stage.
+        Priority bids (SCOUT Tier A, a priority client, or flagged by hand) use the shorter second row.
       </p>
       <table className="data-table">
-        <thead><tr>{CADENCE_STAGES.map((k) => <th key={k} className="num">{STAGE_LABELS[k] || k}</th>)}</tr></thead>
+        <thead><tr><th />{CADENCE_STAGES.map((k) => <th key={k} className="num">{STAGE_LABELS[k] || k}</th>)}</tr></thead>
         <tbody>
-          <tr>
-            {CADENCE_STAGES.map((k) => (
-              <td key={k} className="num">
-                {editing
-                  ? <input type="number" min="0" max="90" value={draft[k]} onChange={(e) => setDraft((d) => ({ ...d, [k]: e.target.value }))} style={{ width: 56 }} />
-                  : cadence[k] ?? "—"}
-              </td>
-            ))}
-          </tr>
+          <tr><td>Normal</td>{CADENCE_STAGES.map((k) => <td key={k} className="num">{cell(draft, setDraft, cadence, k)}</td>)}</tr>
+          <tr><td>🔥 Priority</td>{CADENCE_STAGES.map((k) => <td key={k} className="num">{cell(draftPriority, setDraftPriority, priorityCadence, k)}</td>)}</tr>
         </tbody>
       </table>
+      <p className="field-help" style={{ marginTop: 8 }}>
+        New bids belong to estimating alone for their first{" "}
+        {editing ? <input type="number" min="0" max="60" value={draftHold} onChange={(e) => setDraftHold(e.target.value)} style={{ width: 56 }} /> : <strong>{holdDays ?? 15}</strong>} days:
+        they aren't flagged as unassigned and the auto-assignment rules leave them alone. After that they need an owner.
+      </p>
       {editing && (
         <div style={{ marginTop: 8 }}>
-          <button className="btn btn-accent btn-sm" disabled={busy} onClick={save}>{busy ? "Saving…" : "Save cadence"}</button>
+          <button className="btn btn-accent btn-sm" disabled={busy} onClick={save}>{busy ? "Saving…" : "Save"}</button>
           {error && <span className="login-error" style={{ marginLeft: 10 }}>{error}</span>}
         </div>
       )}
@@ -194,8 +208,7 @@ export default function FollowupManager() {
     if (!data) return [];
     const q = search.trim().toLowerCase();
     return data.work.filter((w) => {
-      const unassigned = !w.owner_username && !w.estimator_username;
-      if (filter === "unassigned" && !unassigned) return false;
+      if (filter === "unassigned" && !w.unassigned) return false;
       if (filter === "overdue" && !(w.days_overdue != null && w.days_overdue > 0)) return false;
       if (q && !(`${w.project_name} ${w.company_name || ""}`.toLowerCase().includes(q))) return false;
       return true;
@@ -232,6 +245,7 @@ export default function FollowupManager() {
         <div className="card"><div className="kv-label">Due today</div><div className="kv-value mono stat">{summary.due_today}</div></div>
         <div className="card"><div className="kv-label">No follow-up date</div><div className="kv-value mono stat">{summary.never_set}</div></div>
         <div className="card"><div className="kv-label">Unassigned</div><div className="kv-value mono stat">{summary.unassigned}</div></div>
+        <div className="card"><div className="kv-label">New, with estimating</div><div className="kv-value mono stat">{summary.estimating_hold}</div></div>
       </div>
 
       <div className="card-title">Team progress</div>
@@ -268,8 +282,8 @@ export default function FollowupManager() {
             {work.map((w) => (
               <tr key={w.id}>
                 <td><input type="checkbox" checked={picked.has(w.id)} onChange={() => toggle(w.id)} /></td>
-                <td>{w.project_name}</td><td>{w.company_name || "—"}</td><td>{STAGE_LABELS[w.stage] || w.stage}</td>
-                <td>{w.owner_username || w.estimator_username ? name(people2, w.owner_username || w.estimator_username) : <span className="row-secondary">unassigned</span>}</td>
+                <td>{w.priority ? "🔥 " : ""}{w.project_name}{w.slowed ? <span className="row-secondary"> · slowed</span> : null}</td><td>{w.company_name || "—"}</td><td>{STAGE_LABELS[w.stage] || w.stage}</td>
+                <td>{w.owner_username ? name(people2, w.owner_username) : w.estimating_hold ? <span className="row-secondary">estimating{w.estimator_username ? ` (${name(people2, w.estimator_username)})` : ""}</span> : <span className="row-secondary">unassigned</span>}</td>
                 <td style={{ color: w.days_overdue != null && w.days_overdue > 0 ? "var(--red)" : undefined }}>
                   {w.days_overdue == null ? "no date" : w.days_overdue > 0 ? `${w.days_overdue} day${w.days_overdue === 1 ? "" : "s"} overdue` : w.days_overdue === 0 ? "due today" : `due in ${-w.days_overdue} days`}
                 </td>
@@ -280,7 +294,7 @@ export default function FollowupManager() {
         </table>
       </div>
 
-      {data.cadence && <CadenceEditor cadence={data.cadence} canEditDirectly={data.can.edit_rules_directly} managers={managers} onSaved={load} />}
+      {data.cadence && <CadenceEditor cadence={data.cadence} priorityCadence={data.priority_cadence} holdDays={data.estimating_hold_days} canEditDirectly={data.can.edit_rules_directly} managers={managers} onSaved={load} />}
 
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
         <div className="card-title">Auto-assignment rules</div>

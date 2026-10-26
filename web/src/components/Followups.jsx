@@ -19,6 +19,7 @@ function daysOverdue(dateStr) {
 
 export default function Followups({ user, access, assignableUsers = [], onNotificationsChanged }) {
   const [bids, setBids] = useState([]);
+  const [help, setHelp] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [mineOnly, setMineOnly] = useState(true);
@@ -29,7 +30,7 @@ export default function Followups({ user, access, assignableUsers = [], onNotifi
     setError(null);
     api
       .listFollowups(mineOnly)
-      .then((data) => setBids(data.bids || []))
+      .then((data) => { setBids(data.bids || []); setHelp(data.help || []); })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
   }, [mineOnly]);
@@ -64,6 +65,23 @@ export default function Followups({ user, access, assignableUsers = [], onNotifi
         )}
         <button className="btn btn-ghost btn-sm" onClick={load} disabled={loading}>{loading ? "↻ …" : "↻ Refresh"}</button>
       </div>
+      {help.length > 0 && (
+        <div className="card" style={{ marginBottom: 12 }}>
+          <div className="card-title">Colleagues asked you to try these clients</div>
+          {help.map((h) => (
+            <div key={h.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, padding: "6px 0", borderTop: "1px solid var(--border-color)" }}>
+              <div>
+                <div className="row-primary">{h.project_name}</div>
+                <div className="row-secondary">{h.company_name || "—"} · from {h.from_user}{h.note ? ` — ${h.note}` : ""}</div>
+              </div>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button className="btn btn-accent btn-sm" onClick={() => setSelected({ id: h.bid_id, prefillEmail: null })}>Open</button>
+                <button className="btn btn-ghost btn-sm" onClick={() => api.resolveHelp(h.id, "dismissed").then(handleChanged)}>Not needed</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
       {error && <div className="card" style={{ color: "var(--red)" }}>{error}</div>}
       {!loading && bids.length === 0 && !error && (
         <div className="empty-state">Nothing due right now — every open bid has a future follow-up date.</div>
@@ -75,8 +93,10 @@ export default function Followups({ user, access, assignableUsers = [], onNotifi
             <div className="row-item" key={bid.id} style={{ gridTemplateColumns: "1.6fr 130px 120px 120px 140px", cursor: "default" }}>
               <div>
                 <div className="row-primary">
-                  {bid.company_hot_lead && <span className="hot-lead-flame">🔥 </span>}
+                  {(bid.priority || bid.company_hot_lead) && <span className="hot-lead-flame">🔥 </span>}
                   {bid.project_name}
+                  {bid.chase_slowed && <span className="row-secondary"> · slowed</span>}
+                  {bid.estimating_hold && <span className="row-secondary"> · new</span>}
                 </div>
                 <div className="row-secondary">
                   {bid.company_name || "—"}

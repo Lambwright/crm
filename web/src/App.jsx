@@ -50,8 +50,8 @@ export default function App() {
   const [user, setUser] = useState(null);
   const [loginNotice, setLoginNotice] = useState(null);
   const [tab, setTab] = useState("dashboard");
-  const [notificationCount, setNotificationCount] = useState(0);
-  const [followupCount, setFollowupCount] = useState(0);
+  // Badges on the Follow-ups and Follow-up manager tabs (the old alert count is gone)
+  const [counts, setCounts] = useState(null);
   const [settings, setSettings] = useState(null);
   const [access, setAccess] = useState(null);
 
@@ -76,8 +76,7 @@ export default function App() {
 
   const refreshNotificationCount = useCallback(() => {
     if (authState !== "in") return;
-    api.listNotifications("pending").then((data) => setNotificationCount((data.notifications || []).length)).catch(() => {});
-    api.listFollowups(true).then((data) => setFollowupCount((data.bids || []).length)).catch(() => {});
+    api.getFollowupCounts().then((c) => setCounts(c)).catch(() => {});
   }, [authState]);
 
   useEffect(() => {
@@ -126,8 +125,8 @@ export default function App() {
           {tabsFor(access).map((t) => (
             <button key={t.key} className={`tab ${tab === t.key ? "active" : ""}`} onClick={() => setTab(t.key)}>
               {t.label}
-              {t.key === "pipeline" && notificationCount > 0 && <span className="tab-count">({notificationCount})</span>}
-              {t.key === "followups" && followupCount > 0 && <span className="tab-count">({followupCount})</span>}
+              {t.key === "followups" && counts && counts.mine_due > 0 && <span className="tab-count" style={counts.mine_overdue > 0 ? { color: "var(--red)" } : undefined}>({counts.mine_due})</span>}
+              {t.key === "followupmgr" && counts && (counts.unassigned > 0 || counts.all_overdue > 0) && <span className="tab-count" style={{ color: "var(--red)" }}>({counts.unassigned || 0} unassigned · {counts.all_overdue || 0} overdue)</span>}
             </button>
           ))}
         </div>

@@ -25,7 +25,10 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
   const [expandedEmailId, setExpandedEmailId] = useState(null);
   // "Other contact" (call, in person, text...) stays folded away until asked for, to keep the screen clean.
   const [otherOpen, setOtherOpen] = useState(false);
-  const [other, setOther] = useState({ contact_type: "call", direction: "outbound", spoke_with: "", body: "" });
+  const [other, setOther] = useState({ contact_type: "call", direction: "outbound", spoke_with: "", body: "", next_date: "" });
+  // "Is this client answering you?" after the 4th unanswered contact
+  const [chasePrompt, setChasePrompt] = useState(null);
+  const [chaseHelp, setChaseHelp] = useState({ to: "", note: "" });
   // Moving the follow-up date because the client asked.
   const [dateOpen, setDateOpen] = useState(false);
   const [dateDraft, setDateDraft] = useState({ date: "", reason: "" });
@@ -125,15 +128,58 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
     );
   }
 
+  // After logging a contact the server may ask "is this client answering?" (4th unanswered contact, then every 4th).
+  function afterLog(result) {
+    load();
+    onChanged?.();
+    if (result?.chase?.prompt) {
+      setChaseHelp({ to: "", note: "" });
+      setChasePrompt(result.chase);
+    }
+  }
+
+  async function answerChase(responsive) {
+    setBusy(true);
+    setStageError(null);
+    try {
+      await api.answerChase(id, { responsive, help_to: chaseHelp.to || undefined, help_note: chaseHelp.note || undefined });
+      setChasePrompt(null);
+      load();
+      onChanged?.();
+    } catch (e) {
+      setStageError(e.data?.detail || e.data?.error || e.message);
+      setChasePrompt(null);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function togglePriority() {
+    setBusy(true);
+    setStageError(null);
+    try {
+      await api.setBidPriority(id, !bid.priority_bid);
+      load();
+      onChanged?.();
+    } catch (e) {
+      setStageError(e.data?.detail || e.data?.error || e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function resolveHelp(helpId, status) {
+    try { await api.resolveHelp(helpId, status); load(); onChanged?.(); } catch (e) { setStageError(e.message); }
+  }
+
   async function handleLogOther() {
     setBusy(true);
     setStageError(null);
     try {
-      await api.logEmail(id, { ...other, from_address: other.direction === "outbound" ? user.username : undefined, sent_at: new Date().toISOString() });
-      setOther({ contact_type: "call", direction: "outbound", spoke_with: "", body: "" });
+      const res = await api.logEmail(id, { ...other, next_date: other.next_date || undefined, from_address: other.direction === "outbound" ? user.username : undefined, sent_at: new Date().toISOString() });
+      setOther({ contact_type: "call", direction: "outbound", spoke_with: "", body: "", next_date: "" });
       setOtherOpen(false);
-      load();
-      onChanged?.();
+      afterLog(res);
     } catch (e) {
       setStageError(e.data?.detail || e.message);
     } finally {
@@ -192,12 +238,12 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
     if (!emailDraft.to_addresses && !emailDraft.subject && !emailDraft.body) return;
     setBusy(true);
     try {
-      await api.logEmail(id, { ...emailDraft, from_address: emailDraft.direction === "outbound" ? user.username : undefined, sent_at: new Date().toISOString() });
+      const res = await api.logEmail(id, { ...emailDraft, from_address: emailDraft.direction === "outbound" ? user.username : undefined, sent_at: new Date().toISOString() });
       // Refresh before handing off to the mail client — setting
       // window.location to a mailto: URI is usually intercepted without a
       // real navigation, but doing it first risks this fetch getting cut
       // short in browsers that treat it as one anyway.
-      load();
+      afterLog(res);
       const mailto = buildMailto({ to: emailDraft.to_addresses, subject: emailDraft.subject, body: emailDraft.body });
       window.location.href = mailto;
       setEmailDraft({ direction: "outbound", subject: "", to_addresses: "", body: "" });
@@ -242,6 +288,9 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
               )}
             </span>
           </div>
+          {!bid.stage || ["complete", "lost", "no_bid"].includes(bid.stage) ? null : (
+            <div className="kv"><span className="kv-label">Priority bid</span><span className="kv-value"><label style={{ display: "flex", gap: 6, alignItems: "center" }}><input type="checkbox" checked={Boolean(bid.priority_bid)} disabled={busy} onChange={togglePriority} /> flag by hand</label></span></div>
+          )}
           <div className="kv"><span className="kv-label">Next Action</span><span className="kv-value">{bid.next_action ? `${bid.next_action} (${bid.next_action_date || "no date"})` : "—"}</span></div>
         </div>
 
@@ -255,10 +304,43 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
             </div>
           </div>
         )}
+        {(bid.priority_reasons || []).length > 0 || bid.priority_bid ? (
+          <div className="field-help" style={{ marginBottom: 6 }}>
+            🔥 Priority bid: {(bid.priority_reasons || []).join(", ")}. It is chased on the shorter priority schedule.
+          </div>
+        ) : null}
+        {bid.chase_slowed && (
+          <div className="field-help" style={{ marginBottom: 6 }}>
+            ⏳ The client hasn't been answering, so reminders for this bid are spaced out. A reply puts them back to normal.
+          </div>
+        )}
+        {(data.help_requests || []).map((h) => (
+          <div className="notification-banner" key={h.id} style={{ marginBottom: 8 }}>
+            <span>
+              {h.to_user === user.username
+                ? `${h.from_user} asked you to try this client${h.note ? ": " + h.note : "."}`
+                : `${h.from_user} asked ${h.to_user} to try this client${h.note ? ": " + h.note : "."}`}
+            </span>
+            {(h.to_user === user.username || h.from_user === user.username) && (
+              <button className="btn btn-ghost btn-sm" onClick={() => resolveHelp(h.id, "dismissed")}>{h.to_user === user.username ? "Not needed" : "Withdraw"}</button>
+            )}
+          </div>
+        ))}
         {(data.followup_events || []).length > 0 && (
           <div className="field-help" style={{ marginBottom: 10 }}>
-            {data.followup_events.slice(0, 3).map((ev) => (
-              <div key={ev.id}>Follow-up date moved to {String(ev.to_date).slice(0, 10)} by {ev.by_username} on {new Date(ev.created_at).toLocaleDateString()}: {ev.reason}</div>
+            {data.followup_events.slice(0, 4).map((ev) => (
+              <div key={ev.id}>
+                {new Date(ev.created_at).toLocaleDateString()} · {ev.by_username}:{" "}
+                {ev.kind === "assign"
+                  ? `${ev.to_user ? "owner set to " + ev.to_user : "owner cleared"}${ev.from_user ? " (was " + ev.from_user + ")" : ""}${ev.reason ? " — " + ev.reason : ""}`
+                  : ev.kind === "slowdown"
+                    ? `reminders slowed, next follow-up ${String(ev.to_date).slice(0, 10)}`
+                    : ev.kind === "help"
+                      ? `asked ${ev.to_user} to try this client${ev.reason ? ": " + ev.reason : ""}`
+                      : ev.kind === "priority"
+                        ? ev.reason
+                        : `follow-up date moved to ${String(ev.to_date).slice(0, 10)}: ${ev.reason}`}
+              </div>
             ))}
           </div>
         )}
@@ -446,6 +528,10 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
                 </div>
               </div>
               <div className="field" style={{ marginBottom: 8 }}>
+                <label>Next follow-up date (optional; leave blank to use the usual gap)</label>
+                <input type="date" value={other.next_date} min={new Date().toISOString().slice(0, 10)} onChange={(e) => setOther((o) => ({ ...o, next_date: e.target.value }))} style={{ maxWidth: 200 }} />
+              </div>
+              <div className="field" style={{ marginBottom: 8 }}>
                 <label>What was discussed (a line or two)</label>
                 <textarea rows={2} value={other.body} onChange={(e) => setOther((o) => ({ ...o, body: e.target.value }))} />
               </div>
@@ -453,6 +539,34 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
             </div>
           )}
         </div>
+
+        {chasePrompt && (
+          <div className="modal-backdrop" style={{ zIndex: 60 }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal" style={{ width: 480 }} onClick={(e) => e.stopPropagation()}>
+              <h2 style={{ marginBottom: 8 }}>Is this client answering you?</h2>
+              <p style={{ fontSize: 14, marginBottom: 10 }}>
+                You've now reached out {chasePrompt.unanswered} times on this bid without hearing back.
+              </p>
+              <p className="field-help" style={{ marginBottom: 12 }}>
+                If they've gone quiet, say so and CRM will wait a little longer before reminding you about this bid, so you aren't chasing at the same pace
+                (about 1½ times the usual gap, and double after 7 tries). When they reply, the reminders go back to normal on their own.
+              </p>
+              <div className="card" style={{ background: "var(--bg-page)", marginBottom: 12 }}>
+                <div className="card-title">Want someone else to try?</div>
+                <div className="field-help" style={{ marginBottom: 6 }}>A manager or colleague may have a better way in. They'll see this bid on their Follow-ups list with your note.</div>
+                <select value={chaseHelp.to} onChange={(e) => setChaseHelp((h) => ({ ...h, to: e.target.value }))} style={{ marginBottom: 6, width: "100%" }}>
+                  <option value="">No, I'll keep trying</option>
+                  {assignableUsers.filter((u) => u.username !== user.username).map((u) => <option key={u.username} value={u.username}>{u.displayName || u.username}</option>)}
+                </select>
+                {chaseHelp.to && <input placeholder="Note for them (optional)" value={chaseHelp.note} onChange={(e) => setChaseHelp((h) => ({ ...h, note: e.target.value }))} style={{ width: "100%" }} />}
+              </div>
+              <div className="modal-actions">
+                <button className="btn btn-ghost" disabled={busy} onClick={() => answerChase(true)}>Yes, they're responding</button>
+                <button className="btn btn-accent" disabled={busy} onClick={() => answerChase(false)}>No, slow my reminders down</button>
+              </div>
+            </div>
+          </div>
+        )}
 
         <div className="card-title">Stage history</div>
         <div className="row-list" style={{ maxHeight: 120, overflowY: "auto", marginBottom: 16 }}>
