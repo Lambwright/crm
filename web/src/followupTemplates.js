@@ -38,9 +38,9 @@ const SUBMITTED_V = (bid) => {
   const sub = bid.submitted_date ? ` (sent ${String(bid.submitted_date).slice(0, 10)})` : "";
   return [
     (p) => `I'm following up on our quote for ${p}${sub}. Did you receive it all right? If you've had a chance to look it over, do you have any questions or concerns we can help with? And are we still in the running?`,
-    (p) => `Just checking that our pricing for ${p}${sub} reached you. Have you started reviewing the bids? We'd be glad to go through anything in our number, and we'd appreciate knowing where we stand.`,
-    (p) => `We sent over our quote for ${p}${sub} and wanted to be sure it got to the right person. Is there anything in it that needs clarifying or adjusting? Do you have a sense of when a decision will be made?`,
-    (p) => `Following up on ${p}${sub}. Has the project been awarded yet, and if so, could you let us know how we made out? If it's still open, we'd welcome the chance to answer any questions on our price.`,
+    (p) => `Just checking that our pricing for ${p}${sub} reached you. Have you started reviewing the bids? Do you have any questions or concerns about our pricing or the scope we've identified? We'd appreciate knowing where we stand.`,
+    (p) => `We sent over our quote for ${p}${sub} and wanted to be sure it got to the right person. Do you have any questions or concerns about our pricing or the scope we've identified? Do you have a sense of when a decision will be made?`,
+    (p) => `Following up on ${p}${sub}. Has the project been awarded yet, and if so, could you let us know how we made out? If it's still open, do you have any questions or concerns about our pricing or the scope we've identified?`,
     (p) => `Hoping you got our quote for ${p}${sub}. Any questions, concerns, or scope changes since you received it? We'd also like to know if we're still being considered.`,
   ];
 };
@@ -50,13 +50,13 @@ const AGED_V = (bid) => {
   return [
     (p) => `It's been a little while since we sent our quote for ${p}${sub}, so I wanted to check in. Has a decision been made? If it's been awarded, we'd appreciate knowing the outcome either way, and if not, are we still in the running?`,
     (p) => `Checking back on ${p}. We sent pricing${sub} and haven't heard since. Did the quote reach you, and do you have any questions or concerns on it? A quick yes or no on whether we're still in the picture would help us plan.`,
-    (p) => `I wanted to follow up on ${p}. Is the project still going ahead, and where are you in choosing a contractor? If our price needs another look because scope or timing has changed, we're happy to revisit it.`,
+    (p) => `I wanted to follow up on ${p}. Is the project still going ahead, and where are you in choosing a contractor? Do you have any questions or concerns about our pricing or the scope we've identified?`,
     (p) => `Following up on our quote for ${p}${sub}. Have you made your decision? Whatever the result, we'd value the feedback. If it's still open, is there anything we can clarify to help?`,
   ];
 };
 
 const HOLD_V = [
-  (p) => `I'm checking in on ${p}, which we understand is on hold. Is the project still going ahead, and do you have a sense of when it might move again? We're happy to refresh our pricing when you're ready.`,
+  (p) => `I'm checking in on ${p}, which we understand is on hold. Is the project still going ahead, and do you have a sense of when it might move again? When it does, do you have any questions or concerns about our pricing or the scope we've identified?`,
   (p) => `Following up on ${p}. Has anything changed on timing or scope since our quote? Let us know if the project is back on, and whether we're still in the running.`,
 ];
 
