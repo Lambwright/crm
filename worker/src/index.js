@@ -2406,7 +2406,7 @@ async function handleBidDetail(id, sql, user) {
   // The customer's directory contacts, so a follow-up's recipient can be picked
   // without leaving the bid (a PM has no Companies tab).
   const contacts = rows[0].company_id
-    ? await sql`select id, first_name, last_name, title, email from contacts where company_id = ${rows[0].company_id} order by first_name, last_name`
+    ? await sql`select id, first_name, last_name, title, email from contacts where company_id = ${rows[0].company_id} and active order by first_name, last_name`
     : [];
   // SCOUT's latest complete record for this bid, plus how many pushes there were.
   const runs = await sql`select * from scout_runs where bid_id = ${id} order by coalesce(submitted_at, received_at) desc limit 1`;
@@ -2541,6 +2541,79 @@ async function handleBidStageChange(id, request, sql, env, user) {
 // ---------------------------------------------------------------------------
 // Tender emails
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Procore Directory contacts for the follow-up email (Ben, 2026-10-28): when someone opens a bid, the
+// "To" picker is filled with the real people at that client, read from Procore's Directory on demand and
+// kept as ordinary CRM contacts. CRM has no Procore access of its own: HANDOFF's
+// GET /directory/vendor-contacts (service binding, same key as /regions) makes the one Procore call and
+// caches it. To stay cheap, CRM asks at most once per company per week, plus a manual Refresh button,
+// and backs off for 10 minutes after any failure. A failed refresh never blocks the form: the contacts
+// CRM already has keep serving.
+// ---------------------------------------------------------------------------
+const CONTACT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const contactRetryAfter = new Map();
+
+async function handleRefreshContacts(bidId, request, env, sql, user) {
+  const body = await parseBody(request);
+  const [bid] = await sql`select id, company_id, owner_username, estimator_username from bids where id = ${bidId}`;
+  if (!bid) return json({ error: "bid_not_found" }, 404);
+  const denied = await bidAccess(sql, user, bid);
+  if (denied) return denied;
+  if (!bid.company_id) return json({ linked: false, contacts: [] });
+  const list = () => sql`
+    select id, first_name, last_name, title, email from contacts
+    where company_id = ${bid.company_id} and active and email is not null and email <> ''
+    order by first_name, last_name`;
+  const [co] = await sql`select id, procore_vendor_id, procore_contacts_synced_at from companies where id = ${bid.company_id}`;
+  if (!co || co.procore_vendor_id == null) return json({ linked: false, contacts: await list() });
+  const force = Boolean(body.force);
+  const age = co.procore_contacts_synced_at ? Date.now() - new Date(co.procore_contacts_synced_at).getTime() : Infinity;
+  if (!force && age < CONTACT_TTL_MS) return json({ linked: true, refreshed: false, synced_at: co.procore_contacts_synced_at, contacts: await list() });
+  if (!force && Date.now() < (contactRetryAfter.get(co.id) || 0)) {
+    return json({ linked: true, refreshed: false, synced_at: co.procore_contacts_synced_at, error: "Procore contacts are temporarily unavailable.", contacts: await list() });
+  }
+  if (!env.HANDOFF_WORKER || !env.HANDOFF_SERVICE_KEY) return json({ linked: true, refreshed: false, error: "Procore contacts aren't connected yet.", contacts: await list() });
+  try {
+    const res = await env.HANDOFF_WORKER.fetch(`https://handoff-worker.ben-a90.workers.dev/directory/vendor-contacts?vendor_id=${encodeURIComponent(String(co.procore_vendor_id))}`, {
+      headers: { "X-Handoff-Service-Key": env.HANDOFF_SERVICE_KEY },
+    });
+    if (!res.ok) throw new Error(`HANDOFF returned HTTP ${res.status}`);
+    const data = await res.json();
+    const rows = Array.isArray(data.contacts) ? data.contacts : null;
+    if (!rows) throw new Error("HANDOFF returned no contact list");
+    const seen = new Set();
+    for (const c of rows) {
+      if (!c || c.id == null) continue;
+      const pid = String(c.id);
+      const email = c.email ? String(c.email).trim() : null;
+      const active = c.is_active !== false;
+      seen.add(pid);
+      let [ex] = await sql`select id from contacts where company_id = ${co.id} and procore_user_id = ${pid}`;
+      if (!ex && email) [ex] = await sql`select id from contacts where company_id = ${co.id} and lower(email) = ${email.toLowerCase()} and procore_user_id is null limit 1`;
+      if (ex) {
+        await sql`update contacts set procore_user_id = ${pid}, active = ${active},
+          first_name = coalesce(nullif(first_name, ''), ${c.first_name || null}), last_name = coalesce(nullif(last_name, ''), ${c.last_name || null}),
+          title = coalesce(nullif(title, ''), ${c.title || null}), phone = coalesce(nullif(phone, ''), ${c.phone || null}),
+          email = coalesce(nullif(email, ''), ${email}), updated_at = now()
+          where id = ${ex.id}`;
+      } else {
+        await sql`insert into contacts (company_id, first_name, last_name, title, email, phone, procore_user_id, active)
+          values (${co.id}, ${c.first_name || null}, ${c.last_name || null}, ${c.title || null}, ${email}, ${c.phone || null}, ${pid}, ${active})`;
+      }
+    }
+    // Someone Procore no longer lists for this company drops out of the picker (kept, not deleted).
+    for (const old of await sql`select id, procore_user_id from contacts where company_id = ${co.id} and procore_user_id is not null and active`) {
+      if (!seen.has(String(old.procore_user_id))) await sql`update contacts set active = false, updated_at = now() where id = ${old.id}`;
+    }
+    await sql`update companies set procore_contacts_synced_at = now() where id = ${co.id}`;
+    contactRetryAfter.delete(co.id);
+    return json({ linked: true, refreshed: true, cached: Boolean(data.cached), synced_at: new Date().toISOString(), contacts: await list() });
+  } catch (e) {
+    contactRetryAfter.set(co.id, Date.now() + 10 * 60 * 1000);
+    return json({ linked: true, refreshed: false, synced_at: co.procore_contacts_synced_at, error: `Couldn't reach Procore: ${e.message}`, contacts: await list() });
+  }
+}
 
 async function handleEmailsList(bidId, sql, user) {
   const [b] = await sql`select id, owner_username, estimator_username from bids where id = ${bidId}`;
@@ -3329,6 +3402,16 @@ SELF_MIGRATIONS.push({
     `create index if not exists bid_help_requests_to on bid_help_requests (to_user, status)`,
   ],
 });
+// Procore Directory contacts live in the ordinary contacts table (Ben, 2026-10-28).
+SELF_MIGRATIONS.push({
+  id: "025_procore_directory_contacts",
+  statements: [
+    `alter table contacts add column if not exists procore_user_id text`,
+    `alter table contacts add column if not exists active boolean not null default true`,
+    `create unique index if not exists contacts_procore_user on contacts (company_id, procore_user_id) where procore_user_id is not null`,
+    `alter table companies add column if not exists procore_contacts_synced_at timestamptz`,
+  ],
+});
 let schemaReady = null;
 function ensureSchema(sql) {
   if (!schemaReady) {
@@ -3996,6 +4079,7 @@ async function handleRequest(request, env) {
         if (isUuid(parts[1]) && parts[2] === "emails" && request.method === "GET") return withRefresh(await handleEmailsList(parts[1], sql, auth.user));
         if (isUuid(parts[1]) && parts[2] === "emails" && request.method === "POST") return withRefresh(await handleEmailCreate(parts[1], request, sql, auth.user));
         if (isUuid(parts[1]) && parts[2] === "followup-date" && request.method === "POST") return withRefresh(await handleFollowupDateSet(parts[1], request, sql, auth.user));
+        if (isUuid(parts[1]) && parts[2] === "refresh-contacts" && request.method === "POST") return withRefresh(await handleRefreshContacts(parts[1], request, env, sql, auth.user));
         if (isUuid(parts[1]) && parts[2] === "chase" && request.method === "POST") return withRefresh(await handleChase(parts[1], request, env, sql, auth.user));
         if (isUuid(parts[1]) && parts[2] === "priority" && request.method === "POST") return withRefresh(await handlePriorityToggle(parts[1], request, sql, auth.user));
       }

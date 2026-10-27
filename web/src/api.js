@@ -138,6 +138,8 @@ export const api = {
   setBidPriority: (bidId, flag) => request(`/bids/${bidId}/priority`, { method: "POST", body: { priority_bid: flag } }),
   resolveHelp: (helpId, status) => request(`/followups/help/${helpId}/resolve`, { method: "POST", body: { status } }),
   getFollowupCounts: () => request(`/followups/counts`),
+  // The client's real contacts from Procore's Directory (CRM asks at most weekly per company unless forced)
+  refreshContacts: (bidId, force) => request(`/bids/${bidId}/refresh-contacts`, { method: "POST", body: { force: Boolean(force) } }),
   setFollowupDate: (bidId, date, reason) => request(`/bids/${bidId}/followup-date`, { method: "POST", body: { date, reason } }),
 
   // What the signed-in user can do in CRM (role matrix) + who they can assign follow-ups to

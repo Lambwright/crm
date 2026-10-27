@@ -28,6 +28,9 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
   const [other, setOther] = useState({ contact_type: "call", direction: "outbound", spoke_with: "", body: "", next_date: "" });
   // "Is this client answering you?" after the 4th unanswered contact
   const [chasePrompt, setChasePrompt] = useState(null);
+  // The client's contacts from Procore's Directory, asked for when the form opens (never blocks it)
+  const [procoreContacts, setProcoreContacts] = useState(null); // { linked, refreshed, synced_at, error, contacts }
+  const [refreshingContacts, setRefreshingContacts] = useState(false);
   const [chaseHelp, setChaseHelp] = useState({ to: "", note: "" });
   // Moving the follow-up date because the client asked.
   const [dateOpen, setDateOpen] = useState(false);
@@ -68,7 +71,13 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
     });
   }
 
+  async function loadProcoreContacts(force) {
+    setRefreshingContacts(true);
+    try { setProcoreContacts(await api.refreshContacts(id, force)); } catch (e) { setProcoreContacts({ error: e.message, contacts: null }); } finally { setRefreshingContacts(false); }
+  }
+
   useEffect(() => {
+    loadProcoreContacts(false);
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
@@ -84,7 +93,7 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
   if (!data) return null;
 
   const { bid, stage_history, emails } = data;
-  const directory = (data.company_contacts || []).filter((c) => c.email);
+  const directory = ((procoreContacts && procoreContacts.contacts) || data.company_contacts || []).filter((c) => c.email);
   const requirements = toStage ? STAGE_REQUIREMENTS[toStage] || [] : [];
 
   async function assignField(field, value) {
@@ -474,6 +483,18 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
                 ))}
               </select>
             )}
+            <div className="field-help" style={{ marginTop: 4 }}>
+              {procoreContacts && procoreContacts.linked === false
+                ? "This client isn't linked to Procore yet, so only the contacts already in CRM are listed."
+                : procoreContacts && procoreContacts.error
+                  ? "Couldn't refresh from Procore just now; showing the contacts CRM already has."
+                  : procoreContacts && procoreContacts.synced_at
+                    ? "Contacts from Procore's Directory, updated " + new Date(procoreContacts.synced_at).toLocaleDateString() + "."
+                    : refreshingContacts ? "Checking Procore for this client's contacts…" : ""}
+              {procoreContacts && procoreContacts.linked !== false && (
+                <button className="btn btn-ghost btn-sm" style={{ marginLeft: 8 }} disabled={refreshingContacts} onClick={() => loadProcoreContacts(true)}>{refreshingContacts ? "…" : "↻ Refresh from Procore"}</button>
+              )}
+            </div>
           </div>
         </div>
         <div className="field" style={{ marginBottom: 6 }}>
