@@ -2017,9 +2017,13 @@ async function handleBulkAssign(request, env, sql, user) {
   return json({ ok: true, assigned: n });
 }
 
-// The rules, in order; the first one that gives a bid an owner wins. Only bids with no owner that are
-// past the estimating hold are considered: a new bid belongs to estimating alone for its first days.
-async function planRuleAssignments(env, sql, user) {
+// The rules, in order; the first one that gives a bid an owner wins. By default only bids with no owner that
+// are past the estimating hold are considered (a new bid belongs to estimating alone for its first days).
+// With `includeOwned`, bids that already have a different owner are also offered to the pinning rules
+// (client, region, province) only, never to relationship or workload rules, so a rule written to send one
+// client's bids to one person takes effect on bids that already exist. `rule_stats` tells the manager,
+// rule by rule, how many bids it matches and why some will not move.
+async function planRuleAssignments(env, sql, user, { includeOwned = false } = {}) {
   const people = await eligibleAssignees(env, user);
   const eligible = new Set(people.map((p) => p.username));
   const { estimatingHoldDays: hold } = await getCrmSettings(sql);
@@ -2039,41 +2043,74 @@ async function planRuleAssignments(env, sql, user) {
     const w = b.owner_username;
     if (w && b.company_id && eligible.has(w) && !lastOwner.has(b.company_id)) lastOwner.set(b.company_id, w);
   }
+  const PINNING = ["client", "region", "province"];
+  const matchRule = (r, b) => {
+    if (r.kind === "client") return r.company_id && r.company_id === b.company_id ? r.assignee_username : null;
+    if (r.kind === "region") return r.value && b.company_region === r.value ? r.assignee_username : null;
+    if (r.kind === "province") {
+      const p = provinceOfProject(b.project_name);
+      return r.value && (p === String(r.value).toUpperCase() || (!p && String(b.company_province || "").toUpperCase() === String(r.value).toUpperCase())) ? r.assignee_username : null;
+    }
+    if (r.kind === "relationship") return b.company_id && lastOwner.has(b.company_id) ? lastOwner.get(b.company_id) : null;
+    if (r.kind === "balance") {
+      const pool = (Array.isArray(r.pool) ? r.pool : []).filter((u) => eligible.has(u));
+      return pool.length ? pool.slice().sort((a, c2) => (load.get(a) || 0) - (load.get(c2) || 0))[0] : null;
+    }
+    return null;
+  };
+  const stats = new Map(rules.filter((r) => PINNING.includes(r.kind)).map((r) => [r.id, { matched: 0, already_theirs: 0, owned_by_others: 0, in_estimating_hold: 0, will_assign: 0 }]));
   const out = [];
-  let unmatched = 0;
+  let unmatched = 0, skippedOwned = 0, skippedHold = 0;
   for (const b of bids) {
-    if (b.owner_username || b.estimating_hold) continue;
+    // how each pinning rule sees this bid, whatever its owner or age
+    for (const r of rules) {
+      const st = stats.get(r.id);
+      const who = st ? matchRule(r, b) : null;
+      if (!st || !who || !eligible.has(who)) continue;
+      st.matched++;
+      if (b.owner_username === who) st.already_theirs++;
+      else if (b.owner_username) st.owned_by_others++;
+      else if (b.estimating_hold) st.in_estimating_hold++;
+    }
+    const hasOwner = Boolean(b.owner_username);
+    if (hasOwner && !includeOwned) { skippedOwned++; continue; }
+    if (!hasOwner && b.estimating_hold) { skippedHold++; continue; }
     let pick = null, why = null;
     for (const r of rules) {
-      let who = null;
-      if (r.kind === "client" && r.company_id && r.company_id === b.company_id) who = r.assignee_username;
-      else if (r.kind === "region" && r.value && b.company_region === r.value) who = r.assignee_username;
-      else if (r.kind === "province" && r.value && (provinceOfProject(b.project_name) === String(r.value).toUpperCase() || (!provinceOfProject(b.project_name) && String(b.company_province || "").toUpperCase() === String(r.value).toUpperCase()))) who = r.assignee_username;
-      else if (r.kind === "relationship" && b.company_id && lastOwner.has(b.company_id)) who = lastOwner.get(b.company_id);
-      else if (r.kind === "balance") {
-        const pool = (Array.isArray(r.pool) ? r.pool : []).filter((u) => eligible.has(u));
-        if (pool.length) who = pool.slice().sort((a, c2) => (load.get(a) || 0) - (load.get(c2) || 0))[0];
-      }
+      if (hasOwner && !PINNING.includes(r.kind)) continue;
+      const who = matchRule(r, b);
       if (who && eligible.has(who)) { pick = who; why = r; break; }
     }
-    if (!pick) { unmatched++; continue; }
-    load.set(pick, (load.get(pick) || 0) + 1);
-    out.push({ bid_id: b.id, project_name: b.project_name, company_name: b.company_name, assignee: pick, rule_id: why.id, rule_kind: why.kind });
+    if (!pick) { if (!hasOwner) unmatched++; continue; }
+    if (pick === b.owner_username) continue;
+    if (!hasOwner) load.set(pick, (load.get(pick) || 0) + 1);
+    if (stats.has(why.id)) stats.get(why.id).will_assign++;
+    out.push({ bid_id: b.id, project_name: b.project_name, company_name: b.company_name, assignee: pick, from: b.owner_username || null, rule_id: why.id, rule_kind: why.kind });
   }
-  return { assignments: out, unmatched, rules_active: rules.length };
+  return {
+    assignments: out, unmatched, rules_active: rules.length,
+    skipped: { already_owned: includeOwned ? 0 : skippedOwned, estimating_hold: skippedHold },
+    rule_stats: Object.fromEntries(stats),
+    include_owned: includeOwned,
+  };
 }
 
 async function handleFollowupRules(request, url, env, sql, user) {
   if (!canSeeFollowupDashboard(user)) return forbidden("The follow-up dashboard isn't available to your role.");
   const path = url.pathname;
-  if (path === "/followups/rules/preview" && request.method === "POST") return json(await planRuleAssignments(env, sql, user));
+  if (path === "/followups/rules/preview" && request.method === "POST") {
+    const body = await parseBody(request);
+    return json(await planRuleAssignments(env, sql, user, { includeOwned: Boolean(body.include_owned) }));
+  }
   if (path === "/followups/rules/apply" && request.method === "POST") {
     if (!canAssignFollowups(user)) return forbidden("You can't assign follow-ups.");
-    const plan = await planRuleAssignments(env, sql, user);
+    const body = await parseBody(request);
+    const plan = await planRuleAssignments(env, sql, user, { includeOwned: Boolean(body.include_owned) });
     let n = 0;
     for (const a of plan.assignments) {
-      const r = await sql`update bids set owner_username = ${a.assignee}, updated_at = now() where id = ${a.bid_id} and owner_username is null returning id`;
-      if (r.length) { n++; await logAssignment(sql, a.bid_id, null, a.assignee, user.username, a.rule_kind); }
+      // only if the owner is still who the preview saw, so nothing changes under someone's feet
+      const r = await sql`update bids set owner_username = ${a.assignee}, updated_at = now() where id = ${a.bid_id} and owner_username is not distinct from ${a.from} returning id`;
+      if (r.length) { n++; await logAssignment(sql, a.bid_id, a.from, a.assignee, user.username, a.rule_kind); }
     }
     return json({ ok: true, assigned: n, unmatched: plan.unmatched });
   }
@@ -2703,6 +2740,7 @@ async function handleFollowupsList(url, sql, user) {
   // manager capability who didn't ask for everything (estimators keep the
   // "My bids only" toggle they had).
   const mine = url.searchParams.get("mine") === "1" || !canSeeAllBids(user);
+  const upcoming = url.searchParams.get("upcoming") === "1";
   const { estimatingHoldDays: hold } = await getCrmSettings(sql);
   // "Mine" = bids I own, plus bids I'm the estimator on while they're still new (estimating alone
   // looks after a bid's first follow-ups). Archived-in-Procore bids are off the board and stay off.
@@ -2713,7 +2751,7 @@ async function handleFollowupsList(url, sql, user) {
       (b.created_at >= now() - make_interval(days => ${hold})) as estimating_hold
     from bids b left join companies c on c.id = b.company_id left join contacts ct on ct.id = b.contact_id
     where b.stage not in ('complete', 'lost', 'no_bid') and b.source_archived = false
-      and (b.next_action_date is null or b.next_action_date <= ${userToday(user)}::date)
+      and (${upcoming}::boolean or b.next_action_date is null or b.next_action_date <= ${userToday(user)}::date)
       and (${mine} = false or b.owner_username = ${user.username}
         or (b.estimator_username = ${user.username} and b.created_at >= now() - make_interval(days => ${hold})))
     order by (b.next_action_date is null) desc, b.next_action_date asc

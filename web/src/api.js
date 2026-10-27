@@ -65,7 +65,7 @@ export const api = {
   ackNotification: (id) => request(`/notifications/${id}/ack`, { method: "POST", body: {} }),
 
   // Follow-ups — open bids due (or overdue) for a human touch
-  listFollowups: (mine) => request(`/followups${mine ? "?mine=1" : ""}`),
+  listFollowups: (mine, upcoming) => request(`/followups?${[mine ? "mine=1" : "", upcoming ? "upcoming=1" : ""].filter(Boolean).join("&")}`),
 
   // Dashboard
   getDashboardSummary: (range, from, to) => {
@@ -122,8 +122,8 @@ export const api = {
   getFollowupDashboard: () => request(`/followups/dashboard`),
   bulkAssignFollowups: (bidIds, owner) => request(`/followups/bulk-assign`, { method: "POST", body: { bid_ids: bidIds, owner_username: owner } }),
   followupRule: (body) => request(`/followups/rules`, { method: "POST", body }),
-  previewFollowupRules: () => request(`/followups/rules/preview`, { method: "POST", body: {} }),
-  applyFollowupRules: () => request(`/followups/rules/apply`, { method: "POST", body: {} }),
+  previewFollowupRules: (includeOwned) => request(`/followups/rules/preview`, { method: "POST", body: { include_owned: Boolean(includeOwned) } }),
+  applyFollowupRules: (includeOwned) => request(`/followups/rules/apply`, { method: "POST", body: { include_owned: Boolean(includeOwned) } }),
 
   // Procore project regions (one list, used for every region pick)
   listRegions: () => request(`/regions`),

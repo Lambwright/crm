@@ -23,17 +23,18 @@ export default function Followups({ user, access, assignableUsers = [], onNotifi
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [mineOnly, setMineOnly] = useState(true);
+  const [upcoming, setUpcoming] = useState(false);
   const [selected, setSelected] = useState(null); // { id, prefillEmail }
 
   const load = useCallback(() => {
     setLoading(true);
     setError(null);
     api
-      .listFollowups(mineOnly)
+      .listFollowups(mineOnly, upcoming)
       .then((data) => { setBids(data.bids || []); setHelp(data.help || []); })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, [mineOnly]);
+  }, [mineOnly, upcoming]);
 
   useEffect(() => {
     load();
@@ -63,6 +64,10 @@ export default function Followups({ user, access, assignableUsers = [], onNotifi
             My bids only
           </label>
         )}
+        <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text-secondary)" }}>
+          <input type="checkbox" checked={upcoming} onChange={(e) => setUpcoming(e.target.checked)} />
+          Include bids not due yet
+        </label>
         <button className="btn btn-ghost btn-sm" onClick={load} disabled={loading}>{loading ? "↻ …" : "↻ Refresh"}</button>
       </div>
       {help.length > 0 && (

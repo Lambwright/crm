@@ -19,6 +19,8 @@ function describe(rule, people) {
   return <>Spread across <strong>{pool}</strong> by current workload</>;
 }
 
+const statsText = (m) => m.matched + " match · " + m.will_assign + " to assign · " + m.already_theirs + " already theirs · " + m.owned_by_others + " owned by others · " + m.in_estimating_hold + " still with estimating";
+
 function ConfirmEditModal({ managers, noun = "rules", onCancel, onConfirm }) {
   const list = managers.map((m) => m.displayName || m.username).join(", ");
   return (
@@ -200,6 +202,7 @@ export default function FollowupManager() {
   const [editing, setEditing] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [preview, setPreview] = useState(null);
+  const [includeOwned, setIncludeOwned] = useState(false);
 
   const load = useCallback(() => api.getFollowupDashboard().then(setData).catch((e) => setError(e.message)), []);
   useEffect(() => { load(); }, [load]);
@@ -234,7 +237,7 @@ export default function FollowupManager() {
     setPicked(new Set());
     await load();
   });
-  const rule = (body) => run("rule", async () => { await api.followupRule(body); await load(); setPreview(null); });
+  const rule = (body) => run("rule", async () => { await api.followupRule(body); await load(); setPreview(await api.previewFollowupRules(includeOwned)); });
   const startEdit = () => (data.can.edit_rules_directly ? setEditing(true) : setConfirming(true));
 
   return (
@@ -305,13 +308,14 @@ export default function FollowupManager() {
         Rules run top to bottom for bids with nobody assigned; the first that names someone wins. Managed by {managers.length ? managers.map((m) => m.displayName || m.username).join(", ") : "the Follow-up Manager role (nobody has it yet)"}.
       </p>
       <table className="data-table">
-        <thead><tr><th>#</th><th>Rule</th><th>Active</th>{editing && <th />}</tr></thead>
+        <thead><tr><th>#</th><th>Rule</th><th>Active</th>{preview && <th>Matches (open bids)</th>}{editing && <th />}</tr></thead>
         <tbody>
           {rules.map((r, i) => (
             <tr key={r.id} style={{ opacity: r.active ? 1 : 0.5 }}>
               <td>{i + 1}</td>
               <td>{describe(r, people2)}</td>
               <td>{editing ? <input type="checkbox" checked={r.active} onChange={(e) => rule({ action: "toggle", id: r.id, active: e.target.checked })} /> : r.active ? "Yes" : "Off"}</td>
+              {preview && <td className="row-secondary">{preview.rule_stats && preview.rule_stats[r.id] ? statsText(preview.rule_stats[r.id]) : "—"}</td>}
               {editing && (
                 <td style={{ whiteSpace: "nowrap" }}>
                   <button className="btn btn-ghost btn-sm" disabled={i === 0 || !!busy} onClick={() => rule({ action: "move", id: r.id, direction: "up" })}>↑</button>{" "}
@@ -324,25 +328,31 @@ export default function FollowupManager() {
           {rules.length === 0 && <tr><td colSpan={editing ? 4 : 3} className="empty-state">No rules yet.</td></tr>}
         </tbody>
       </table>
-      {editing && <AddRule people={people2} onAdded={async () => { await load(); setPreview(null); }} />}
+      {editing && <AddRule people={people2} onAdded={async () => { await load(); try { setPreview(await api.previewFollowupRules(includeOwned)); } catch (e) { setPreview(null); } }} />}
 
-      <div style={{ marginTop: 14 }}>
-        <button className="btn btn-accent btn-sm" disabled={!!busy || !rules.length} onClick={() => run("preview", async () => setPreview(await api.previewFollowupRules()))}>{busy === "preview" ? "Checking…" : "Preview who the rules would assign"}</button>
+      <div style={{ marginTop: 14, display: "flex", gap: 14, alignItems: "center", flexWrap: "wrap" }}>
+        <button className="btn btn-accent btn-sm" disabled={!!busy || !rules.length} onClick={() => run("preview", async () => setPreview(await api.previewFollowupRules(includeOwned)))}>{busy === "preview" ? "Checking…" : "Preview who the rules would assign"}</button>
+        <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12, color: "var(--text-secondary)" }}>
+          <input type="checkbox" checked={includeOwned} onChange={(e) => { setIncludeOwned(e.target.checked); setPreview(null); }} />
+          Also move bids that already have another owner (client, region and province rules only)
+        </label>
       </div>
       {preview && (
         <div className="card" style={{ marginTop: 10 }}>
           <div className="field-help" style={{ marginBottom: 6 }}>
-            {preview.assignments.length} unassigned open bid{preview.assignments.length === 1 ? "" : "s"} would be assigned; {preview.unmatched} match no rule.
+            {preview.assignments.length} bid{preview.assignments.length === 1 ? "" : "s"} would be assigned; {preview.unmatched} with no owner match no rule.
+            {preview.skipped && preview.skipped.already_owned > 0 ? ` ${preview.skipped.already_owned} already have an owner and are left alone.` : ""}
+            {preview.skipped && preview.skipped.estimating_hold > 0 ? ` ${preview.skipped.estimating_hold} are new and still with estimating.` : ""}
           </div>
           {preview.assignments.length > 0 && (
             <>
               <div style={{ maxHeight: 220, overflowY: "auto" }}>
                 <table className="data-table">
-                  <thead><tr><th>Project</th><th>Client</th><th>Goes to</th><th>Rule</th></tr></thead>
-                  <tbody>{preview.assignments.map((a) => <tr key={a.bid_id}><td>{a.project_name}</td><td>{a.company_name || "—"}</td><td>{name(people2, a.assignee)}</td><td>{a.rule_kind}</td></tr>)}</tbody>
+                  <thead><tr><th>Project</th><th>Client</th><th>Goes to</th><th>Was</th><th>Rule</th></tr></thead>
+                  <tbody>{preview.assignments.map((a) => <tr key={a.bid_id}><td>{a.project_name}</td><td>{a.company_name || "—"}</td><td>{name(people2, a.assignee)}</td><td>{a.from ? name(people2, a.from) : <span className="row-secondary">no owner</span>}</td><td>{a.rule_kind}</td></tr>)}</tbody>
                 </table>
               </div>
-              <button className="btn btn-accent btn-sm" style={{ marginTop: 8 }} disabled={!!busy || !data.can.assign} onClick={() => run("apply", async () => { const r = await api.applyFollowupRules(); setMsg(`Assigned ${r.assigned} bid${r.assigned === 1 ? "" : "s"}; ${r.unmatched} matched no rule.`); setPreview(null); await load(); })}>
+              <button className="btn btn-accent btn-sm" style={{ marginTop: 8 }} disabled={!!busy || !data.can.assign} onClick={() => run("apply", async () => { const r = await api.applyFollowupRules(includeOwned); setMsg(`Assigned ${r.assigned} bid${r.assigned === 1 ? "" : "s"}; ${r.unmatched} matched no rule.`); setPreview(null); await load(); })}>
                 {busy === "apply" ? "Assigning…" : `Assign these ${preview.assignments.length}`}
               </button>
             </>
