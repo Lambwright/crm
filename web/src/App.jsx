@@ -67,7 +67,7 @@ export default function App() {
         setAuthState("in");
       } else {
         if (data.error === "no_app_access") {
-          setLoginNotice("Your account doesn't have access to any apps yet. Ask an admin to grant you access in HELM.");
+          setLoginNotice("Your account doesn't have access to any apps yet. Ask your admin to give you access.");
         }
         setAuthState("out");
       }

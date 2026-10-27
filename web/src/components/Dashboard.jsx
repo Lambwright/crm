@@ -233,8 +233,8 @@ export default function Dashboard() {
         <div className="card">
           <Tip label="Overdue follow-ups">
             Open bids created {rangeInfo.phrase} whose follow-up date has passed with nothing done about it.
-            Logging a tender email on a bid resets its follow-up date; how many days each stage waits is set in
-            HELM → CRM Options.<br /><br />
+            Logging a tender email on a bid resets its follow-up date; how many days each stage waits is set on the
+            Follow-up manager tab.<br /><br />
             <strong>{fmtNum(summary.overdue_followups)}</strong> overdue right now.
           </Tip>
           <div className="kv-value mono stat" style={{ color: summary.overdue_followups > 0 ? "var(--red)" : undefined }}>{fmtNum(summary.overdue_followups)}</div>
