@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api.js";
 import { parseCsv } from "../csv.js";
+import Loading from "./Loading.jsx";
 
 // Admin tool (Companies tab): upload a NetSuite customer export (CSV) and link
 // or create a CRM company for each customer. Always preview first; nothing
@@ -182,7 +183,7 @@ export default function NetSuiteSync() {
       )}
 
       {error && <div className="login-error" style={{ marginBottom: 8 }}>{error}</div>}
-      {!data && !error && <div className="spinner-inline">Loading…</div>}
+      {!data && !error && <Loading />}
       {s && (
         <>
           <div className="field-help" style={{ marginBottom: 8 }}>

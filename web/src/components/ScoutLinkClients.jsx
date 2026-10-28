@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api.js";
+import Loading from "./Loading.jsx";
 
 // Admin: SCOUT history runs whose client name isn't a CRM company yet. A customer can
 // have several branches, each its own company, and a bid is for one specific branch,
@@ -133,7 +134,7 @@ export default function ScoutLinkClients({ onChanged }) {
           The stats count these runs either way.
         </p>
         {error && <div className="login-error">{error}</div>}
-        {!items && !error && <div className="spinner-inline">Loading…</div>}
+        {!items && !error && <Loading />}
         {items && items.length === 0 && <div className="empty-state">Everything is matched.</div>}
         {items && items.map((it) => <ClientRow key={it.client} item={it} onRunsLinked={runsLinked} onClientDone={clientDone} />)}
       </div>

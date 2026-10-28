@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { getStoredToken, verify, logout as doLogout } from "./auth.js";
 import { api } from "./api.js";
 import Header from "./components/Header.jsx";
+import Loading from "./components/Loading.jsx";
 import LoginScreen from "./components/LoginScreen.jsx";
 import BidBoard from "./components/BidBoard.jsx";
 import CompanyList from "./components/CompanyList.jsx";
@@ -91,6 +92,12 @@ export default function App() {
     api.getAccess().then(setAccess).catch(() => {});
   }, [authState]);
 
+  // Seasonal decorations from the suite's shared file, once the header has rendered after sign-in.
+  useEffect(() => {
+    if (authState !== "in") return;
+    try { window.EinbauFestive && window.EinbauFestive.init({ app: "CRM" }); } catch (e) { /* decorations are optional */ }
+  }, [authState]);
+
   function handleLoggedIn(u) {
     setUser(u);
     setAuthState("in");
@@ -109,7 +116,7 @@ export default function App() {
   if (authState === "checking") {
     return (
       <div className="login-screen">
-        <span className="spinner-inline">Checking session…</span>
+        <Loading />
       </div>
     );
   }

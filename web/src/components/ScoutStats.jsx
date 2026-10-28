@@ -4,6 +4,7 @@ import Tip from "./Tip.jsx";
 import { SERIES, StackedColumns, GroupedBars, CompareRows } from "./charts.jsx";
 import ScoutImport from "./ScoutImport.jsx";
 import ScoutLinkClients from "./ScoutLinkClients.jsx";
+import Loading from "./Loading.jsx";
 
 // SCOUT prequalification stats (Ben, 2026-10-16). Prequalification began June 8
 // 2026 with the scoring spreadsheet; SCOUT's app took over in late July; both are
@@ -111,7 +112,7 @@ export default function ScoutStats({ access }) {
   }, [range, from, to, reload]);
 
   if (error) return <div className="card" style={{ color: "var(--red)" }}>{error}</div>;
-  if (!data || data.period.key !== range) return <div className="spinner-inline">Loading…</div>;
+  if (!data || data.period.key !== range) return <Loading />;
 
   const info = range === "custom" ? { label: "Custom range", phrase: `from ${from} to ${to}` } : RANGES.find((r) => r.key === range);
   const isValue = basis === "value";

@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../api.js";
 import { STAGE_LABELS } from "../stages.js";
 import RegionSelect from "./RegionSelect.jsx";
+import Loading from "./Loading.jsx";
+import { busyText } from "../festive.js";
 
 // Follow-up manager dashboard (Ben, 2026-10-21): progress, bulk assignment and the
 // auto-assignment rules. For admins, estimators and follow-up managers only. The rules
@@ -181,7 +183,7 @@ function CadenceEditor({ cadence, priorityCadence, holdDays, canEditDirectly, ma
       </p>
       {editing && (
         <div style={{ marginTop: 8 }}>
-          <button className="btn btn-accent btn-sm" disabled={busy} onClick={save}>{busy ? "Saving…" : "Save"}</button>
+          <button className="btn btn-accent btn-sm" disabled={busy} onClick={save}>{busy ? busyText("Saving…") : "Save"}</button>
           {error && <span className="login-error" style={{ marginLeft: 10 }}>{error}</span>}
         </div>
       )}
@@ -219,7 +221,7 @@ export default function FollowupManager() {
   }, [data, filter, search]);
 
   if (error) return <div className="card" style={{ color: "var(--red)" }}>{error}</div>;
-  if (!data) return <div className="spinner-inline">Loading…</div>;
+  if (!data) return <Loading />;
 
   const { summary, team, rules, managers, people } = data;
   const people2 = people || [];
@@ -331,7 +333,7 @@ export default function FollowupManager() {
       {editing && <AddRule people={people2} onAdded={async () => { await load(); try { setPreview(await api.previewFollowupRules(includeOwned)); } catch (e) { setPreview(null); } }} />}
 
       <div style={{ marginTop: 14, display: "flex", gap: 14, alignItems: "center", flexWrap: "wrap" }}>
-        <button className="btn btn-accent btn-sm" disabled={!!busy || !rules.length} onClick={() => run("preview", async () => setPreview(await api.previewFollowupRules(includeOwned)))}>{busy === "preview" ? "Checking…" : "Preview who the rules would assign"}</button>
+        <button className="btn btn-accent btn-sm" disabled={!!busy || !rules.length} onClick={() => run("preview", async () => setPreview(await api.previewFollowupRules(includeOwned)))}>{busy === "preview" ? busyText("Checking…") : "Preview who the rules would assign"}</button>
         <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12, color: "var(--text-secondary)" }}>
           <input type="checkbox" checked={includeOwned} onChange={(e) => { setIncludeOwned(e.target.checked); setPreview(null); }} />
           Also move bids that already have another owner (client, region and province rules only)
@@ -353,7 +355,7 @@ export default function FollowupManager() {
                 </table>
               </div>
               <button className="btn btn-accent btn-sm" style={{ marginTop: 8 }} disabled={!!busy || !data.can.assign} onClick={() => run("apply", async () => { const r = await api.applyFollowupRules(includeOwned); setMsg(`Assigned ${r.assigned} bid${r.assigned === 1 ? "" : "s"}; ${r.unmatched} matched no rule.`); setPreview(null); await load(); })}>
-                {busy === "apply" ? "Assigning…" : `Assign these ${preview.assignments.length}`}
+                {busy === "apply" ? busyText("Assigning…") : `Assign these ${preview.assignments.length}`}
               </button>
             </>
           )}

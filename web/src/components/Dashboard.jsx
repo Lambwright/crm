@@ -3,6 +3,7 @@ import { api } from "../api.js";
 import { STAGE_LABELS, STAGE_ORDER } from "../stages.js";
 import Tip from "./Tip.jsx";
 import CustomerTable from "./CustomerTable.jsx";
+import Loading from "./Loading.jsx";
 
 // Einbau's fiscal year runs Oct 1 - Sep 30 and is named for the year it ends
 // in, so from 2026-10-01 we're in FY2027 (Ben, 2026-10-06). Calendar quarters
@@ -96,7 +97,7 @@ export default function Dashboard() {
   }, [range, from, to]);
 
   if (error) return <div className="card" style={{ color: "var(--red)" }}>{error}</div>;
-  if (!summary || (summary.period && summary.period.key !== range)) return <div className="spinner-inline">Loading…</div>;
+  if (!summary || (summary.period && summary.period.key !== range)) return <Loading />;
 
   const rangeInfo = range === "custom"
     ? { key: "custom", label: "Custom range", phrase: `from ${from || "the beginning"} to ${to || "today"}` }

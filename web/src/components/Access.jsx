@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api.js";
 import NetSuiteSync from "./NetSuiteSync.jsx";
+import Loading from "./Loading.jsx";
 
 // Admin-only. The Einbau ID level (admin / estimator / PM) is set in HELM and
 // decides the base of what someone can do; this tab adds the two extra
@@ -47,7 +48,7 @@ export default function Access() {
   }
 
   if (error) return <div className="card" style={{ color: "var(--red)" }}>{error}</div>;
-  if (!data) return <div className="spinner-inline">Loading…</div>;
+  if (!data) return <Loading />;
 
   return (
     <>

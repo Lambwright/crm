@@ -1,3 +1,4 @@
+import { busyText } from "../festive.js";
 import { useEffect, useState } from "react";
 import { api } from "../api.js";
 
@@ -19,7 +20,7 @@ function useRegions() {
 
 export default function RegionSelect({ value, onChange, disabled, allowEmpty = true, emptyLabel = "— no region —" }) {
   const data = useRegions();
-  if (!data) return <span className="spinner-inline">Loading…</span>;
+  if (!data) return <span className="spinner-inline">{busyText("Loading…")}</span>;
   const names = data.regions.map((r) => r.name);
   const stray = value && !names.includes(value);
   return (

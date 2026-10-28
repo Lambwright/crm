@@ -1,3 +1,4 @@
+import Loading from "./Loading.jsx";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api.js";
 import { ACCOUNT_SEGMENT_LABELS, ACCOUNT_SEGMENTS } from "../stages.js";
@@ -142,6 +143,7 @@ export default function CompanyList({ access }) {
             <div className="row-amount">{fmtMoney(c.total_value)}</div>
           </div>
         ))}
+        {loading && companies.length === 0 && <Loading />}
         {!loading && companies.length === 0 && <div className="empty-state">No companies match.</div>}
       </div>
 

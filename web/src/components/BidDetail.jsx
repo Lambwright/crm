@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, buildMailto } from "../api.js";
+import Loading from "./Loading.jsx";
 import ScoutRecord from "./ScoutRecord.jsx";
 import { buildFollowUpDraft, variantCount } from "../followupTemplates.js";
 import { HANDOFF_STATUS_LABELS, STAGE_LABELS, STAGE_ORDER, STAGE_REQUIREMENTS } from "../stages.js";
@@ -90,7 +91,11 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
       </div>
     </div>
   );
-  if (!data) return null;
+  if (!data) return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}><Loading /></div>
+    </div>
+  );
 
   const { bid, stage_history, emails } = data;
   const directory = ((procoreContacts && procoreContacts.contacts) || data.company_contacts || []).filter((c) => c.email);

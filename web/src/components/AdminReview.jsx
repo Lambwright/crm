@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api.js";
+import Loading from "./Loading.jsx";
 
 // Admin review (Ben, 2026-10-21): the things leadership should look at in one place.
 // Priority-client RFQs an estimator declined are a queue to work through (follow up
@@ -54,7 +55,7 @@ export default function AdminReview() {
   useEffect(() => { load(); }, [load]);
 
   if (error) return <div className="card" style={{ color: "var(--red)" }}>{error}</div>;
-  if (!data) return <div className="spinner-inline">Loading…</div>;
+  if (!data) return <Loading />;
 
   const open = data.declined.filter((d) => d.status === "open");
   const closed = data.declined.filter((d) => d.status !== "open");

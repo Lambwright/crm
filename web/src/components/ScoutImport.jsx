@@ -1,3 +1,4 @@
+import { busyText } from "../festive.js";
 import { useState } from "react";
 import { api } from "../api.js";
 import { parseCsv } from "../csv.js";
@@ -65,7 +66,7 @@ export default function ScoutImport({ onImported }) {
         </p>
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", marginBottom: 10 }}>
           <input type="file" accept=".csv,text/csv" onChange={onFile} />
-          {rows && <button className="btn btn-accent btn-sm" disabled={!!busy} onClick={doPreview}>{busy === "preview" ? "Checking…" : `Preview ${rows.length} rows`}</button>}
+          {rows && <button className="btn btn-accent btn-sm" disabled={!!busy} onClick={doPreview}>{busy === "preview" ? busyText("Checking…") : `Preview ${rows.length} rows`}</button>}
           {preview && preview.new > 0 && <button className="btn btn-accent btn-sm" disabled={!!busy} onClick={doApply}>{busy === "apply" ? "Importing…" : `Import ${preview.new} new runs`}</button>}
         </div>
         {error && <div className="login-error" style={{ marginBottom: 8 }}>{error}</div>}

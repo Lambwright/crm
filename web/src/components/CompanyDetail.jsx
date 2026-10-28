@@ -1,3 +1,4 @@
+import Loading from "./Loading.jsx";
 import { useEffect, useState } from "react";
 import { api } from "../api.js";
 import RegionSelect from "./RegionSelect.jsx";
@@ -41,7 +42,11 @@ export default function CompanyDetail({ id, onClose, onChanged, canHotLead = tru
       </div>
     </div>
   );
-  if (!data) return null;
+  if (!data) return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}><Loading /></div>
+    </div>
+  );
 
   const { company, contacts, bids } = data;
 

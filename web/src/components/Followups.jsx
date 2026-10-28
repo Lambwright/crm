@@ -3,6 +3,7 @@ import { api } from "../api.js";
 import { STAGE_LABELS } from "../stages.js";
 import { buildFollowUpDraft } from "../followupTemplates.js";
 import BidDetail from "./BidDetail.jsx";
+import Loading from "./Loading.jsx";
 
 // Whole days past the follow-up date, by calendar day. The API sends the date
 // as a full ISO timestamp ("2026-09-28T00:00:00.000Z"), so take just the
@@ -88,6 +89,7 @@ export default function Followups({ user, access, assignableUsers = [], onNotifi
         </div>
       )}
       {error && <div className="card" style={{ color: "var(--red)" }}>{error}</div>}
+      {loading && bids.length === 0 && <Loading />}
       {!loading && bids.length === 0 && !error && (
         <div className="empty-state">Nothing due right now — every open bid has a future follow-up date.</div>
       )}

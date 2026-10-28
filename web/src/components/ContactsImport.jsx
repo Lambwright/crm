@@ -1,3 +1,4 @@
+import { busyText } from "../festive.js";
 import { useState } from "react";
 import { api } from "../api.js";
 import { parseCsv } from "../csv.js";
@@ -73,7 +74,7 @@ export default function ContactsImport() {
       </p>
       <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", marginBottom: 10 }}>
         <input type="file" accept=".csv,.tsv,.txt,text/csv" onChange={onFile} />
-        {rows && <button className="btn btn-accent btn-sm" disabled={!!busy} onClick={doPreview}>{busy === "preview" ? "Checking…" : `Preview ${rows.length} rows`}</button>}
+        {rows && <button className="btn btn-accent btn-sm" disabled={!!busy} onClick={doPreview}>{busy === "preview" ? busyText("Checking…") : `Preview ${rows.length} rows`}</button>}
         {s && (s.contacts_to_add > 0 || s.address_updates > 0) && (
           <button className="btn btn-accent btn-sm" disabled={!!busy} onClick={doApply}>
             {busy === "apply" ? "Applying…" : `Apply: add ${s.contacts_to_add} contacts, fill ${s.address_updates} addresses`}
