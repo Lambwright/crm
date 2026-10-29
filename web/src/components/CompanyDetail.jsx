@@ -1,4 +1,5 @@
 import Loading from "./Loading.jsx";
+import ProcoreContacts from "./ProcoreContacts.jsx";
 import { useEffect, useState } from "react";
 import { api } from "../api.js";
 import RegionSelect from "./RegionSelect.jsx";
@@ -18,6 +19,9 @@ export default function CompanyDetail({ id, onClose, onChanged, canHotLead = tru
   const [error, setError] = useState(null);
   const [saving, setSaving] = useState(false);
   const [hotLeadReason, setHotLeadReason] = useState("");
+  // The client's people from Procore's Directory, re-read whenever the record opens
+  const [procoreContacts, setProcoreContacts] = useState(null);
+  const [refreshingContacts, setRefreshingContacts] = useState(false);
 
   function load() {
     api.getCompany(id).then((d) => {
@@ -27,7 +31,17 @@ export default function CompanyDetail({ id, onClose, onChanged, canHotLead = tru
     }).catch((e) => setError(e.message));
   }
 
+  async function refreshProcoreContacts(force) {
+    setRefreshingContacts(true);
+    try {
+      const r = await api.refreshCompanyContacts(id, force);
+      setProcoreContacts(r);
+      if (r.refreshed) load();
+    } catch (e) { setProcoreContacts({ reason: "error", error: e.message }); } finally { setRefreshingContacts(false); }
+  }
+
   useEffect(() => {
+    refreshProcoreContacts(false);
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
@@ -166,6 +180,8 @@ export default function CompanyDetail({ id, onClose, onChanged, canHotLead = tru
         <div style={{ marginTop: 12 }}><PaymentHistory payment={data.payment} /></div>
 
         <div className="card-title" style={{ marginTop: 16 }}>Contacts ({contacts.length})</div>
+        <ProcoreContacts companyId={id} status={procoreContacts} refreshing={refreshingContacts} onRefresh={refreshProcoreContacts} canLink={can?.all_bids !== false}
+          onLinked={(r) => { setProcoreContacts(r); load(); onChanged?.(); }} />
         <div className="row-list" style={{ marginBottom: 16 }}>
           {contacts.map((c) => (
             <div className="card" key={c.id} style={{ padding: 10, marginBottom: 0 }}>

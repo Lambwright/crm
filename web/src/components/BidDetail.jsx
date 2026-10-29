@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, buildMailto } from "../api.js";
 import Loading from "./Loading.jsx";
+import ProcoreContacts from "./ProcoreContacts.jsx";
 import ScoutRecord from "./ScoutRecord.jsx";
 import { buildFollowUpDraft, variantCount } from "../followupTemplates.js";
 import { HANDOFF_STATUS_LABELS, STAGE_LABELS, STAGE_ORDER, STAGE_REQUIREMENTS } from "../stages.js";
@@ -488,18 +489,8 @@ export default function BidDetail({ id, user, onClose, onChanged, prefillEmail, 
                 ))}
               </select>
             )}
-            <div className="field-help" style={{ marginTop: 4 }}>
-              {procoreContacts && procoreContacts.linked === false
-                ? "This client isn't linked to Procore yet, so only the contacts already in CRM are listed."
-                : procoreContacts && procoreContacts.error
-                  ? "Couldn't refresh from Procore just now; showing the contacts CRM already has."
-                  : procoreContacts && procoreContacts.synced_at
-                    ? "Contacts from Procore's Directory, updated " + new Date(procoreContacts.synced_at).toLocaleDateString() + "."
-                    : refreshingContacts ? "Checking Procore for this client's contacts…" : ""}
-              {procoreContacts && procoreContacts.linked !== false && (
-                <button className="btn btn-ghost btn-sm" style={{ marginLeft: 8 }} disabled={refreshingContacts} onClick={() => loadProcoreContacts(true)}>{refreshingContacts ? "…" : "↻ Refresh from Procore"}</button>
-              )}
-            </div>
+            <ProcoreContacts companyId={bid.company_id} status={procoreContacts} refreshing={refreshingContacts} onRefresh={loadProcoreContacts} canLink={can?.all_bids !== false}
+              onLinked={(r) => { setProcoreContacts(r); load(); }} />
           </div>
         </div>
         <div className="field" style={{ marginBottom: 6 }}>

@@ -139,6 +139,9 @@ export const api = {
   resolveHelp: (helpId, status) => request(`/followups/help/${helpId}/resolve`, { method: "POST", body: { status } }),
   getFollowupCounts: () => request(`/followups/counts`),
   // The client's real contacts from Procore's Directory (CRM asks at most weekly per company unless forced)
+  refreshCompanyContacts: (companyId, force) => request(`/companies/${companyId}/refresh-contacts`, { method: "POST", body: { force: Boolean(force) } }),
+  procoreCandidates: (companyId) => request(`/companies/${companyId}/procore-candidates`),
+  procoreLink: (companyId, vendorId) => request(`/companies/${companyId}/procore-link`, { method: "POST", body: { vendor_id: vendorId } }),
   refreshContacts: (bidId, force) => request(`/bids/${bidId}/refresh-contacts`, { method: "POST", body: { force: Boolean(force) } }),
   setFollowupDate: (bidId, date, reason) => request(`/bids/${bidId}/followup-date`, { method: "POST", body: { date, reason } }),
 

@@ -2217,7 +2217,7 @@ async function handleCompanyDetail(id, sql) {
   const rows = await sql`select * from companies where id = ${id}`;
   if (!rows.length) return json({ error: "not_found" }, 404);
   const payment = (await sql`select * from company_payment_scores where company_id = ${id}`)[0] || null;
-  const contacts = await sql`select * from contacts where company_id = ${id} order by created_at`;
+  const contacts = await sql`select * from contacts where company_id = ${id} and active order by created_at`;
   const bids = await sql`select id, rfq_ref, project_name, stage, qualification_result, estimated_value, submitted_value, final_value, bid_due_date, created_at from bids where company_id = ${id} order by created_at desc`;
   return json({ company: rows[0], contacts, bids, payment });
 }
@@ -2543,39 +2543,36 @@ async function handleBidStageChange(id, request, sql, env, user) {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Procore Directory contacts for the follow-up email (Ben, 2026-10-28): when someone opens a bid, the
-// "To" picker is filled with the real people at that client, read from Procore's Directory on demand and
-// kept as ordinary CRM contacts. CRM has no Procore access of its own: HANDOFF's
-// GET /directory/vendor-contacts (service binding, same key as /regions) makes the one Procore call and
-// caches it. To stay cheap, CRM asks at most once per company per week, plus a manual Refresh button,
-// and backs off for 10 minutes after any failure. A failed refresh never blocks the form: the contacts
-// CRM already has keep serving.
+// Procore Directory contacts (Ben, 2026-10-28): opening a bid's follow-up email form or a company record
+// re-reads the client's real people from Procore's Directory and keeps them as ordinary CRM contacts.
+// CRM has no Procore access of its own: HANDOFF's GET /directory/vendor-contacts (service binding, same key
+// as /regions) answers from its own once-a-day copy of the whole Directory, so asking on every open costs
+// no extra Procore calls. CRM only de-duplicates quick repeats (10 minutes per company) and backs off for
+// 10 minutes after a failure. A failed refresh never blocks the form: the contacts CRM already has keep
+// serving. A company must carry its Procore vendor id (companies.procore_vendor_id) to be looked up; one
+// without it can be linked by name search (handleProcoreCandidates / handleProcoreLink).
 // ---------------------------------------------------------------------------
-const CONTACT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const CONTACT_TTL_MS = 10 * 60 * 1000;
 const contactRetryAfter = new Map();
+const HANDOFF_URL = "https://handoff-worker.ben-a90.workers.dev";
 
-async function handleRefreshContacts(bidId, request, env, sql, user) {
-  const body = await parseBody(request);
-  const [bid] = await sql`select id, company_id, owner_username, estimator_username from bids where id = ${bidId}`;
-  if (!bid) return json({ error: "bid_not_found" }, 404);
-  const denied = await bidAccess(sql, user, bid);
-  if (denied) return denied;
-  if (!bid.company_id) return json({ linked: false, contacts: [] });
+async function refreshCompanyContacts(env, sql, companyId, { force = false } = {}) {
   const list = () => sql`
     select id, first_name, last_name, title, email from contacts
-    where company_id = ${bid.company_id} and active and email is not null and email <> ''
+    where company_id = ${companyId} and active and email is not null and email <> ''
     order by first_name, last_name`;
-  const [co] = await sql`select id, procore_vendor_id, procore_contacts_synced_at from companies where id = ${bid.company_id}`;
-  if (!co || co.procore_vendor_id == null) return json({ linked: false, contacts: await list() });
-  const force = Boolean(body.force);
+  const [co] = await sql`select id, procore_vendor_id, procore_contacts_synced_at from companies where id = ${companyId}`;
+  if (!co) return { linked: false, reason: "no_company", contacts: [] };
+  if (co.procore_vendor_id == null) return { linked: false, reason: "not_linked", contacts: await list() };
+  const base = { linked: true, procore_vendor_id: String(co.procore_vendor_id), synced_at: co.procore_contacts_synced_at };
   const age = co.procore_contacts_synced_at ? Date.now() - new Date(co.procore_contacts_synced_at).getTime() : Infinity;
-  if (!force && age < CONTACT_TTL_MS) return json({ linked: true, refreshed: false, synced_at: co.procore_contacts_synced_at, contacts: await list() });
+  if (!force && age < CONTACT_TTL_MS) return { ...base, refreshed: false, contacts: await list() };
   if (!force && Date.now() < (contactRetryAfter.get(co.id) || 0)) {
-    return json({ linked: true, refreshed: false, synced_at: co.procore_contacts_synced_at, error: "Procore contacts are temporarily unavailable.", contacts: await list() });
+    return { ...base, refreshed: false, reason: "error", error: "Procore contacts are temporarily unavailable.", contacts: await list() };
   }
-  if (!env.HANDOFF_WORKER || !env.HANDOFF_SERVICE_KEY) return json({ linked: true, refreshed: false, error: "Procore contacts aren't connected yet.", contacts: await list() });
+  if (!env.HANDOFF_WORKER || !env.HANDOFF_SERVICE_KEY) return { ...base, refreshed: false, reason: "error", error: "Procore contacts aren't connected yet.", contacts: await list() };
   try {
-    const res = await env.HANDOFF_WORKER.fetch(`https://handoff-worker.ben-a90.workers.dev/directory/vendor-contacts?vendor_id=${encodeURIComponent(String(co.procore_vendor_id))}`, {
+    const res = await env.HANDOFF_WORKER.fetch(`${HANDOFF_URL}/directory/vendor-contacts?vendor_id=${encodeURIComponent(String(co.procore_vendor_id))}`, {
       headers: { "X-Handoff-Service-Key": env.HANDOFF_SERVICE_KEY },
     });
     if (!res.ok) throw new Error(`HANDOFF returned HTTP ${res.status}`);
@@ -2608,11 +2605,62 @@ async function handleRefreshContacts(bidId, request, env, sql, user) {
     }
     await sql`update companies set procore_contacts_synced_at = now() where id = ${co.id}`;
     contactRetryAfter.delete(co.id);
-    return json({ linked: true, refreshed: true, cached: Boolean(data.cached), synced_at: new Date().toISOString(), contacts: await list() });
+    const contacts = await list();
+    return { ...base, refreshed: true, cached: Boolean(data.cached), synced_at: new Date().toISOString(), procore_contacts: rows.length, reason: rows.length === 0 ? "no_contacts" : undefined, contacts };
   } catch (e) {
     contactRetryAfter.set(co.id, Date.now() + 10 * 60 * 1000);
-    return json({ linked: true, refreshed: false, synced_at: co.procore_contacts_synced_at, error: `Couldn't reach Procore: ${e.message}`, contacts: await list() });
+    return { ...base, refreshed: false, reason: "error", error: `Couldn't reach Procore: ${e.message}`, contacts: await list() };
   }
+}
+
+async function handleRefreshContacts(bidId, request, env, sql, user) {
+  const body = await parseBody(request);
+  const [bid] = await sql`select id, company_id, owner_username, estimator_username from bids where id = ${bidId}`;
+  if (!bid) return json({ error: "bid_not_found" }, 404);
+  const denied = await bidAccess(sql, user, bid);
+  if (denied) return denied;
+  if (!bid.company_id) return json({ linked: false, reason: "no_company", contacts: [] });
+  return json(await refreshCompanyContacts(env, sql, bid.company_id, { force: Boolean(body.force) }));
+}
+
+async function handleCompanyRefreshContacts(id, request, env, sql, user) {
+  const denied = scopeDenied(user);
+  if (denied) return denied;
+  const body = await parseBody(request);
+  return json(await refreshCompanyContacts(env, sql, id, { force: Boolean(body.force) }));
+}
+
+// Possible Procore Directory matches for a company that has no Procore id yet (a person clicks "Find in
+// Procore"). HANDOFF answers from its cached vendor list.
+async function handleProcoreCandidates(id, env, sql, user) {
+  const denied = scopeDenied(user);
+  if (denied) return denied;
+  const [co] = await sql`select name from companies where id = ${id}`;
+  if (!co) return json({ error: "not_found" }, 404);
+  if (!env.HANDOFF_WORKER || !env.HANDOFF_SERVICE_KEY) return json({ candidates: [], error: "Procore search isn't connected yet." });
+  try {
+    const res = await env.HANDOFF_WORKER.fetch(`${HANDOFF_URL}/directory/vendor-search?q=${encodeURIComponent(co.name)}`, { headers: { "X-Handoff-Service-Key": env.HANDOFF_SERVICE_KEY } });
+    if (!res.ok) throw new Error(`HANDOFF returned HTTP ${res.status}`);
+    const data = await res.json();
+    const taken = await sql`select procore_vendor_id, name from companies where procore_vendor_id is not null and id <> ${id}`;
+    const takenBy = new Map(taken.map((t) => [String(t.procore_vendor_id), t.name]));
+    return json({ candidates: (Array.isArray(data.candidates) ? data.candidates : []).slice(0, 10).map((c) => ({ ...c, linked_to: takenBy.get(String(c.directory_id)) || null })) });
+  } catch (e) {
+    return json({ candidates: [], error: `Couldn't search Procore: ${e.message}` });
+  }
+}
+
+// Tie a CRM company to its Procore Directory company, then pull its contacts straight away.
+async function handleProcoreLink(id, request, env, sql, user) {
+  if (!canSeeAllBids(user)) return forbidden("Only estimators, admins and follow-up managers can link a company to Procore.");
+  const body = await parseBody(request);
+  const vendor = String(body.vendor_id || "").trim();
+  if (!/^\d{1,18}$/.test(vendor)) return json({ error: "vendor_id must be the Procore company number" }, 400);
+  const [other] = await sql`select id, name from companies where procore_vendor_id = ${vendor}::bigint and id <> ${id} limit 1`;
+  if (other) return json({ error: "already_linked", detail: `That Procore company is already linked to "${other.name}". Merge the two CRM companies first if they're the same client.` }, 409);
+  const rows = await sql`update companies set procore_vendor_id = ${vendor}::bigint, procore_contacts_synced_at = null, updated_at = now() where id = ${id} returning id`;
+  if (!rows.length) return json({ error: "not_found" }, 404);
+  return json(await refreshCompanyContacts(env, sql, id, { force: true }));
 }
 
 async function handleEmailsList(bidId, sql, user) {
@@ -4065,6 +4113,9 @@ async function handleRequest(request, env) {
         if (isUuid(parts[1]) && !parts[2] && request.method === "GET") return withRefresh(await handleCompanyDetail(parts[1], sql));
         if (isUuid(parts[1]) && !parts[2] && request.method === "PATCH") return withRefresh(await handleCompanyPatch(parts[1], request, sql, env, auth.user));
         if (isUuid(parts[1]) && parts[2] === "contacts" && request.method === "POST") return withRefresh(await handleContactCreate(parts[1], request, sql));
+        if (isUuid(parts[1]) && parts[2] === "refresh-contacts" && request.method === "POST") return withRefresh(await handleCompanyRefreshContacts(parts[1], request, env, sql, auth.user));
+        if (isUuid(parts[1]) && parts[2] === "procore-candidates" && request.method === "GET") return withRefresh(await handleProcoreCandidates(parts[1], env, sql, auth.user));
+        if (isUuid(parts[1]) && parts[2] === "procore-link" && request.method === "POST") return withRefresh(await handleProcoreLink(parts[1], request, env, sql, auth.user));
       }
 
       if (parts[0] === "contacts" && isUuid(parts[1]) && !parts[2] && request.method === "PATCH") {
