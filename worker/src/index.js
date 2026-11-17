@@ -2556,6 +2556,16 @@ const CONTACT_TTL_MS = 10 * 60 * 1000;
 const contactRetryAfter = new Map();
 const HANDOFF_URL = "https://handoff-worker.ben-a90.workers.dev";
 
+// HANDOFF's refusal in words (its own reason, e.g. "Invalid service key."), so a failure says what is wrong.
+async function handoffFailure(res) {
+  let why = "";
+  try {
+    const t = await res.text();
+    try { const j = JSON.parse(t); why = j.reason || j.detail || j.error || ""; } catch (e) { why = t; }
+  } catch (e) { /* no body */ }
+  return `HANDOFF returned HTTP ${res.status}${why ? ": " + String(why).slice(0, 200) : ""}`;
+}
+
 async function refreshCompanyContacts(env, sql, companyId, { force = false } = {}) {
   const list = () => sql`
     select id, first_name, last_name, title, email from contacts
@@ -2575,7 +2585,7 @@ async function refreshCompanyContacts(env, sql, companyId, { force = false } = {
     const res = await env.HANDOFF_WORKER.fetch(`${HANDOFF_URL}/directory/vendor-contacts?vendor_id=${encodeURIComponent(String(co.procore_vendor_id))}`, {
       headers: { "X-Handoff-Service-Key": env.HANDOFF_SERVICE_KEY },
     });
-    if (!res.ok) throw new Error(`HANDOFF returned HTTP ${res.status}`);
+    if (!res.ok) throw new Error(await handoffFailure(res));
     const data = await res.json();
     const rows = Array.isArray(data.contacts) ? data.contacts : null;
     if (!rows) throw new Error("HANDOFF returned no contact list");
@@ -2640,7 +2650,7 @@ async function handleProcoreCandidates(id, env, sql, user) {
   if (!env.HANDOFF_WORKER || !env.HANDOFF_SERVICE_KEY) return json({ candidates: [], error: "Procore search isn't connected yet." });
   try {
     const res = await env.HANDOFF_WORKER.fetch(`${HANDOFF_URL}/directory/vendor-search?q=${encodeURIComponent(co.name)}`, { headers: { "X-Handoff-Service-Key": env.HANDOFF_SERVICE_KEY } });
-    if (!res.ok) throw new Error(`HANDOFF returned HTTP ${res.status}`);
+    if (!res.ok) throw new Error(await handoffFailure(res));
     const data = await res.json();
     const taken = await sql`select procore_vendor_id, name from companies where procore_vendor_id is not null and id <> ${id}`;
     const takenBy = new Map(taken.map((t) => [String(t.procore_vendor_id), t.name]));
