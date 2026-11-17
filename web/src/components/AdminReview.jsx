@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api.js";
 import Loading from "./Loading.jsx";
+import DuplicateFinder from "./DuplicateFinder.jsx";
 
 // Admin review (Ben, 2026-10-21): the things leadership should look at in one place.
 // Priority-client RFQs an estimator declined are a queue to work through (follow up
@@ -134,6 +135,7 @@ export default function AdminReview() {
           </tbody>
         </table>
       </Section>
+      <DuplicateFinder />
     </>
   );
 }

@@ -87,6 +87,8 @@ export const api = {
   setNsSyncAuto: (enabled) => request(`/admin/netsuite-sync/auto`, { method: "POST", body: { enabled } }),
 
   // Merge a duplicate company into another (admin)
+  getDuplicates: () => request(`/admin/duplicates`),
+  dismissDuplicates: (ids) => request(`/admin/duplicates/dismiss`, { method: "POST", body: { ids } }),
   previewCompanyMerge: (keepId, mergeId) => request(`/admin/companies/merge-preview?keep=${keepId}&merge=${mergeId}`),
   mergeCompanies: (keepId, mergeId) => request(`/admin/companies/merge`, { method: "POST", body: { keep_id: keepId, merge_id: mergeId } }),
 

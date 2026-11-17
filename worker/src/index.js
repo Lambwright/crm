@@ -2628,6 +2628,69 @@ async function refreshCompanyContacts(env, sql, companyId, { force = false } = {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Possible duplicate clients (Ben, 2026-11-18): a one-time portfolio cleanup, and a standing check after.
+// Admin only. Two records are CERTAIN duplicates when they carry the same Procore company number or the same
+// NetSuite customer number; they are LIKELY duplicates when their names match once legal suffixes (Inc, Ltd,
+// ULC, Corp…) and punctuation are ignored. A group whose members carry different Procore or NetSuite numbers
+// is flagged as a conflict (probably two real companies), and a group an admin has marked "not duplicates" is
+// not shown again. Nothing is merged here: the screen calls the ordinary merge for each pick.
+// ---------------------------------------------------------------------------
+const DUP_DROP = new Set([...NS_LOOSE_DROP, "ulc", "ltee", "plc", "lc"]);
+const dupKey = (v) => nsNorm(String(v || "").replace(/\([^)]*\)/g, " ")).split(" ").filter((w) => w && !DUP_DROP.has(w)).join(" ");
+
+async function handleDuplicates(request, url, sql, user) {
+  if (!isCrmAdmin(user)) return forbidden("Admin access required.");
+  if (url.pathname === "/admin/duplicates/dismiss" && request.method === "POST") {
+    const body = await parseBody(request);
+    const ids = Array.isArray(body.ids) ? body.ids.map(String).sort() : [];
+    if (ids.length < 2) return json({ error: "ids is required" }, 400);
+    await sql`insert into company_dup_dismissed (group_key, dismissed_by) values (${ids.join(",")}, ${user.username}) on conflict (group_key) do nothing`;
+    return json({ ok: true });
+  }
+  const companies = await sql`
+    select c.id, c.name, c.netsuite_customer_id, c.procore_vendor_id, c.account_segment, c.created_at,
+      (select count(*) from bids b where b.company_id = c.id)::int as bids,
+      (select count(*) from contacts k where k.company_id = c.id)::int as contacts
+    from companies c`;
+  const dismissed = new Set((await sql`select group_key from company_dup_dismissed`).map((r) => r.group_key));
+  const parent = new Map(companies.map((c) => [c.id, c.id]));
+  const find = (x) => { while (parent.get(x) !== x) { parent.set(x, parent.get(parent.get(x))); x = parent.get(x); } return x; };
+  const reasons = new Map(); // root -> Set of reasons (filled after unions)
+  const edges = [];
+  const link = (ids, reason) => { for (let i = 1; i < ids.length; i++) edges.push([ids[0], ids[i], reason]); };
+  const bucket = (keyOf, reason) => {
+    const m = new Map();
+    for (const c of companies) { const k = keyOf(c); if (k) { if (!m.has(k)) m.set(k, []); m.get(k).push(c.id); } }
+    for (const ids of m.values()) if (ids.length > 1) link(ids, reason);
+  };
+  bucket((c) => (c.procore_vendor_id != null ? String(c.procore_vendor_id) : null), "same_procore_id");
+  bucket((c) => (c.netsuite_customer_id != null && String(c.netsuite_customer_id) !== "" ? String(c.netsuite_customer_id) : null), "same_netsuite_id");
+  bucket((c) => { const k = dupKey(c.name).replace(/ /g, ""); return k.length >= 4 ? k : null; }, "same_name");
+  for (const [a, b] of edges) parent.set(find(a), find(b));
+  for (const [a, , reason] of edges) { const r = find(a); if (!reasons.has(r)) reasons.set(r, new Set()); reasons.get(r).add(reason); }
+  const byRoot = new Map();
+  for (const c of companies) { const r = find(c.id); if (!byRoot.has(r)) byRoot.set(r, []); byRoot.get(r).push(c); }
+  const groups = [];
+  for (const [root, members] of byRoot) {
+    if (members.length < 2) continue;
+    const key = members.map((m) => m.id).sort().join(",");
+    if (dismissed.has(key)) continue;
+    const why = [...(reasons.get(root) || [])];
+    const distinct = (f) => new Set(members.map((m) => m[f]).filter((v) => v != null && String(v) !== "").map(String));
+    const conflict = distinct("procore_vendor_id").size > 1 || distinct("netsuite_customer_id").size > 1;
+    const ranked = members.slice().sort((a, b) =>
+      (b.procore_vendor_id != null) - (a.procore_vendor_id != null) || (b.netsuite_customer_id != null) - (a.netsuite_customer_id != null) || b.bids - a.bids || new Date(a.created_at) - new Date(b.created_at));
+    groups.push({
+      key, tier: !conflict && why.some((w) => w !== "same_name") ? "certain" : "likely", conflict, reasons: why,
+      suggested_keep: ranked[0].id,
+      members: ranked.map((m) => ({ id: m.id, name: m.name, bids: m.bids, contacts: m.contacts, procore_vendor_id: m.procore_vendor_id != null ? String(m.procore_vendor_id) : null, netsuite_customer_id: m.netsuite_customer_id != null ? String(m.netsuite_customer_id) : null, segment: m.account_segment })),
+    });
+  }
+  groups.sort((a, b) => (a.tier === b.tier ? b.members.length - a.members.length : a.tier === "certain" ? -1 : 1));
+  return json({ total_companies: companies.length, groups });
+}
+
 async function handleRefreshContacts(bidId, request, env, sql, user) {
   const body = await parseBody(request);
   const [bid] = await sql`select id, company_id, owner_username, estimator_username from bids where id = ${bidId}`;
@@ -3475,6 +3538,17 @@ SELF_MIGRATIONS.push({
     `alter table companies add column if not exists procore_contacts_synced_at timestamptz`,
   ],
 });
+// Groups of client records an admin has marked "not duplicates" (Ben, 2026-11-18).
+SELF_MIGRATIONS.push({
+  id: "026_company_dup_dismissed",
+  statements: [
+    `create table if not exists company_dup_dismissed (
+      group_key text primary key,
+      dismissed_by text,
+      dismissed_at timestamptz not null default now()
+    )`,
+  ],
+});
 let schemaReady = null;
 function ensureSchema(sql) {
   if (!schemaReady) {
@@ -4160,6 +4234,7 @@ async function handleRequest(request, env) {
       if (url.pathname === "/access" && request.method === "GET") return withRefresh(await handleAccess(env, auth.user));
       if (url.pathname === "/scout/financials/refresh" && request.method === "POST") return withRefresh(await handleFinancialsRefresh(request, env, sql, auth.user));
       if (url.pathname === "/scout/stats" && request.method === "GET") return withRefresh(await handleScoutStats(url, sql));
+      if (url.pathname.startsWith("/admin/duplicates")) return withRefresh(await handleDuplicates(request, url, sql, auth.user));
       if (url.pathname.startsWith("/admin/review")) return withRefresh(await handleAdminReview(request, url, sql, auth.user));
       if (url.pathname.startsWith("/admin/scout-unlinked")) return withRefresh(await handleScoutUnlinked(request, url, sql, auth.user));
       if (url.pathname.startsWith("/admin/scout-import") && request.method === "POST") return withRefresh(await handleScoutImport(request, url, sql, auth.user));
