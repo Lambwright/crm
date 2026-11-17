@@ -1309,6 +1309,11 @@ async function handleCompanyMerge(request, url, sql, user) {
     await sql`update contacts set company_id = ${keep.id} where company_id = ${dupe.id}`;
     await sql`update bid_emails set company_id = ${keep.id} where company_id = ${dupe.id}`;
     await sql`update notifications set company_id = ${keep.id} where company_id = ${dupe.id}`;
+    // These three would otherwise be lost with the removed company: follow-up rules are deleted with it, and
+    // SCOUT history and the admin review queue would lose their client link.
+    await sql`update followup_rules set company_id = ${keep.id} where company_id = ${dupe.id}`;
+    await sql`update scout_runs set company_id = ${keep.id} where company_id = ${dupe.id}`;
+    await sql`update review_queue set company_id = ${keep.id} where company_id = ${dupe.id}`;
     // One payment score per company: the survivor's own wins; otherwise take the duplicate's.
     const keepHasScore = (await sql`select 1 from company_payment_scores where company_id = ${keep.id}`).length > 0;
     if (!keepHasScore) await sql`update company_payment_scores set company_id = ${keep.id} where company_id = ${dupe.id}`;
