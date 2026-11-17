@@ -591,24 +591,39 @@ async function pushHotLeadToNetSuite(env, company) {
 // before this runs at real volume — see kickoff prompt "Explicitly deferred".
 // ---------------------------------------------------------------------------
 
-async function findOrCreateCompany(sql, { name, procore_vendor_id }) {
+// Identity is the Procore company number and the NetSuite customer number; the name is only a fallback (Ben,
+// 2026-11-18). A company found by any route is given a number it was missing, so SCOUT-origin companies stop
+// being plain text.
+async function findOrCreateCompany(sql, { name, procore_vendor_id, netsuite_customer_id }) {
   if (!name || !name.trim()) throw new Error("company name is required");
+  const pcId = /^\d{1,18}$/.test(String(procore_vendor_id ?? "")) ? String(procore_vendor_id) : null;
+  const nsId = /^\d{1,12}$/.test(String(netsuite_customer_id ?? "")) ? String(netsuite_customer_id) : null;
+  const adopt = async (c) => {
+    if ((pcId && c.procore_vendor_id == null) || (nsId && !c.netsuite_customer_id)) {
+      const [u] = await sql`update companies set procore_vendor_id = coalesce(procore_vendor_id, ${pcId}::bigint),
+        netsuite_customer_id = coalesce(nullif(netsuite_customer_id, ''), ${nsId}), updated_at = now() where id = ${c.id} returning *`;
+      return u || c;
+    }
+    return c;
+  };
+  if (pcId) { const [c] = await sql`select * from companies where procore_vendor_id = ${pcId}::bigint order by created_at limit 1`; if (c) return adopt(c); }
+  if (nsId) { const [c] = await sql`select * from companies where netsuite_customer_id = ${nsId} order by created_at limit 1`; if (c) return adopt(c); }
   const existing = await sql`select * from companies where lower(name) = lower(${name.trim()}) limit 1`;
-  if (existing.length) return existing[0];
+  if (existing.length) return adopt(existing[0]);
   // The same name ignoring case, spacing, punctuation and accents ("Structure
   // Corp." / "Structure Corp", "Hermès" / "Hermes"), or a spelling that was
   // merged into a company earlier. Only when it points at exactly one company.
   const key = nsNorm(name);
   if (key) {
     const [alias] = await sql`select company_id from company_aliases where alias_norm = ${key}`;
-    if (alias) { const [c] = await sql`select * from companies where id = ${alias.company_id}`; if (c) return c; }
+    if (alias) { const [c] = await sql`select * from companies where id = ${alias.company_id}`; if (c) return adopt(c); }
     const all = await sql`select * from companies`;
     const same = all.filter((c) => nsNorm(c.name) === key);
-    if (same.length === 1) return same[0];
+    if (same.length === 1) return adopt(same[0]);
   }
   const [created] = await sql`
-    insert into companies (name, procore_vendor_id)
-    values (${name.trim()}, ${procore_vendor_id || null})
+    insert into companies (name, procore_vendor_id, netsuite_customer_id)
+    values (${name.trim()}, ${pcId}::bigint, ${nsId})
     returning *`;
   return created;
 }
@@ -666,7 +681,12 @@ async function handleScoutIntake(request, sql) {
   if (!company_name) return json({ error: "company_name is required" }, 400);
 
   const settings = await getCrmSettings(sql);
-  const company = await findOrCreateCompany(sql, { name: company_name, procore_vendor_id });
+  const recIds = body.scout_record && typeof body.scout_record === "object" ? body.scout_record : {};
+  const company = await findOrCreateCompany(sql, {
+    name: company_name,
+    procore_vendor_id: procore_vendor_id ?? recIds.procore_company_id,
+    netsuite_customer_id: body.ns_customer_id ?? recIds.ns_customer_id,
+  });
 
   let contactRow = null;
   if (contact && contact.email) {
@@ -3017,6 +3037,7 @@ async function handleProcoreSync(request, sql) {
     where b.procore_bid_board_id is null and b.stage = 'rfq'`;
 
   let attached = 0, updated = 0;
+  const companyPcIds = new Map();
   for (const row of rows) {
     const boardId = String(row.id);
     let bid = byBoardId.get(boardId);
@@ -3034,6 +3055,9 @@ async function handleProcoreSync(request, sql) {
       }
     }
     if (!bid) continue;
+    // The Procore company number of this bid's customer, when HANDOFF sends it (row.customer_company_id):
+    // the real identity of the CRM company, so it is copied onto the company if the company has none.
+    if (bid.company_id && /^d{1,18}$/.test(String(row.customer_company_id ?? ""))) companyPcIds.set(bid.company_id, String(row.customer_company_id));
 
     const newStage = String(row.status || "").toLowerCase();
     const stageKnown = STAGES.includes(newStage);
@@ -3073,6 +3097,13 @@ async function handleProcoreSync(request, sql) {
           values (${bid.id}, 'sync_needs_detail', ${`Procore marked "${after.project_name}" as ${PROCORE_STAGE_LABELS[newStage] || newStage} — still need: ${validation.missing.join(", ")}.`})`;
       }
     }
+  }
+  if (companyPcIds.size) {
+    const vals = [];
+    const params = [];
+    let i = 1;
+    for (const [cid, pc] of companyPcIds) { vals.push("($" + (i++) + "::uuid, $" + (i++) + "::bigint)"); params.push(cid, pc); }
+    await sql.query("update companies c set procore_vendor_id = v.pc, updated_at = now() from (values " + vals.join(", ") + ") as v(cid, pc) where c.id = v.cid and c.procore_vendor_id is null", params);
   }
   return json({ received: rows.length, attached, updated });
 }
@@ -3547,6 +3578,25 @@ SELF_MIGRATIONS.push({
       dismissed_by text,
       dismissed_at timestamptz not null default now()
     )`,
+  ],
+});
+// Fill in company numbers from SCOUT pushes already stored (Ben, 2026-11-18): each push's record carries the
+// NetSuite customer number and, when SCOUT could look it up, the Procore company number. Only where a company's
+// pushes agree on exactly one number, and never over a number already there. Two duplicate spellings of one real
+// client then share a number, which is what the duplicate finder calls "certain".
+SELF_MIGRATIONS.push({
+  id: "027_company_ids_from_scout_pushes",
+  statements: [
+    `update companies c set netsuite_customer_id = x.ns
+       from (select company_id, min(payload->>'ns_customer_id') as ns from scout_runs
+             where company_id is not null and payload->>'ns_customer_id' ~ '^[0-9]{1,12}$'
+             group by company_id having count(distinct payload->>'ns_customer_id') = 1) x
+       where c.id = x.company_id and (c.netsuite_customer_id is null or c.netsuite_customer_id = '')`,
+    `update companies c set procore_vendor_id = x.pc::bigint
+       from (select company_id, min(payload->>'procore_company_id') as pc from scout_runs
+             where company_id is not null and payload->>'procore_company_id' ~ '^[0-9]{1,18}$'
+             group by company_id having count(distinct payload->>'procore_company_id') = 1) x
+       where c.id = x.company_id and c.procore_vendor_id is null`,
   ],
 });
 let schemaReady = null;
