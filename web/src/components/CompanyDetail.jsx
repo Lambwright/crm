@@ -50,8 +50,6 @@ export default function CompanyDetail({ id, onClose, onChanged, canHotLead = tru
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <div style={{ color: "var(--red)" }}>{error}</div>
-        {can?.admin === true && <MergeCompany company={company} onMerged={() => { onChanged?.(); load(); }} />}
-
         <div className="modal-actions"><button className="btn btn-ghost" onClick={onClose}>Close</button></div>
       </div>
     </div>
@@ -202,6 +200,8 @@ export default function CompanyDetail({ id, onClose, onChanged, canHotLead = tru
           ))}
           {bids.length === 0 && <div className="empty-state">No bids yet.</div>}
         </div>
+
+        {can?.admin === true && <MergeCompany company={company} onMerged={() => { onChanged?.(); load(); }} />}
 
         <div className="modal-actions"><button className="btn btn-ghost" onClick={onClose}>Close</button></div>
       </div>
